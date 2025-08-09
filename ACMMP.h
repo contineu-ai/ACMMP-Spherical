@@ -16,7 +16,8 @@ float GetAngle(const cv::Vec3f &v1, const cv::Vec3f &v2);
 void StoreColorPlyFileBinaryPointCloud (const std::string &plyFilePath, const std::vector<PointList> &pc);
 void RunFusionCuda(const std::string &dense_folder,
                    const std::vector<Problem> &problems,
-                   bool geom_consistency);
+                   bool geom_consistency,
+                size_t max_textures_in_memory=60);
 void RunJBU(const cv::Mat_<float>  &scaled_image_float, const cv::Mat_<float> &src_depthmap, const std::string &dense_folder , const Problem &problem);
 
 #define CUDA_SAFE_CALL(error) CudaSafeCall(error, __FILE__, __LINE__)

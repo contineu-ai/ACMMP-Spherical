@@ -181,7 +181,8 @@ Camera ReadCamera(const std::string &cam_path)
         camera.params[0] = file_f;
         camera.params[1] = file_cx; 
         camera.params[2] = file_cy; 
-
+        camera.width = file_cx*2;
+        camera.height = file_cy*2;
         float depth_min, depth_interval;
         int   n_depth_planes;
         float depth_max;
