@@ -14,7 +14,9 @@ float3 Get3DPointonWorld(const int x, const int y, const float depth, const Came
 void ProjectonCamera(const float3 PointX, const Camera camera, float2 &point, float &depth);
 float GetAngle(const cv::Vec3f &v1, const cv::Vec3f &v2);
 void StoreColorPlyFileBinaryPointCloud (const std::string &plyFilePath, const std::vector<PointList> &pc);
-
+void RunFusionCuda(const std::string &dense_folder,
+                   const std::vector<Problem> &problems,
+                   bool geom_consistency);
 void RunJBU(const cv::Mat_<float>  &scaled_image_float, const cv::Mat_<float> &src_depthmap, const std::string &dense_folder , const Problem &problem);
 
 #define CUDA_SAFE_CALL(error) CudaSafeCall(error, __FILE__, __LINE__)

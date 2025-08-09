@@ -476,7 +476,7 @@ int main(int argc, char** argv)
     }
 
     geom_consistency = true;
-    RunFusion(dense_folder, problems, geom_consistency);
+    RunFusionCuda(dense_folder, problems, geom_consistency);
 
     return 0;
 }

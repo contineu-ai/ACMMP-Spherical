@@ -141,104 +141,212 @@ ACMMP::~ACMMP()
     }
 
 }
+#include <string> // For std::stof
 
 Camera ReadCamera(const std::string &cam_path)
 {
     Camera camera;
     std::ifstream file(cam_path);
+    if (!file.is_open()) {
+        std::cerr << "Error: Could not open camera file: " << cam_path << std::endl;
+        return camera;
+    }
+    std::string token;
 
-    std::string line;
-    file >> line;
-
+    file >> token; // Consume "extrinsic"
     for (int i = 0; i < 3; ++i) {
         file >> camera.R[3 * i + 0] >> camera.R[3 * i + 1] >> camera.R[3 * i + 2] >> camera.t[i];
     }
-
-    float tmp[4];
-    file >> tmp[0] >> tmp[1] >> tmp[2] >> tmp[3];
-    file >> line;
-
-    for (int i = 0; i < 3; ++i) {
-        file >> camera.K[3 * i + 0] >> camera.K[3 * i + 1] >> camera.K[3 * i + 2];
+    
+    // --- FIX 1: Consume the extra "0.0 0.0 0.0 1.0" line ---
+    // This is the primary parsing bug.
+    float dummy_float;
+    for (int i = 0; i < 4; ++i) {
+        file >> dummy_float;
     }
 
-    float depth_num;
-    float interval;
-    file >> camera.depth_min >> interval >> depth_num >> camera.depth_max;
+    // Now the file stream is positioned correctly.
+    file >> token; // Consume "intrinsic" header
+    file >> token; // This token should be the model name or K[0]
+
+    if (token == "SPHERE") {
+        camera.model = ::SPHERE;
+        
+        // Use clear variable names
+        float file_f, file_cx, file_cy;
+        file >> file_f >> file_cx >> file_cy;
+
+        // Store the intrinsic parameters. Note that 'f' is not used in the new math,
+        // but we store it anyway.
+        camera.params[0] = file_f;
+        camera.params[1] = file_cx; 
+        camera.params[2] = file_cy; 
+
+        float depth_min, depth_interval;
+        int   n_depth_planes;
+        float depth_max;
+
+        file >> depth_min >> depth_interval >> n_depth_planes >> depth_max;
+
+        camera.depth_min  = depth_min;
+        camera.depth_max  = depth_max;
+        
+    } else {
+        // This is the PINHOLE camera format
+        camera.model = ::PINHOLE;
+        
+        // The token was the first value of the K matrix.
+        camera.K[0] = std::stof(token);
+        file >> camera.K[1] >> camera.K[2];
+        file >> camera.K[3] >> camera.K[4] >> camera.K[5];
+        file >> camera.K[6] >> camera.K[7] >> camera.K[8];
+
+        float dummy1, dummy2;
+        file >> camera.depth_min >> camera.depth_max >> dummy1 >> dummy2;
+    }
 
     return camera;
 }
+// In file: ACMH.cpp
+// Replace the entire function with this one.
 
-void  RescaleImageAndCamera(cv::Mat_<cv::Vec3b> &src, cv::Mat_<cv::Vec3b> &dst, cv::Mat_<float> &depth, Camera &camera)
+void RescaleImageAndCamera(cv::Mat_<cv::Vec3b> &src, cv::Mat_<cv::Vec3b> &dst, cv::Mat_<float> &depth, Camera &camera)
 {
     const int cols = depth.cols;
     const int rows = depth.rows;
 
+    // ============================= THE FINAL FIX IS HERE =============================
+    // Set the camera's dimensions immediately. This ensures they are never uninitialized,
+    // even if the function returns early.
+    camera.width = cols;
+    camera.height = rows;
+    // ===============================================================================
+
+    // If the image already matches the depth map size, we don't need to resize.
+    // It's now safe to return early.
     if (cols == src.cols && rows == src.rows) {
         dst = src.clone();
         return;
     }
 
+    // If resizing is needed, proceed.
     const float scale_x = cols / static_cast<float>(src.cols);
     const float scale_y = rows / static_cast<float>(src.rows);
 
     cv::resize(src, dst, cv::Size(cols,rows), 0, 0, cv::INTER_LINEAR);
 
-    camera.K[0] *= scale_x;
-    camera.K[2] *= scale_x;
-    camera.K[4] *= scale_y;
-    camera.K[5] *= scale_y;
-    camera.width = cols;
-    camera.height = rows;
+    // Also scale the intrinsic parameters.
+    if (camera.model == SPHERE) {
+        camera.params[1] *= scale_x;   // cx
+        camera.params[2] *= scale_y;   // cy
+    } else { // PINHOLE
+        camera.K[0] *= scale_x;  camera.K[2] *= scale_x;
+        camera.K[4] *= scale_y;  camera.K[5] *= scale_y;
+    }
 }
+float3 Get3DPointonWorld(int x,
+                         int y,
+                         float depth,
+                         const Camera camera) {
+    // 1) Camera‐space point
+    float3 point_cam;
+    if (camera.model == SPHERE) {
+        // --- FIX 2: Corrected spherical math using cx, cy ---
+        // This generalizes your original code to use the principal point.
+        float lon = (static_cast<float>(x) - camera.params[1]) / static_cast<float>(camera.width) * 2.0f * M_PI;
+        float lat = -(static_cast<float>(y) - camera.params[2]) / static_cast<float>(camera.height) * M_PI;
+        
+        point_cam = make_float3(
+            std::cos(lat) * std::sin(lon) * depth,
+                           -std::sin(lat) * depth,
+            std::cos(lat) * std::cos(lon) * depth
+        );
 
-float3 Get3DPointonWorld(const int x, const int y, const float depth, const Camera camera)
-{
-    float3 pointX;
-    float3 tmpX;
-    // Reprojection
-    pointX.x = depth * (x - camera.K[2]) / camera.K[0];
-    pointX.y = depth * (y - camera.K[5]) / camera.K[4];
-    pointX.z = depth;
+    } else { // pin-hole
+        point_cam = make_float3(
+          depth * (static_cast<float>(x) - camera.K[2]) / camera.K[0],
+          depth * (static_cast<float>(y) - camera.K[5]) / camera.K[4],
+          depth
+        );
+    }
 
-    // Rotation
-    tmpX.x = camera.R[0] * pointX.x + camera.R[3] * pointX.y + camera.R[6] * pointX.z;
-    tmpX.y = camera.R[1] * pointX.x + camera.R[4] * pointX.y + camera.R[7] * pointX.z;
-    tmpX.z = camera.R[2] * pointX.x + camera.R[5] * pointX.y + camera.R[8] * pointX.z;
-
-    // Transformation
+    // 2 & 3) World transformation (This part was correct)
+    float3 tmp;
+    tmp.x = camera.R[0]*point_cam.x + camera.R[3]*point_cam.y + camera.R[6]*point_cam.z;
+    tmp.y = camera.R[1]*point_cam.x + camera.R[4]*point_cam.y + camera.R[7]*point_cam.z;
+    tmp.z = camera.R[2]*point_cam.x + camera.R[5]*point_cam.y + camera.R[8]*point_cam.z;
+    
     float3 C;
-    C.x = -(camera.R[0] * camera.t[0] + camera.R[3] * camera.t[1] + camera.R[6] * camera.t[2]);
-    C.y = -(camera.R[1] * camera.t[0] + camera.R[4] * camera.t[1] + camera.R[7] * camera.t[2]);
-    C.z = -(camera.R[2] * camera.t[0] + camera.R[5] * camera.t[1] + camera.R[8] * camera.t[2]);
-    pointX.x = tmpX.x + C.x;
-    pointX.y = tmpX.y + C.y;
-    pointX.z = tmpX.z + C.z;
+    C.x = -(camera.R[0]*camera.t[0] + camera.R[3]*camera.t[1] + camera.R[6]*camera.t[2]);
+    C.y = -(camera.R[1]*camera.t[0] + camera.R[4]*camera.t[1] + camera.R[7]*camera.t[2]);
+    C.z = -(camera.R[2]*camera.t[0] + camera.R[5]*camera.t[1] + camera.R[8]*camera.t[2]);
 
-    return pointX;
-}
+    return make_float3(tmp.x + C.x, tmp.y + C.y, tmp.z + C.z);
+}   
 
 float3 Get3DPointonRefCam(const int x, const int y, const float depth, const Camera camera)
-{
-    float3 pointX;
-    // Reprojection
-    pointX.x = depth * (x - camera.K[2]) / camera.K[0];
-    pointX.y = depth * (y - camera.K[5]) / camera.K[4];
-    pointX.z = depth;
+ {
+    // 1) Camera‐space point
+    float3 point_cam;
+    if (camera.model == SPHERE) {
+        // --- FIX 2: Corrected spherical math using cx, cy ---
+        // This generalizes your original code to use the principal point.
+        float lon = (static_cast<float>(x) - camera.params[1]) / static_cast<float>(camera.width) * 2.0f * M_PI;
+        float lat = -(static_cast<float>(y) - camera.params[2]) / static_cast<float>(camera.height) * M_PI;
+        
+        point_cam = make_float3(
+            std::cos(lat) * std::sin(lon) * depth,
+                           -std::sin(lat) * depth,
+            std::cos(lat) * std::cos(lon) * depth
+        );
 
-    return pointX;
-}
+    } else { // pin-hole
+        point_cam = make_float3(
+          depth * (static_cast<float>(x) - camera.K[2]) / camera.K[0],
+          depth * (static_cast<float>(y) - camera.K[5]) / camera.K[4],
+          depth
+        );
+    }
 
-void ProjectonCamera(const float3 PointX, const Camera camera, float2 &point, float &depth)
-{
+    return point_cam;
+}   
+
+
+void ProjectonCamera(const float3 PointX,
+                     const Camera camera,
+                     float2 &point,
+                     float &depth) {
+    // 1) Transform into camera frame (This part was correct)
     float3 tmp;
-    tmp.x = camera.R[0] * PointX.x + camera.R[1] * PointX.y + camera.R[2] * PointX.z + camera.t[0];
-    tmp.y = camera.R[3] * PointX.x + camera.R[4] * PointX.y + camera.R[5] * PointX.z + camera.t[1];
-    tmp.z = camera.R[6] * PointX.x + camera.R[7] * PointX.y + camera.R[8] * PointX.z + camera.t[2];
+    tmp.x = camera.R[0]*PointX.x + camera.R[1]*PointX.y + camera.R[2]*PointX.z + camera.t[0];
+    tmp.y = camera.R[3]*PointX.x + camera.R[4]*PointX.y + camera.R[5]*PointX.z + camera.t[1];
+    tmp.z = camera.R[6]*PointX.x + camera.R[7]*PointX.y + camera.R[8]*PointX.z + camera.t[2];
 
-    depth = camera.K[6] * tmp.x + camera.K[7] * tmp.y + camera.K[8] * tmp.z;
-    point.x = (camera.K[0] * tmp.x + camera.K[1] * tmp.y + camera.K[2] * tmp.z) / depth;
-    point.y = (camera.K[3] * tmp.x + camera.K[4] * tmp.y + camera.K[5] * tmp.z) / depth;
+    if (camera.model == SPHERE) {
+        depth = std::sqrt(tmp.x*tmp.x + tmp.y*tmp.y + tmp.z*tmp.z);
+        if (depth < 1e-6) {
+            point.x = camera.params[1];
+            point.y = camera.params[2];
+            return;
+        }
+
+        // --- FIX 3: Corrected spherical back-projection ---
+        float latitude  = -std::asin(tmp.y / depth);
+        float longitude =  std::atan2(tmp.x, tmp.z);
+        
+        point.x = (longitude / (2.0f * M_PI)) * static_cast<float>(camera.width) + camera.params[1];
+        point.y = (-latitude / M_PI) * static_cast<float>(camera.height) + camera.params[2];
+
+    } else { // pin-hole
+        depth = tmp.z;
+        if (depth < 1e-6) {
+            point.x = camera.K[2];
+            point.y = camera.K[5];
+            return;
+        }
+        point.x = (camera.K[0]*tmp.x + camera.K[1]*tmp.y + camera.K[2]*tmp.z) / depth;
+        point.y = (camera.K[3]*tmp.x + camera.K[4]*tmp.y + camera.K[5]*tmp.z) / depth;
+    }
 }
 
 float GetAngle( const cv::Vec3f &v1, const cv::Vec3f &v2 )
@@ -427,6 +535,8 @@ void StoreColorPlyFileBinaryPointCloud (const std::string &plyFilePath, const st
 
 static float GetDisparity(const Camera &camera, const int2 &p, const float &depth)
 {
+    if (camera.model == SPHERE)
+        return depth;   // already radial distance
     float point3D[3];
     point3D[0] = depth * (p.x - camera.K[2]) / camera.K[0];
     point3D[1] = depth * (p.y - camera.K[5]) / camera.K[4];
@@ -517,10 +627,17 @@ void ACMMP::InuputInitialization(const std::string &dense_folder, const std::vec
         cv::resize(images[i], scaled_image_float, cv::Size(new_cols,new_rows), 0, 0, cv::INTER_LINEAR);
         images[i] = scaled_image_float.clone();
 
+    if (cameras[i].model == SPHERE) {
+        // For spherical, scale the principal point parameters
+        cameras[i].params[1] *= scale_x; // cx
+        cameras[i].params[2] *= scale_y; // cy
+    } else { // PINHOLE
+        // For pinhole, scale the K matrix
         cameras[i].K[0] *= scale_x;
         cameras[i].K[2] *= scale_x;
         cameras[i].K[4] *= scale_y;
         cameras[i].K[5] *= scale_y;
+    }
         cameras[i].height = scaled_image_float.rows;
         cameras[i].width = scaled_image_float.cols;
     }
@@ -688,7 +805,7 @@ void ACMMP::CudaSpaceInitialization(const std::string &dense_folder, const Probl
         cudaMalloc((void**)&scaled_plane_hypotheses_cuda, sizeof(float4) * height * width);
         pre_costs_host = new float[height * width];
         cudaMalloc((void**)&pre_costs_cuda, sizeof(float) * cameras[0].height * cameras[0].width);
-        if (width !=images[0]. rows || height != images[0].cols) {
+        if (width != images[0].cols || height != images[0].rows) {
             params.upsample = true;
             params.scaled_cols = width;
             params.scaled_rows = height;
@@ -873,7 +990,24 @@ float4 ACMMP::GetPriorPlaneParams(const Triangle triangle, const cv::Mat_<float>
 
 float ACMMP::GetDepthFromPlaneParam(const float4 plane_hypothesis, const int x, const int y)
 {
-    return -plane_hypothesis.w * cameras[0].K[0] / ((x - cameras[0].K[2]) * plane_hypothesis.x + (cameras[0].K[0] / cameras[0].K[4]) * (y - cameras[0].K[5]) * plane_hypothesis.y + cameras[0].K[0] * plane_hypothesis.z);
+    if (cameras[0].model == SPHERE) {
+        // Convert pixel to ray direction
+        float lon = (static_cast<float>(x) - cameras[0].params[1]) / static_cast<float>(cameras[0].width) * 2.0f * M_PI;
+        float lat = -(static_cast<float>(y) - cameras[0].params[2]) / static_cast<float>(cameras[0].height) * M_PI;
+        
+        float3 dir = make_float3(
+            std::cos(lat) * std::sin(lon),
+            -std::sin(lat),
+            std::cos(lat) * std::cos(lon)
+        );
+        
+        // Compute intersection with plane
+        float denom = plane_hypothesis.x * dir.x + plane_hypothesis.y * dir.y + plane_hypothesis.z * dir.z;
+        return (std::abs(denom) < 1e-6f) ? 1e6f : (-plane_hypothesis.w / denom);
+    } else {
+        // Original pinhole logic
+        return -plane_hypothesis.w * cameras[0].K[0] / ((x - cameras[0].K[2]) * plane_hypothesis.x + (cameras[0].K[0] / cameras[0].K[4]) * (y - cameras[0].K[5]) * plane_hypothesis.y + cameras[0].K[0] * plane_hypothesis.z);
+    }
 }
 
  void JBUAddImageToTextureFloatGray ( std::vector<cv::Mat_<float>>  &imgs, cudaTextureObject_t texs[], cudaArray *cuArray[], const int &numSelViews)

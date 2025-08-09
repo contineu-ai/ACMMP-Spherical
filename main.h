@@ -32,15 +32,28 @@
 #define MAX_IMAGES 256
 #define JBU_NUM 2
 
-struct Camera {
-    float K[9];
-    float R[9];
-    float t[3];
-    int height;
-    int width;
-    float depth_min;
-    float depth_max;
+enum CameraModel {
+    PINHOLE = 0,
+    SPHERE = 11 // Using 11 to match your comment, but any distinct int is fine
 };
+
+struct Camera {
+  // Use the enum instead of std::string
+  CameraModel model;
+  
+  // Use a fixed-size C-style array for parameters. 
+  // Make it large enough for any model. Pinhole uses 9 (K), Sphere uses 3 (f, cx, cy).
+  // Let's keep K as it is and add sphere_params explicitly.
+  float params[4];       // For SPHERE: [f, cx, cy, unused]
+
+  float R[9];
+  float t[3];
+  float K[9];
+  int   width, height;
+  float depth_min, depth_max;
+};
+
+
 
 struct Problem {
     int ref_image_id;

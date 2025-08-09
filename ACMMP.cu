@@ -1,4 +1,25 @@
 #include "ACMMP.h"
+#include <math_constants.h>  // for CUDART_PI_F
+
+// these two get used before their definitions, so forward‐declare them
+__device__ float3 Get3DPointonWorld_cu(const float x,
+                                       const float y,
+                                       const float depth,
+                                       const Camera camera);
+__device__ void ProjectonCamera_cu(const float3 PointX,
+                                   const Camera camera,
+                                   float2 &point,
+                                   float &depth);
+
+__device__ __forceinline__ float SampleDepthInv(curandState* rs, float dmin, float dmax) {
+    dmin = fmaxf(dmin, 1e-6f);
+    dmax = fmaxf(dmax, dmin + 1e-6f);
+    const float inv_min = 1.0f / dmax;
+    const float inv_max = 1.0f / dmin;
+    const float u = curand_uniform(rs);           // (0,1]
+    const float inv = inv_min + u * (inv_max - inv_min);
+    return 1.0f / inv;
+}
 
 #define mul4(v,k) { \
     v->x = v->x * k; \
@@ -95,6 +116,24 @@ __device__ void NormalizeVec3 (float4 *vec)
     vec->z *= inverse_sqrt;
 }
 
+__device__ inline void PixelToDir(const Camera& cam, const int2 p, float3* dir)
+{
+    if (cam.model == PINHOLE) {
+        dir->x =  (static_cast<float>(p.x) - cam.K[2]) / cam.K[0];
+        dir->y =  (static_cast<float>(p.y) - cam.K[5]) / cam.K[4];
+        dir->z =  1.f;
+        NormalizeVec3(reinterpret_cast<float4*>(dir));
+    } else { // SPHERE
+        // --- FIX 4: Use cx and cy for spherical projection in CUDA ---
+        const float lon = (static_cast<float>(p.x) - cam.params[1]) / static_cast<float>(cam.width) * 2.0f * CUDART_PI_F;
+        const float lat = -(static_cast<float>(p.y) - cam.params[2]) / static_cast<float>(cam.height) * CUDART_PI_F;
+        dir->x =  cosf(lat) * sinf(lon);
+        dir->y = -sinf(lat);
+        dir->z =  cosf(lat) * cosf(lon);
+    }
+}
+
+
 __device__ void TransformPDFToCDF(float* probs, const int num_probs)
 {
     float prob_sum = 0.0f;
@@ -113,24 +152,18 @@ __device__ void TransformPDFToCDF(float* probs, const int num_probs)
 
 __device__ void Get3DPoint(const Camera camera, const int2 p, const float depth, float *X)
 {
-    X[0] = depth * (p.x - camera.K[2]) / camera.K[0];
-    X[1] = depth * (p.y - camera.K[5]) / camera.K[4];
-    X[2] = depth;
+    float3 dir;  PixelToDir(camera, p, &dir);
+    X[0] = dir.x * depth;
+    X[1] = dir.y * depth;
+    X[2] = dir.z * depth;
 }
 
 __device__ float4 GetViewDirection(const Camera camera, const int2 p, const float depth)
 {
-    float X[3];
-    Get3DPoint(camera, p, depth, X);
-    float norm = sqrt(X[0] * X[0] + X[1] * X[1] + X[2] * X[2]);
-
-    float4 view_direction;
-    view_direction.x = X[0] / norm;
-    view_direction.y = X[1] / norm;
-    view_direction.z =  X[2] / norm;
-    view_direction.w = 0;
-    return view_direction;
+    float3 dir;  PixelToDir(camera, p, &dir);
+    return make_float4(dir.x, dir.y, dir.z, 0);
 }
+
 
 __device__ float GetDistance2Origin(const Camera camera, const int2 p, const float depth, const float4 normal)
 {
@@ -153,9 +186,11 @@ __device__  float RangeGauss(float x, float sigma, float mu = 0.0)
 
 __device__ float ComputeDepthfromPlaneHypothesis(const Camera camera, const float4 plane_hypothesis, const int2 p)
 {
-    return -plane_hypothesis.w * camera.K[0] / ((p.x - camera.K[2]) * plane_hypothesis.x + (camera.K[0] / camera.K[4]) * (p.y - camera.K[5]) * plane_hypothesis.y + camera.K[0] * plane_hypothesis.z);
+    float3 dir;  PixelToDir(camera, p, &dir);
+    // The plane is passed in as 'plane_hypothesis'
+    const float denom = plane_hypothesis.x*dir.x + plane_hypothesis.y*dir.y + plane_hypothesis.z*dir.z;
+    return (fabsf(denom) < 1e-6f) ? 1e6f : (-plane_hypothesis.w / denom);    
 }
-
 __device__ float4 GenerateRandomNormal(const Camera camera, const int2 p, curandState *rand_state, const float depth)
 {
     float4 normal;
@@ -229,23 +264,44 @@ __device__ float4 GenerateRandomPlaneHypothesis(const Camera camera, const int2 
     return plane_hypothesis;
 }
 
-__device__ float4 GeneratePertubedPlaneHypothesis(const Camera camera, const int2 p, curandState *rand_state, const float perturbation, const float4 plane_hypothesis_now, const float depth_now, const float depth_min, const float depth_max)
+__device__ float4 GeneratePertubedPlaneHypothesis(const Camera camera, const int2 p,
+                                                  curandState *rand_state, const float perturbation,
+                                                  const float4 plane_hypothesis_now,
+                                                  const float depth_now,
+                                                  const float depth_min, const float depth_max)
 {
-    float depth_perturbed = depth_now;
+    // Local window intersected with global bounds
+    float lo = fmaxf((1.0f - perturbation) * depth_now, depth_min);
+    float hi = fminf((1.0f + perturbation) * depth_now, depth_max);
+    if (!(hi > lo)) { lo = depth_min; hi = depth_max; }
 
-    float dist_perturbed = plane_hypothesis_now.w;
-    const float dist_min_perturbed = (1 - perturbation) * dist_perturbed;
-    const float dist_max_perturbed = (1 + perturbation) * dist_perturbed;
-    float4 plane_hypothesis_temp = plane_hypothesis_now;
-    do {
-        dist_perturbed = curand_uniform(rand_state) * (dist_max_perturbed - dist_min_perturbed) + dist_min_perturbed;
-        plane_hypothesis_temp.w = dist_perturbed;
-        depth_perturbed = ComputeDepthfromPlaneHypothesis(camera, plane_hypothesis_temp, p);
-    } while (depth_perturbed < depth_min && depth_perturbed > depth_max);
+    float4 best_ph   = plane_hypothesis_now;
+    float  best_depth = depth_now;
 
-    float4 plane_hypothesis = GeneratePerturbedNormal(camera, p, plane_hypothesis_now, rand_state, perturbation * M_PI);
-    plane_hypothesis.w = dist_perturbed;
-    return plane_hypothesis;
+    // Try a bounded number of candidates; occasionally jitter the normal
+    for (int k = 0; k < 64; ++k) {
+        const float cand_depth = SampleDepthInv(rand_state, lo, hi);
+
+        // Every 8th try: perturb the normal a bit, otherwise keep current normal
+        float4 n_try = ((k % 8) == 0)
+            ? GeneratePerturbedNormal(camera, p, plane_hypothesis_now, rand_state, 0.1f * CUDART_PI_F)
+            : plane_hypothesis_now;
+
+        float4 ph = n_try;
+        ph.w = GetDistance2Origin(camera, p, cand_depth, n_try);
+
+        const float test = ComputeDepthfromPlaneHypothesis(camera, ph, p);
+        if (test >= depth_min && test <= depth_max && test < 1e6f) {
+            best_ph    = ph;
+            best_depth = test;
+            break;
+        }
+    }
+
+    // Final slight normal jitter around the accepted one
+    float4 out = GeneratePerturbedNormal(camera, p, best_ph, rand_state, perturbation * CUDART_PI_F);
+    out.w = GetDistance2Origin(camera, p, best_depth, out);
+    return out;
 }
 
 __device__ void ComputeHomography(const Camera ref_camera, const Camera src_camera, const float4 plane_hypothesis, float *H)
@@ -346,79 +402,119 @@ __device__ float ComputeBilateralWeight(const float x_dist, const float y_dist, 
     return exp(-spatial_dist / (2.0f * sigma_spatial* sigma_spatial) - color_dist / (2.0f * sigma_color * sigma_color));
 }
 
-__device__ float ComputeBilateralNCC(const cudaTextureObject_t ref_image, const Camera ref_camera, const cudaTextureObject_t src_image, const Camera src_camera, const int2 p, const float4 plane_hypothesis, const PatchMatchParams params)
+__device__ float ComputeBilateralNCC(
+    const cudaTextureObject_t ref_image,
+    const Camera ref_camera,
+    const cudaTextureObject_t src_image,
+    const Camera src_camera,
+    const int2 p,
+    const float4 plane_hypothesis,
+    const PatchMatchParams params)
 {
     const float cost_max = 2.0f;
-    int radius = params.patch_size / 2;
+    const int radius = params.patch_size / 2;
 
-    float H[9];
-    ComputeHomography(ref_camera, src_camera, plane_hypothesis, H);
-    float2 pt = ComputeCorrespondingPoint(H, p);
-    if (pt.x >= src_camera.width || pt.x < 0.0f || pt.y >= src_camera.height || pt.y < 0.0f) {
-        return cost_max;
+    // 1) Depth of the ref center under the hypothesis, world point
+    float depth_ref = ComputeDepthfromPlaneHypothesis(ref_camera, plane_hypothesis, p);
+    float3 Pw_center = Get3DPointonWorld_cu(p.x, p.y, depth_ref, ref_camera);
+
+    // 2) Project the center into the source; validate (SPHERE uses wrap/clamp)
+    float2 pt_center; float dummy_depth;
+    ProjectonCamera_cu(Pw_center, src_camera, pt_center, dummy_depth);
+
+    if (src_camera.model == SPHERE) {
+        pt_center.x = pt_center.x - floorf(pt_center.x / (float)src_camera.width) * (float)src_camera.width;   // wrap lon
+        pt_center.y = fminf(fmaxf(pt_center.y, 0.0f), (float)src_camera.height - 1.0f);                         // clamp lat
+    } else {
+        if (pt_center.x < 0.0f || pt_center.x >= src_camera.width ||
+            pt_center.y < 0.0f || pt_center.y >= src_camera.height) {
+            return cost_max;
+        }
     }
 
-    float cost = 0.0f;
-    {
-        float sum_ref = 0.0f;
-        float sum_ref_ref = 0.0f;
-        float sum_src = 0.0f;
-        float sum_src_src = 0.0f;
-        float sum_ref_src = 0.0f;
-        float bilateral_weight_sum = 0.0f;
-        const float ref_center_pix = tex2D<float>(ref_image, p.x + 0.5f, p.y + 0.5f);
+    // 3) Angular pixel scaling for SPHERE (use local small-angle metric)
+    float scale_x = 1.0f, scale_y = 1.0f, sigma_spatial_eff = params.sigma_spatial;
+    if (ref_camera.model == SPHERE) {
+        const float lat_c = -((float)p.y - ref_camera.params[2]) / (float)ref_camera.height * CUDART_PI_F;
+        scale_x = (2.0f * CUDART_PI_F / (float)ref_camera.width) * cosf(lat_c);  // dlon * cos(lat)
+        scale_y = (CUDART_PI_F / (float)ref_camera.height);                       // dlat
+        sigma_spatial_eff = params.sigma_spatial * (CUDART_PI_F / (float)ref_camera.height); // px → rad
+    }
 
-        for (int i = -radius; i < radius + 1; i += params.radius_increment) {
-            float sum_ref_row = 0.0f;
-            float sum_src_row = 0.0f;
-            float sum_ref_ref_row = 0.0f;
-            float sum_src_src_row = 0.0f;
-            float sum_ref_src_row = 0.0f;
-            float bilateral_weight_sum_row = 0.0f;
+    // 4) Bilateral-weighted NCC accumulation
+    const float ref_center_pix = tex2D<float>(ref_image, p.x + 0.5f, p.y + 0.5f);
+    float sum_ref = 0.0f, sum_ref_ref = 0.0f;
+    float sum_src = 0.0f, sum_src_src = 0.0f;
+    float sum_ref_src = 0.0f, sum_bw = 0.0f;
 
-            for (int j = -radius; j < radius + 1; j += params.radius_increment) {
-                const int2 ref_pt = make_int2(p.x + i, p.y + j);
-                const float ref_pix = tex2D<float>(ref_image, ref_pt.x + 0.5f, ref_pt.y + 0.5f);
-                float2 src_pt = ComputeCorrespondingPoint(H, ref_pt);
-                const float src_pix = tex2D<float>(src_image, src_pt.x + 0.5f, src_pt.y + 0.5f);
+    for (int i = -radius; i <= radius; i += params.radius_increment) {
+        for (int j = -radius; j <= radius; j += params.radius_increment) {
+            const int2 ref_pt = make_int2(p.x + i, p.y + j);
 
-                float weight = ComputeBilateralWeight(i, j, ref_pix, ref_center_pix, params.sigma_spatial, params.sigma_color);
+            // sample reference (assumes texture addressing handles edges as configured)
+            const float ref_pix = tex2D<float>(ref_image, ref_pt.x + 0.5f, ref_pt.y + 0.5f);
 
-                sum_ref_row += weight * ref_pix;
-                sum_ref_ref_row += weight * ref_pix * ref_pix;
-                sum_src_row += weight * src_pix;
-                sum_src_src_row += weight * src_pix * src_pix;
-                sum_ref_src_row += weight * ref_pix * src_pix;
-                bilateral_weight_sum_row += weight;
+            // compute 3D point for this ref offset under the same plane
+            const float depth_n = ComputeDepthfromPlaneHypothesis(ref_camera, plane_hypothesis, ref_pt);
+            float3 Pw_n = Get3DPointonWorld_cu(ref_pt.x, ref_pt.y, depth_n, ref_camera);
+
+            // project into source
+            float2 src_pt; float src_d;
+            ProjectonCamera_cu(Pw_n, src_camera, src_pt, src_d);
+
+            if (src_camera.model == SPHERE) {
+                // wrap longitude, clamp latitude
+                src_pt.x = src_pt.x - floorf(src_pt.x / (float)src_camera.width) * (float)src_camera.width;
+                src_pt.y = fminf(fmaxf(src_pt.y, 0.0f), (float)src_camera.height - 1.0f);
+            } else {
+                if (src_pt.x < 0.0f || src_pt.x >= src_camera.width ||
+                    src_pt.y < 0.0f || src_pt.y >= src_camera.height) {
+                    continue;
+                }
             }
 
-            sum_ref += sum_ref_row;
-            sum_ref_ref += sum_ref_ref_row;
-            sum_src += sum_src_row;
-            sum_src_src += sum_src_src_row;
-            sum_ref_src += sum_ref_src_row;
-            bilateral_weight_sum += bilateral_weight_sum_row;
-        }
-        const float inv_bilateral_weight_sum = 1.0f / bilateral_weight_sum;
-        sum_ref *= inv_bilateral_weight_sum;
-        sum_ref_ref *= inv_bilateral_weight_sum;
-        sum_src *= inv_bilateral_weight_sum;
-        sum_src_src *= inv_bilateral_weight_sum;
-        sum_ref_src *= inv_bilateral_weight_sum;
+            const float src_pix = tex2D<float>(src_image, src_pt.x + 0.5f, src_pt.y + 0.5f);
 
-        const float var_ref = sum_ref_ref - sum_ref * sum_ref;
-        const float var_src = sum_src_src - sum_src * sum_src;
+            // bilateral weight: angular distances for SPHERE, pixel distances otherwise
+            const float dx = (ref_camera.model == SPHERE) ? (i * scale_x) : (float)i;
+            const float dy = (ref_camera.model == SPHERE) ? (j * scale_y) : (float)j;
 
-        const float kMinVar = 1e-5f;
-        if (var_ref < kMinVar || var_src < kMinVar) {
-            return cost = cost_max;
-        } else {
-            const float covar_src_ref = sum_ref_src - sum_ref * sum_src;
-            const float var_ref_src = sqrt(var_ref * var_src);
-            return cost = max(0.0f, min(cost_max, 1.0f - covar_src_ref / var_ref_src));
+            const float w = ComputeBilateralWeight(dx, dy,
+                                                   ref_pix,
+                                                   ref_center_pix,
+                                                   (ref_camera.model == SPHERE) ? sigma_spatial_eff : params.sigma_spatial,
+                                                   params.sigma_color);
+
+            sum_bw      += w;
+            sum_ref     += w * ref_pix;
+            sum_ref_ref += w * ref_pix * ref_pix;
+            sum_src     += w * src_pix;
+            sum_src_src += w * src_pix * src_pix;
+            sum_ref_src += w * ref_pix * src_pix;
         }
     }
+
+    if (sum_bw < 1e-6f) return cost_max;
+
+    // normalize by total weight
+    const float inv_bw = 1.0f / sum_bw;
+    const float m_ref = sum_ref * inv_bw;
+    const float m_src = sum_src * inv_bw;
+    const float e_ref_ref = sum_ref_ref * inv_bw;
+    const float e_src_src = sum_src_src * inv_bw;
+    const float e_ref_src = sum_ref_src * inv_bw;
+
+    const float var_ref = e_ref_ref - m_ref * m_ref;
+    const float var_src = e_src_src - m_src * m_src;
+    const float kMinVar = 1e-5f;
+    if (var_ref < kMinVar || var_src < kMinVar) return cost_max;
+
+    const float covar = e_ref_src - m_ref * m_src;
+    float ncc_cost = 1.0f - covar / sqrtf(var_ref * var_src);
+    ncc_cost = fmaxf(0.0f, fminf(cost_max, ncc_cost));
+    return ncc_cost;
 }
+
 
 __device__ float ComputeMultiViewInitialCostandSelectedViews(const cudaTextureObject_t *images, const Camera *cameras, const int2 p, const float4 plane_hypothesis, unsigned int *selected_views, const PatchMatchParams params)
 {
@@ -466,42 +562,85 @@ __device__ void ComputeMultiViewCostVector(const cudaTextureObject_t *images, co
     }
 }
 
-__device__ float3 Get3DPointonWorld_cu(const float x, const float y, const float depth, const Camera camera)
+__device__ float3 Get3DPointonWorld_cu(const float x,
+                                       const float y,
+                                       const float depth,
+                                       const Camera camera)
 {
-    float3 pointX;
-    float3 tmpX;
-    // Reprojection
-    pointX.x = depth * (x - camera.K[2]) / camera.K[0];
-    pointX.y = depth * (y - camera.K[5]) / camera.K[4];
-    pointX.z = depth;
+    float3 point_cam;
+    if (camera.model == SPHERE) {
+        // --- FIX 5: Use cx and cy for spherical projection in CUDA ---
+        const float lon = (x - camera.params[1]) / static_cast<float>(camera.width) * 2.0f * CUDART_PI_F;
+        const float lat = -(y - camera.params[2]) / static_cast<float>(camera.height) * CUDART_PI_F;
+        point_cam.x = cosf(lat) * sinf(lon) * depth;
+        point_cam.y = -sinf(lat)           * depth;
+        point_cam.z = cosf(lat) * cosf(lon) * depth;
+    } else {
+        point_cam.x = depth * (x - camera.K[2]) / camera.K[0];
+        point_cam.y = depth * (y - camera.K[5]) / camera.K[4];
+        point_cam.z = depth;
+    }
 
-    // Rotation
-    tmpX.x = camera.R[0] * pointX.x + camera.R[3] * pointX.y + camera.R[6] * pointX.z;
-    tmpX.y = camera.R[1] * pointX.x + camera.R[4] * pointX.y + camera.R[7] * pointX.z;
-    tmpX.z = camera.R[2] * pointX.x + camera.R[5] * pointX.y + camera.R[8] * pointX.z;
+    // 2) rotate into world coords
+    float3 tmp;
+    tmp.x = camera.R[0]*point_cam.x + camera.R[3]*point_cam.y + camera.R[6]*point_cam.z;
+    tmp.y = camera.R[1]*point_cam.x + camera.R[4]*point_cam.y + camera.R[7]*point_cam.z;
+    tmp.z = camera.R[2]*point_cam.x + camera.R[5]*point_cam.y + camera.R[8]*point_cam.z;
 
-    // Transformation
+    // 3) translate by camera center
     float3 C;
-    C.x = -(camera.R[0] * camera.t[0] + camera.R[3] * camera.t[1] + camera.R[6] * camera.t[2]);
-    C.y = -(camera.R[1] * camera.t[0] + camera.R[4] * camera.t[1] + camera.R[7] * camera.t[2]);
-    C.z = -(camera.R[2] * camera.t[0] + camera.R[5] * camera.t[1] + camera.R[8] * camera.t[2]);
-    pointX.x = tmpX.x + C.x;
-    pointX.y = tmpX.y + C.y;
-    pointX.z = tmpX.z + C.z;
+    C.x = -(camera.R[0]*camera.t[0] + camera.R[3]*camera.t[1] + camera.R[6]*camera.t[2]);
+    C.y = -(camera.R[1]*camera.t[0] + camera.R[4]*camera.t[1] + camera.R[7]*camera.t[2]);
+    C.z = -(camera.R[2]*camera.t[0] + camera.R[5]*camera.t[1] + camera.R[8]*camera.t[2]);
 
-    return pointX;
+    // 4) final world point
+    return make_float3(tmp.x + C.x,
+                       tmp.y + C.y,
+                       tmp.z + C.z);
 }
 
-__device__ void ProjectonCamera_cu(const float3 PointX, const Camera camera, float2 &point, float &depth)
+__device__ void ProjectonCamera_cu(const float3 PointX,
+                                   const Camera camera,
+                                   float2 &point,
+                                   float &depth)
 {
+    // 1) Transform world point into camera frame
     float3 tmp;
-    tmp.x = camera.R[0] * PointX.x + camera.R[1] * PointX.y + camera.R[2] * PointX.z + camera.t[0];
-    tmp.y = camera.R[3] * PointX.x + camera.R[4] * PointX.y + camera.R[5] * PointX.z + camera.t[1];
-    tmp.z = camera.R[6] * PointX.x + camera.R[7] * PointX.y + camera.R[8] * PointX.z + camera.t[2];
+    tmp.x = camera.R[0] * PointX.x + camera.R[1] * PointX.y +
+            camera.R[2] * PointX.z + camera.t[0];
+    tmp.y = camera.R[3] * PointX.x + camera.R[4] * PointX.y +
+            camera.R[5] * PointX.z + camera.t[1];
+    tmp.z = camera.R[6] * PointX.x + camera.R[7] * PointX.y +
+            camera.R[8] * PointX.z + camera.t[2];
 
-    depth = camera.K[6] * tmp.x + camera.K[7] * tmp.y + camera.K[8] * tmp.z;
-    point.x = (camera.K[0] * tmp.x + camera.K[1] * tmp.y + camera.K[2] * tmp.z) / depth;
-    point.y = (camera.K[3] * tmp.x + camera.K[4] * tmp.y + camera.K[5] * tmp.z) / depth;
+    if (camera.model == SPHERE) {
+        depth = sqrtf(tmp.x*tmp.x + tmp.y*tmp.y + tmp.z*tmp.z);
+        if (depth < 1e-6f) {
+            point.x = camera.params[1];
+            point.y = camera.params[2];
+            return;
+        }
+
+        // --- FIX 6: Use cx and cy for spherical back-projection in CUDA ---
+        float latitude  = -asinf(tmp.y / depth);
+        float longitude =  atan2f(tmp.x, tmp.z);
+
+        point.x = (longitude / (2.0f * CUDART_PI_F)) * static_cast<float>(camera.width) + camera.params[1];
+        point.y = (-latitude / CUDART_PI_F) * static_cast<float>(camera.height) + camera.params[2];
+
+    }
+    else {
+        // 2b) Pinhole: depth is z-coordinate
+        depth = tmp.z;
+
+        // 3b) Standard intrinsics: (fx X + skew Y + cx Z)/Z
+        point.x = (camera.K[0] * tmp.x +
+                   camera.K[1] * tmp.y +
+                   camera.K[2] * tmp.z) / depth;
+        point.y = (camera.K[3] * tmp.x +
+                   camera.K[4] * tmp.y +
+                   camera.K[5] * tmp.z) / depth;
+    }
 }
 
 __device__ float ComputeGeomConsistencyCost(const cudaTextureObject_t depth_image, const Camera ref_camera, const Camera src_camera, const float4 plane_hypothesis, const int2 p)
@@ -655,77 +794,139 @@ __global__ void RandomInitialization(cudaTextureObjects *texture_objects, Camera
     }
 }
 
-__device__ void PlaneHypothesisRefinement(const cudaTextureObject_t *images, const cudaTextureObject_t *depth_images, const Camera *cameras, float4 *plane_hypothesis, float *depth, float *cost, curandState *rand_state, const float *view_weights, const float weight_norm, float4 *prior_planes, unsigned int *plane_masks, float *restricted_cost, const int2 p, const PatchMatchParams params)
+__device__ void PlaneHypothesisRefinement(const cudaTextureObject_t *images,
+                                          const cudaTextureObject_t *depth_images,
+                                          const Camera *cameras,
+                                          float4 *plane_hypothesis,
+                                          float *depth,
+                                          float *cost,
+                                          curandState *rand_state,
+                                          const float *view_weights,
+                                          const float weight_norm,
+                                          float4 *prior_planes,
+                                          unsigned int *plane_masks,
+                                          float *restricted_cost,
+                                          const int2 p,
+                                          const PatchMatchParams params)
 {
-    float perturbation = 0.02f;
+    // Early exit if no views were selected
+    if (weight_norm <= 0.0f) return;
+
+    const float perturbation = 0.02f;
     const int center = p.y * cameras[0].width + p.x;
 
-    float gamma = 0.5f;
-    float depth_sigma = (params.depth_max - params.depth_min) / 64.0f;
-    float two_depth_sigma_squared = 2 * depth_sigma * depth_sigma;
-    float angle_sigma = M_PI * (5.0f / 180.0f);
-    float two_angle_sigma_squared = 2 * angle_sigma * angle_sigma;
-    float beta = 0.18f;
-    float depth_prior = 0.0f;
+    // ACMMP's prior parameters (preserved)
+    const float gamma = 0.5f;
+    const float depth_sigma = (params.depth_max - params.depth_min) / 64.0f;
+    const float two_depth_sigma_squared = 2 * depth_sigma * depth_sigma;
+    const float angle_sigma = CUDART_PI_F * (5.0f / 180.0f);  // Using CUDART_PI_F for consistency
+    const float two_angle_sigma_squared = 2 * angle_sigma * angle_sigma;
+    const float beta = 0.18f;
 
+    // 1) Random candidate depth generation (improved with ACMH approach)
     float depth_rand;
     float4 plane_hypothesis_rand;
+    
     if (params.planar_prior && plane_masks[center] > 0) {
-        depth_prior = ComputeDepthfromPlaneHypothesis(cameras[0], prior_planes[center], p);
-        depth_rand = curand_uniform(rand_state) * 6 * depth_sigma + (depth_prior - 3 * depth_sigma);
+        // Use prior-based sampling
+        float depth_prior = ComputeDepthfromPlaneHypothesis(cameras[0], prior_planes[center], p);
+        depth_rand = SampleDepthInv(rand_state, 
+                                   fmaxf(depth_prior - 3 * depth_sigma, params.depth_min),
+                                   fminf(depth_prior + 3 * depth_sigma, params.depth_max));
         plane_hypothesis_rand = GeneratePerturbedNormal(cameras[0], p, prior_planes[center], rand_state, angle_sigma);
+    } else {
+        // Standard random sampling
+        depth_rand = SampleDepthInv(rand_state, params.depth_min, params.depth_max);
+        plane_hypothesis_rand = GenerateRandomNormal(cameras[0], p, rand_state, depth_rand);
     }
-    else {
-        depth_rand = curand_uniform(rand_state) * (params.depth_max - params.depth_min) + params.depth_min;
-        plane_hypothesis_rand = GenerateRandomNormal(cameras[0], p, rand_state, *depth);
-    }
-    float depth_perturbed = *depth;
-    const float depth_min_perturbed = (1 - perturbation) * depth_perturbed;
-    const float depth_max_perturbed = (1 + perturbation) * depth_perturbed;
-    do {
-        depth_perturbed = curand_uniform(rand_state) * (depth_max_perturbed - depth_min_perturbed) + depth_min_perturbed;
-    } while (depth_perturbed < params.depth_min && depth_perturbed > params.depth_max);
-    float4 plane_hypothesis_perturbed = GeneratePerturbedNormal(cameras[0], p, *plane_hypothesis, rand_state, perturbation * M_PI);
 
+    // 2) Local window around current depth (ACMH's bounded + healed approach)
+    float lo = fmaxf((1.0f - perturbation) * (*depth), params.depth_min);
+    float hi = fminf((1.0f + perturbation) * (*depth), params.depth_max);
+    if (!(hi > lo)) { 
+        lo = params.depth_min; 
+        hi = params.depth_max; 
+    }
+
+    float depth_perturbed = *depth;
+    bool ok = false;
+    for (int k = 0; k < 32; ++k) {
+        float cand = SampleDepthInv(rand_state, lo, hi);
+        if (cand >= params.depth_min && cand <= params.depth_max) {
+            depth_perturbed = cand;
+            ok = true;
+            break;
+        }
+    }
+    if (!ok) {
+        depth_perturbed = fminf(fmaxf(*depth, params.depth_min), params.depth_max);
+    }
+
+    // 3) Slightly perturbed normal around current one
+    float4 plane_hypothesis_perturbed = 
+        GeneratePerturbedNormal(cameras[0], p, *plane_hypothesis, rand_state, perturbation * CUDART_PI_F);
+
+    // 4) Evaluate candidates
     const int num_planes = 5;
-    float depths[num_planes] = {depth_rand, *depth, depth_rand, *depth, depth_perturbed};
-    float4 normals[num_planes] = {*plane_hypothesis, plane_hypothesis_rand, plane_hypothesis_rand, plane_hypothesis_perturbed, *plane_hypothesis};
+    float  depths[num_planes]  = { depth_rand, *depth, depth_rand, *depth, depth_perturbed };
+    float4 normals[num_planes] = { *plane_hypothesis, plane_hypothesis_rand,
+                                   plane_hypothesis_rand, plane_hypothesis_perturbed,
+                                   *plane_hypothesis };
 
     for (int i = 0; i < num_planes; ++i) {
-        float cost_vector[32] = {2.0f};
+        float cost_vector[32] = { 2.0f };
         float4 temp_plane_hypothesis = normals[i];
         temp_plane_hypothesis.w = GetDistance2Origin(cameras[0], p, depths[i], temp_plane_hypothesis);
+
+        // Compute multi-view photo-consistency costs
         ComputeMultiViewCostVector(images, cameras, p, temp_plane_hypothesis, cost_vector, params);
 
+        // Aggregate with view weights (+ optional geom consistency)
         float temp_cost = 0.0f;
         for (int j = 0; j < params.num_images - 1; ++j) {
-            if (view_weights[j] > 0) {
+            if (view_weights[j] > 0.0f) {
                 if (params.geom_consistency) {
-                    temp_cost += view_weights[j] * (cost_vector[j] + 0.2f * ComputeGeomConsistencyCost(depth_images[j+1], cameras[0], cameras[j+1], temp_plane_hypothesis, p));
-                }
-                else {
+                    temp_cost += view_weights[j] * (cost_vector[j] +
+                                  0.1f * ComputeGeomConsistencyCost(depth_images[j+1],
+                                                                    cameras[0], cameras[j+1],
+                                                                    temp_plane_hypothesis, p));
+                } else {
                     temp_cost += view_weights[j] * cost_vector[j];
                 }
             }
         }
-        temp_cost /= weight_norm;
+        if (weight_norm > 0.0f) {
+            temp_cost /= weight_norm;  // Safe divide
+        }
 
-        float depth_before = ComputeDepthfromPlaneHypothesis(cameras[0], temp_plane_hypothesis, p);
+        // Validate depth
+        const float depth_before = ComputeDepthfromPlaneHypothesis(cameras[0], temp_plane_hypothesis, p);
+        if (depth_before < params.depth_min || depth_before > params.depth_max || depth_before >= 1e6f) {
+            continue;  // Skip invalid depths
+        }
+
+        // Accept based on prior availability (ACMMP's strength preserved)
         if (params.planar_prior && plane_masks[center] > 0) {
+            // Prior-based acceptance
+            float depth_prior = ComputeDepthfromPlaneHypothesis(cameras[0], prior_planes[center], p);
             float depth_diff = depths[i] - depth_prior;
             float angle_cos = Vec3DotVec3(prior_planes[center], temp_plane_hypothesis);
-            float angle_diff = acos(angle_cos);
-            float prior = gamma + exp(- depth_diff * depth_diff / two_depth_sigma_squared) * exp(- angle_diff * angle_diff / two_angle_sigma_squared);
-            float restricted_temp_cost = exp(-temp_cost * temp_cost / beta) * prior;
-            if (depth_before >= params.depth_min && depth_before <= params.depth_max && restricted_temp_cost > *restricted_cost) {
+            angle_cos = fminf(fmaxf(angle_cos, -1.0f), 1.0f);  // Clamp for numerical stability
+            float angle_diff = acosf(angle_cos);
+            
+            float prior = gamma + expf(-depth_diff * depth_diff / two_depth_sigma_squared) * 
+                                 expf(-angle_diff * angle_diff / two_angle_sigma_squared);
+            float restricted_temp_cost = expf(-temp_cost * temp_cost / beta) * prior;
+            
+            if (restricted_temp_cost > *restricted_cost) {
                 *depth = depth_before;
                 *plane_hypothesis = temp_plane_hypothesis;
                 *cost = temp_cost;
                 *restricted_cost = restricted_temp_cost;
             }
-        }
-        else {
-            if (depth_before >= params.depth_min && depth_before <= params.depth_max && temp_cost < *cost) {
+        } else {
+            // Standard acceptance (ACMH's clean approach)
+            if (temp_cost < *cost) {
                 *depth = depth_before;
                 *plane_hypothesis = temp_plane_hypothesis;
                 *cost = temp_cost;
@@ -827,7 +1028,7 @@ __device__ void CheckerboardPropagation(const cudaTextureObject_t *images, const
         for (int i = 1; i < 11; ++i) {
             if (p.x < width - 3 - 2 * i) {
                 int pointTemp = right_far + 2 * i;
-                if (costMin < costs[pointTemp]) {
+                if (costs[pointTemp] < costMin) {
                     costMin = costs[pointTemp];
                     costMinPoint = pointTemp;
                 }
@@ -1445,4 +1646,460 @@ void JBU::CudaRun()
     float milliseconds = 0;
     cudaEventElapsedTime(&milliseconds, start, stop);
     printf("Total time needed for computation: %f seconds\n", milliseconds / 1000.f);
+}
+
+
+#include <thrust/device_vector.h>
+#include <thrust/host_vector.h>
+
+// ─── Simple fusion data structures ──────────────────────────
+struct FusionProblem {
+    int ref_image_id;
+    int num_src_images;
+    int src_image_ids[32];
+    int src_image_indices[32];
+};
+
+// ─── Simple Per-pixel fusion kernel (mirroring CPU logic) ─────────────
+__global__ void SimpleFusionKernel(
+    cudaTextureObject_t* depth_textures,
+    cudaTextureObject_t* normal_textures,
+    cudaTextureObject_t* image_textures,
+    Camera* cameras,
+    int ref_image_idx,
+    FusionProblem problem,
+    PointList* output_points,
+    int* valid_flags,
+    int width,
+    int height
+) {
+    int c = blockIdx.x * blockDim.x + threadIdx.x;  // column (x)
+    int r = blockIdx.y * blockDim.y + threadIdx.y;  // row (y)
+    
+    if (c >= width || r >= height) return;
+    
+    int idx = r * width + c;
+    const Camera& ref_cam = cameras[ref_image_idx];
+
+    // Sample reference depth
+    float ref_depth = tex2D<float>(depth_textures[ref_image_idx], c, r);
+    
+    if (ref_depth <= 0.0f) {
+        valid_flags[idx] = 0;
+        return;
+    }
+
+    // Get 3D point in world coordinates
+    float3 PointX = Get3DPointonWorld_cu(static_cast<float>(c), static_cast<float>(r), ref_depth, ref_cam);
+    
+    // Sample reference normal and color
+    float4 ref_normal_tex = tex2D<float4>(normal_textures[ref_image_idx], c, r);
+    float3 ref_normal = make_float3(ref_normal_tex.x, ref_normal_tex.y, ref_normal_tex.z);
+    
+    float4 ref_color = tex2D<float4>(image_textures[ref_image_idx], c, r);
+    
+    // Initialize sums for averaging
+    float3 point_sum = PointX;
+    float3 normal_sum = ref_normal;
+    float color_sum[3] = {
+        ref_color.z * 255.0f,  // R (OpenCV uses BGR)
+        ref_color.y * 255.0f,  // G
+        ref_color.x * 255.0f   // B
+    };
+    int num_consistent = 1;
+    
+    // Check all source images
+    for (int j = 0; j < problem.num_src_images; ++j) {
+        int src_idx = problem.src_image_indices[j];
+        if (src_idx < 0) continue;
+        
+        const Camera& src_cam = cameras[src_idx];
+        
+        // Project 3D point to source camera
+        float2 proj_point;
+        float proj_depth_in_src;
+        ProjectonCamera_cu(PointX, src_cam, proj_point, proj_depth_in_src);
+        
+        int src_c = static_cast<int>(proj_point.x + 0.5f);
+        int src_r = static_cast<int>(proj_point.y + 0.5f);
+        
+        // Check if projection is within image bounds
+        if (src_c < 0 || src_c >= src_cam.width || src_r < 0 || src_r >= src_cam.height) 
+            continue;
+        
+        // Sample source depth
+        float src_depth = tex2D<float>(depth_textures[src_idx], src_c, src_r);
+        if (src_depth <= 0.0f) continue;
+        
+        // Get 3D point from source depth
+        float3 PointX_src = Get3DPointonWorld_cu(static_cast<float>(src_c), static_cast<float>(src_r), src_depth, src_cam);
+        
+        // Reproject source 3D point back to reference camera
+        float2 reproj_point_in_ref;
+        float dummy_depth;
+        ProjectonCamera_cu(PointX_src, ref_cam, reproj_point_in_ref, dummy_depth);
+        
+        // Calculate reprojection error
+        float reproj_error = hypotf(c - reproj_point_in_ref.x, r - reproj_point_in_ref.y);
+        
+        // Calculate relative depth difference
+        float relative_depth_diff = fabsf(proj_depth_in_src - src_depth) / src_depth;
+        
+        // Sample source normal
+        float4 src_normal_tex = tex2D<float4>(normal_textures[src_idx], src_c, src_r);
+        float3 src_normal = make_float3(src_normal_tex.x, src_normal_tex.y, src_normal_tex.z);
+        
+        // Calculate angle between normals
+        float dot_product = ref_normal.x * src_normal.x + ref_normal.y * src_normal.y + ref_normal.z * src_normal.z;
+        dot_product = fmaxf(-1.0f, fminf(1.0f, dot_product));  // Clamp to [-1,1]
+        float angle = acosf(dot_product);
+        
+        // Check consistency (same thresholds as CPU version)
+        if (reproj_error < 1.0 && relative_depth_diff < 0.01f && angle < 0.149f) {
+            // Add to sums for averaging
+            point_sum.x += PointX_src.x;
+            point_sum.y += PointX_src.y;
+            point_sum.z += PointX_src.z;
+            
+            normal_sum.x += src_normal.x;
+            normal_sum.y += src_normal.y;
+            normal_sum.z += src_normal.z;
+            
+            float4 src_color = tex2D<float4>(image_textures[src_idx], src_c, src_r);
+            color_sum[0] += src_color.z * 255.0f;  // R
+            color_sum[1] += src_color.y * 255.0f;  // G
+            color_sum[2] += src_color.x * 255.0f;  // B
+            
+            num_consistent++;
+        }
+    }
+    
+    // Check if we have enough consistent views (same as CPU: >= 3)
+    if (num_consistent >= 3) {
+        PointList final_point;
+        
+        // Average the 3D points
+        final_point.coord = make_float3(
+            point_sum.x / num_consistent,
+            point_sum.y / num_consistent,
+            point_sum.z / num_consistent
+        );
+        
+        // Average and normalize the normals
+        float3 avg_normal = make_float3(
+            normal_sum.x / num_consistent,
+            normal_sum.y / num_consistent,
+            normal_sum.z / num_consistent
+        );
+        float normal_length = hypotf(hypotf(avg_normal.x, avg_normal.y), avg_normal.z);
+        if (normal_length > 0.0f) {
+            avg_normal.x /= normal_length;
+            avg_normal.y /= normal_length;
+            avg_normal.z /= normal_length;
+        }
+        final_point.normal = avg_normal;
+        
+        // Average the colors
+        final_point.color = make_float3(
+            color_sum[0] / num_consistent,
+            color_sum[1] / num_consistent,
+            color_sum[2] / num_consistent
+        );
+        
+        output_points[idx] = final_point;
+        valid_flags[idx] = 1;
+    } else {
+        valid_flags[idx] = 0;
+    }
+}
+
+// ─── Simplified CUDA Fusion implementation ──────────────
+void RunFusionCuda(const std::string &dense_folder,
+                   const std::vector<Problem> &problems,
+                   bool geom_consistency)
+{
+    const size_t N = problems.size();
+    const std::string imgF = dense_folder + "/images";
+    const std::string camF = dense_folder + "/cams";
+    char buf[256];
+
+    std::cout << "[CUDA Fusion] Starting simple fusion with " << N << " images..." << std::endl;
+
+    // Load and validate all data
+    std::vector<Camera> cams;
+    std::vector<cv::Mat_<float>> deps;
+    std::vector<cv::Mat_<cv::Vec3f>> normals;
+    std::vector<cv::Mat> imgs;
+    std::vector<Problem> valid_problems;
+    std::map<int, int> id_to_index;
+
+    for (size_t i = 0; i < N; ++i) {
+        int id = problems[i].ref_image_id;
+        
+        // Load camera
+        sprintf(buf, "%s/%08d_cam.txt", camF.c_str(), id);
+        Camera cam = ReadCamera(buf);
+        
+        // Load depth
+        std::string depth_suffix = geom_consistency ? "/depths_geom.dmb" : "/depths.dmb";
+        sprintf(buf, "%s/ACMMP/2333_%08d%s", dense_folder.c_str(), id, depth_suffix.c_str());
+        cv::Mat_<float> depth;
+        if (readDepthDmb(buf, depth) != 0) {
+            std::cerr << "Warning: Could not load depth for image " << id << std::endl;
+            continue;
+        }
+        
+        // Load normals
+        sprintf(buf, "%s/ACMMP/2333_%08d/normals.dmb", dense_folder.c_str(), id);
+        cv::Mat_<cv::Vec3f> normal;
+        if (readNormalDmb(buf, normal) != 0) {
+            std::cerr << "Warning: Could not load normals for image " << id << std::endl;
+            continue;
+        }
+        
+        // Load image
+        sprintf(buf, "%s/%08d.jpg", imgF.c_str(), id);
+        cv::Mat img = cv::imread(buf, cv::IMREAD_COLOR);
+        if (img.empty()) {
+            std::cerr << "Warning: Could not load image " << id << std::endl;
+            continue;
+        }
+        
+        // Rescale image and camera to match depth resolution
+        cv::Mat_<cv::Vec3b> img_color(img);
+        cv::Mat_<cv::Vec3b> scaled_color;
+        RescaleImageAndCamera(img_color, scaled_color, depth, cam);
+        img = cv::Mat(scaled_color);
+        
+        // Store valid data
+        id_to_index[id] = cams.size();
+        cams.push_back(cam);
+        deps.push_back(depth);
+        normals.push_back(normal);
+        imgs.push_back(img);
+        valid_problems.push_back(problems[i]);
+    }
+    
+    size_t num_valid = cams.size();
+    std::cout << "[CUDA Fusion] Successfully loaded " << num_valid << "/" << N << " images" << std::endl;
+    
+    if (num_valid == 0) {
+        std::cerr << "Error: No valid images to process!" << std::endl;
+        return;
+    }
+
+    // Allocate texture arrays
+    std::vector<cudaArray*> depth_arrays(num_valid);
+    std::vector<cudaArray*> normal_arrays(num_valid);
+    std::vector<cudaArray*> image_arrays(num_valid);
+    std::vector<cudaTextureObject_t> depth_textures_host(num_valid);
+    std::vector<cudaTextureObject_t> normal_textures_host(num_valid);
+    std::vector<cudaTextureObject_t> image_textures_host(num_valid);
+
+    // Create textures for each image
+    for (size_t i = 0; i < num_valid; ++i) {
+        int width = deps[i].cols;
+        int height = deps[i].rows;
+        
+        // Create depth texture (single channel float)
+        cudaChannelFormatDesc depth_desc = cudaCreateChannelDesc<float>();
+        CUDA_SAFE_CALL(cudaMallocArray(&depth_arrays[i], &depth_desc, width, height));
+        CUDA_SAFE_CALL(cudaMemcpy2DToArray(depth_arrays[i], 0, 0, 
+                                           deps[i].ptr<float>(), deps[i].step[0], 
+                                           width * sizeof(float), height, 
+                                           cudaMemcpyHostToDevice));
+
+        cudaResourceDesc depth_res_desc = {};
+        depth_res_desc.resType = cudaResourceTypeArray;
+        depth_res_desc.res.array.array = depth_arrays[i];
+
+        cudaTextureDesc depth_tex_desc = {};
+        depth_tex_desc.addressMode[0] = cudaAddressModeWrap;
+        depth_tex_desc.addressMode[1] = cudaAddressModeClamp;
+        depth_tex_desc.filterMode = cudaFilterModePoint;
+        depth_tex_desc.readMode = cudaReadModeElementType;
+        depth_tex_desc.normalizedCoords = false;
+
+        CUDA_SAFE_CALL(cudaCreateTextureObject(&depth_textures_host[i], 
+                                               &depth_res_desc, &depth_tex_desc, NULL));
+
+        // Create normal texture (4 channel float for Vec3f + padding)
+        cv::Mat normal_rgba;
+        cv::cvtColor(normals[i], normal_rgba, cv::COLOR_RGB2RGBA);  // Add alpha channel
+        
+        cudaChannelFormatDesc normal_desc = cudaCreateChannelDesc<float4>();
+        CUDA_SAFE_CALL(cudaMallocArray(&normal_arrays[i], &normal_desc, width, height));
+        CUDA_SAFE_CALL(cudaMemcpy2DToArray(normal_arrays[i], 0, 0, 
+                                           normal_rgba.ptr<float>(), normal_rgba.step[0], 
+                                           width * sizeof(float4), height, 
+                                           cudaMemcpyHostToDevice));
+
+        cudaResourceDesc normal_res_desc = {};
+        normal_res_desc.resType = cudaResourceTypeArray;
+        normal_res_desc.res.array.array = normal_arrays[i];
+
+        cudaTextureDesc normal_tex_desc = {};
+        normal_tex_desc.addressMode[0] = cudaAddressModeWrap;
+        normal_tex_desc.addressMode[1] = cudaAddressModeClamp;
+        normal_tex_desc.filterMode = cudaFilterModePoint;
+        normal_tex_desc.readMode = cudaReadModeElementType;
+        normal_tex_desc.normalizedCoords = false;
+
+        CUDA_SAFE_CALL(cudaCreateTextureObject(&normal_textures_host[i], 
+                                               &normal_res_desc, &normal_tex_desc, NULL));
+
+        // Create image texture (4 channel float for RGBA)
+        cv::Mat rgba_float;
+        cv::Mat rgba;
+        cv::cvtColor(imgs[i], rgba, cv::COLOR_BGR2RGBA);
+        rgba.convertTo(rgba_float, CV_32FC4, 1.0/255.0);
+
+        cudaChannelFormatDesc image_desc = cudaCreateChannelDesc<float4>();
+        CUDA_SAFE_CALL(cudaMallocArray(&image_arrays[i], &image_desc, width, height));
+        CUDA_SAFE_CALL(cudaMemcpy2DToArray(image_arrays[i], 0, 0, 
+                                           rgba_float.ptr<float>(), rgba_float.step[0], 
+                                           width * sizeof(float4), height, 
+                                           cudaMemcpyHostToDevice));
+
+        cudaResourceDesc image_res_desc = {};
+        image_res_desc.resType = cudaResourceTypeArray;
+        image_res_desc.res.array.array = image_arrays[i];
+
+        cudaTextureDesc image_tex_desc = {};
+        image_tex_desc.addressMode[0] = cudaAddressModeWrap;
+        image_tex_desc.addressMode[1] = cudaAddressModeClamp;
+        image_tex_desc.filterMode = cudaFilterModeLinear;
+        image_tex_desc.readMode = cudaReadModeElementType;
+        image_tex_desc.normalizedCoords = false;
+
+        CUDA_SAFE_CALL(cudaCreateTextureObject(&image_textures_host[i], 
+                                               &image_res_desc, &image_tex_desc, NULL));
+    }
+
+    // Copy texture objects to device
+    cudaTextureObject_t* depth_textures_cuda;
+    cudaTextureObject_t* normal_textures_cuda;
+    cudaTextureObject_t* image_textures_cuda;
+    CUDA_SAFE_CALL(cudaMalloc(&depth_textures_cuda, num_valid * sizeof(cudaTextureObject_t)));
+    CUDA_SAFE_CALL(cudaMalloc(&normal_textures_cuda, num_valid * sizeof(cudaTextureObject_t)));
+    CUDA_SAFE_CALL(cudaMalloc(&image_textures_cuda, num_valid * sizeof(cudaTextureObject_t)));
+    
+    CUDA_SAFE_CALL(cudaMemcpy(depth_textures_cuda, depth_textures_host.data(), 
+                              num_valid * sizeof(cudaTextureObject_t), cudaMemcpyHostToDevice));
+    CUDA_SAFE_CALL(cudaMemcpy(normal_textures_cuda, normal_textures_host.data(), 
+                              num_valid * sizeof(cudaTextureObject_t), cudaMemcpyHostToDevice));
+    CUDA_SAFE_CALL(cudaMemcpy(image_textures_cuda, image_textures_host.data(), 
+                              num_valid * sizeof(cudaTextureObject_t), cudaMemcpyHostToDevice));
+
+    // Copy cameras to device
+    Camera* cameras_cuda;
+    CUDA_SAFE_CALL(cudaMalloc(&cameras_cuda, num_valid * sizeof(Camera)));
+    CUDA_SAFE_CALL(cudaMemcpy(cameras_cuda, cams.data(), 
+                              num_valid * sizeof(Camera), cudaMemcpyHostToDevice));
+
+    // Prepare fusion problems
+    std::vector<FusionProblem> fusion_problems(num_valid);
+    for (size_t i = 0; i < num_valid; ++i) {
+        fusion_problems[i].ref_image_id = valid_problems[i].ref_image_id;
+        fusion_problems[i].num_src_images = std::min((int)valid_problems[i].src_image_ids.size(), 32);
+        
+        for (int j = 0; j < fusion_problems[i].num_src_images; ++j) {
+            int src_id = valid_problems[i].src_image_ids[j];
+            fusion_problems[i].src_image_ids[j] = src_id;
+            
+            auto it = id_to_index.find(src_id);
+            if (it != id_to_index.end()) {
+                fusion_problems[i].src_image_indices[j] = it->second;
+            } else {
+                fusion_problems[i].src_image_indices[j] = -1;
+            }
+        }
+    }
+
+    // Process each image
+    std::vector<PointList> all_points;
+    size_t total_points = 0;
+    
+    for (size_t i = 0; i < num_valid; ++i) {
+        int width = cams[i].width;
+        int height = cams[i].height;
+        int total_pixels = width * height;
+        
+        std::cout << "[CUDA Fusion] Processing image " << (i+1) << "/" << num_valid 
+                  << " (ID=" << valid_problems[i].ref_image_id << ", " 
+                  << width << "x" << height << ")" << std::endl;
+
+        // Allocate device memory
+        PointList* output_points_cuda;
+        int* valid_flags_cuda;
+        CUDA_SAFE_CALL(cudaMalloc(&output_points_cuda, total_pixels * sizeof(PointList)));
+        CUDA_SAFE_CALL(cudaMalloc(&valid_flags_cuda, total_pixels * sizeof(int)));
+        CUDA_SAFE_CALL(cudaMemset(valid_flags_cuda, 0, total_pixels * sizeof(int)));
+
+        // Launch kernel
+        dim3 block_size(16, 16);
+        dim3 grid_size((width + block_size.x - 1) / block_size.x, 
+                      (height + block_size.y - 1) / block_size.y);
+
+        SimpleFusionKernel<<<grid_size, block_size>>>(
+            depth_textures_cuda,
+            normal_textures_cuda,
+            image_textures_cuda,
+            cameras_cuda,
+            i,
+            fusion_problems[i],
+            output_points_cuda,
+            valid_flags_cuda,
+            width,
+            height
+        );
+
+        CUDA_SAFE_CALL(cudaGetLastError());
+        CUDA_SAFE_CALL(cudaDeviceSynchronize());
+
+        // Copy results back
+        std::vector<PointList> points(total_pixels);
+        std::vector<int> valid_flags(total_pixels);
+        
+        CUDA_SAFE_CALL(cudaMemcpy(points.data(), output_points_cuda, 
+                                  total_pixels * sizeof(PointList), cudaMemcpyDeviceToHost));
+        CUDA_SAFE_CALL(cudaMemcpy(valid_flags.data(), valid_flags_cuda, 
+                                  total_pixels * sizeof(int), cudaMemcpyDeviceToHost));
+
+        // Collect valid points
+        size_t valid_count = 0;
+        for (int j = 0; j < total_pixels; ++j) {
+            if (valid_flags[j]) {
+                all_points.push_back(points[j]);
+                valid_count++;
+            }
+        }
+        
+        total_points += valid_count;
+        std::cout << "  -> Generated " << valid_count << " points" << std::endl;
+
+        // Cleanup
+        cudaFree(output_points_cuda);
+        cudaFree(valid_flags_cuda);
+    }
+
+    // Write output
+    std::string output_path = dense_folder + "/ACMMP/ACMM_model_cuda_5.ply";
+    StoreColorPlyFileBinaryPointCloud(output_path, all_points);
+    std::cout << "[CUDA Fusion] Complete! Wrote " << total_points 
+              << " points to " << output_path << std::endl;
+
+    // Cleanup
+    for (size_t i = 0; i < num_valid; ++i) {
+        cudaDestroyTextureObject(depth_textures_host[i]);
+        cudaDestroyTextureObject(normal_textures_host[i]);
+        cudaDestroyTextureObject(image_textures_host[i]);
+        cudaFreeArray(depth_arrays[i]);
+        cudaFreeArray(normal_arrays[i]);
+        cudaFreeArray(image_arrays[i]);
+    }
+    cudaFree(depth_textures_cuda);
+    cudaFree(normal_textures_cuda);
+    cudaFree(image_textures_cuda);
+    cudaFree(cameras_cuda);
 }

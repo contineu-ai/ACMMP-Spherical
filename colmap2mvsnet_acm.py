@@ -1,471 +1,432 @@
 #!/usr/bin/env python
 """
-Copyright 2019, Jingyang Zhang and Yao Yao, HKUST. Model reading is provided by COLMAP.
-Preprocess script.
-View selection is modified according to COLMAP's strategy, Qingshan Xu
+COLMAP → ACMMP/MVSNet converter with:
+
+* tqdm progress bars
+* pair-pruning (top-K neighbours, min shared tracks)
+* robust skip of images with no 3-D points
+* binary (.bin) or text (.txt) sparse model
+
+Example
+-------
+python3 colmap2mvsnet_acm.py \
+    --dense_folder  /path/to/dense            \
+    --save_folder   out                       \
+    --model_ext     .bin                      \
+    --top_k         20                        \
+    --min_shared    15                        \
+    --chunksize     64
 """
 
 from __future__ import print_function
-import collections
-import struct
-import numpy as np
-import multiprocessing as mp
+import os, shutil, struct, argparse, collections, multiprocessing as mp
 from functools import partial
-import os
-import argparse
-import shutil
+from itertools import combinations
+import numpy as np
 import cv2
+from tqdm import tqdm
 
-#============================ read_model.py ============================#
-CameraModel = collections.namedtuple(
-    "CameraModel", ["model_id", "model_name", "num_params"])
-Camera = collections.namedtuple(
-    "Camera", ["id", "model", "width", "height", "params"])
-BaseImage = collections.namedtuple(
-    "Image", ["id", "qvec", "tvec", "camera_id", "name", "xys", "point3D_ids"])
-Point3D = collections.namedtuple(
-    "Point3D", ["id", "xyz", "rgb", "error", "image_ids", "point2D_idxs"])
+# ───────────────────────────────────────────────────────────────────────────────
+# 1.  Named-tuple data structures
+# ───────────────────────────────────────────────────────────────────────────────
+CameraModel = collections.namedtuple("CameraModel", ["model_id",
+                                                     "model_name",
+                                                     "num_params"])
+Camera   = collections.namedtuple("Camera",
+            ["id", "model", "width", "height", "params"])
+BaseImg  = collections.namedtuple("Image",
+            ["id", "qvec", "tvec", "camera_id", "name",
+             "xys", "point3D_ids"])
+Point3D  = collections.namedtuple("Point3D",
+            ["id", "xyz", "rgb", "error", "image_ids", "point2D_idxs"])
 
-class Image(BaseImage):
+class Image(BaseImg):
     def qvec2rotmat(self):
         return qvec2rotmat(self.qvec)
 
+# Supported camera models (same IDs as COLMAP)
 CAMERA_MODELS = {
-    CameraModel(model_id=0, model_name="SIMPLE_PINHOLE", num_params=3),
-    CameraModel(model_id=1, model_name="PINHOLE", num_params=4),
-    CameraModel(model_id=2, model_name="SIMPLE_RADIAL", num_params=4),
-    CameraModel(model_id=3, model_name="RADIAL", num_params=5),
-    CameraModel(model_id=4, model_name="OPENCV", num_params=8),
-    CameraModel(model_id=5, model_name="OPENCV_FISHEYE", num_params=8),
-    CameraModel(model_id=6, model_name="FULL_OPENCV", num_params=12),
-    CameraModel(model_id=7, model_name="FOV", num_params=5),
-    CameraModel(model_id=8, model_name="SIMPLE_RADIAL_FISHEYE", num_params=4),
-    CameraModel(model_id=9, model_name="RADIAL_FISHEYE", num_params=5),
-    CameraModel(model_id=10, model_name="THIN_PRISM_FISHEYE", num_params=12)
+    CameraModel(0,  "SIMPLE_PINHOLE",        3),
+    CameraModel(1,  "PINHOLE",               4),
+    CameraModel(2,  "SIMPLE_RADIAL",         4),
+    CameraModel(3,  "RADIAL",                5),
+    CameraModel(4,  "OPENCV",                8),
+    CameraModel(5,  "OPENCV_FISHEYE",        8),
+    CameraModel(6,  "FULL_OPENCV",          12),
+    CameraModel(7,  "FOV",                   5),
+    CameraModel(8,  "SIMPLE_RADIAL_FISHEYE", 4),
+    CameraModel(9,  "RADIAL_FISHEYE",        5),
+    CameraModel(10, "THIN_PRISM_FISHEYE",   12),
+    CameraModel(model_id=11, model_name="SPHERE",num_params=3),
 }
-CAMERA_MODEL_IDS = dict([(camera_model.model_id, camera_model) \
-                         for camera_model in CAMERA_MODELS])
+CAMERA_MODEL_IDS = {cm.model_id: cm for cm in CAMERA_MODELS}
 
+# ───────────────────────────────────────────────────────────────────────────────
+# 2.  Low-level binary helpers
+# ───────────────────────────────────────────────────────────────────────────────
+def _read(fid, nbytes, fmt, endian="<"):
+    return struct.unpack(endian + fmt, fid.read(nbytes))
 
-def read_next_bytes(fid, num_bytes, format_char_sequence, endian_character="<"):
-    """Read and unpack the next bytes from a binary file.
-    :param fid:
-    :param num_bytes: Sum of combination of {2, 4, 8}, e.g. 2, 6, 16, 30, etc.
-    :param format_char_sequence: List of {c, e, f, d, h, H, i, I, l, L, q, Q}.
-    :param endian_character: Any of {@, =, <, >, !}
-    :return: Tuple of read and unpacked values.
-    """
-    data = fid.read(num_bytes)
-    return struct.unpack(endian_character + format_char_sequence, data)
-
-
+# ───────────────────────────────────────────────────────────────────────────────
+# 3.  COLMAP text / binary readers
+# ───────────────────────────────────────────────────────────────────────────────
 def read_cameras_text(path):
-    """
-    see: src/base/reconstruction.cc
-        void Reconstruction::WriteCamerasText(const std::string& path)
-        void Reconstruction::ReadCamerasText(const std::string& path)
-    """
-    cameras = {}
-    with open(path, "r") as fid:
-        while True:
-            line = fid.readline()
-            if not line:
-                break
-            line = line.strip()
-            if len(line) > 0 and line[0] != "#":
-                elems = line.split()
-                camera_id = int(elems[0])
-                model = elems[1]
-                width = int(elems[2])
-                height = int(elems[3])
-                params = np.array(tuple(map(float, elems[4:])))
-                cameras[camera_id] = Camera(id=camera_id, model=model,
-                                            width=width, height=height,
-                                            params=params)
-    return cameras
+    cams={}
+    with open(path) as f:
+        for ln in f:
+            if ln.lstrip().startswith("#") or not ln.strip(): continue
+            s=ln.split(); cid=int(s[0]); model=s[1]; w,h=map(int,s[2:4])
+            params=np.fromiter(map(float,s[4:]),float)
+            cams[cid]=Camera(cid,model,w,h,params)
+    return cams
 
-
-def read_cameras_binary(path_to_model_file):
-    """
-    see: src/base/reconstruction.cc
-        void Reconstruction::WriteCamerasBinary(const std::string& path)
-        void Reconstruction::ReadCamerasBinary(const std::string& path)
-    """
-    cameras = {}
-    with open(path_to_model_file, "rb") as fid:
-        num_cameras = read_next_bytes(fid, 8, "Q")[0]
-        for camera_line_index in range(num_cameras):
-            camera_properties = read_next_bytes(
-                fid, num_bytes=24, format_char_sequence="iiQQ")
-            camera_id = camera_properties[0]
-            model_id = camera_properties[1]
-            model_name = CAMERA_MODEL_IDS[camera_properties[1]].model_name
-            width = camera_properties[2]
-            height = camera_properties[3]
-            num_params = CAMERA_MODEL_IDS[model_id].num_params
-            params = read_next_bytes(fid, num_bytes=8*num_params,
-                                     format_char_sequence="d"*num_params)
-            cameras[camera_id] = Camera(id=camera_id,
-                                        model=model_name,
-                                        width=width,
-                                        height=height,
-                                        params=np.array(params))
-        assert len(cameras) == num_cameras
-    return cameras
-
+def read_cameras_binary(path):
+    cams={}
+    with open(path,"rb") as f:
+        n=_read(f,8,"Q")[0]
+        for _ in range(n):
+            cid,mid,w,h=_read(f,24,"iiQQ")
+            cm=CAMERA_MODEL_IDS[mid]
+            params=np.array(_read(f,8*cm.num_params,"d"*cm.num_params))
+            cams[cid]=Camera(cid,cm.model_name,w,h,params)
+    return cams
 
 def read_images_text(path):
-    """
-    see: src/base/reconstruction.cc
-        void Reconstruction::ReadImagesText(const std::string& path)
-        void Reconstruction::WriteImagesText(const std::string& path)
-    """
-    images = {}
-    with open(path, "r") as fid:
+    imgs={}
+    with open(path) as f:
         while True:
-            line = fid.readline()
-            if not line:
-                break
-            line = line.strip()
-            if len(line) > 0 and line[0] != "#":
-                elems = line.split()
-                image_id = int(elems[0])
-                qvec = np.array(tuple(map(float, elems[1:5])))
-                tvec = np.array(tuple(map(float, elems[5:8])))
-                camera_id = int(elems[8])
-                image_name = elems[9]
-                elems = fid.readline().split()
-                xys = np.column_stack([tuple(map(float, elems[0::3])),
-                                       tuple(map(float, elems[1::3]))])
-                point3D_ids = np.array(tuple(map(int, elems[2::3])))
-                images[image_id] = Image(
-                    id=image_id, qvec=qvec, tvec=tvec,
-                    camera_id=camera_id, name=image_name,
-                    xys=xys, point3D_ids=point3D_ids)
-    return images
+            ln=f.readline();  # first line per image
+            if not ln: break
+            if ln.lstrip().startswith("#") or not ln.strip(): continue
+            s=ln.split()
+            iid=int(s[0]); qvec=np.fromiter(map(float,s[1:5]),float)
+            tvec=np.fromiter(map(float,s[5:8]),float); cid=int(s[8]); name=s[9]
+            track=f.readline().split()
+            xys=np.column_stack([list(map(float,track[0::3])),
+                                 list(map(float,track[1::3]))])
+            pids=np.array(list(map(int,track[2::3])),dtype=int)
+            imgs[iid]=Image(iid,qvec,tvec,cid,name,xys,pids)
+    return imgs
 
-
-def read_images_binary(path_to_model_file):
-    """
-    see: src/base/reconstruction.cc
-        void Reconstruction::ReadImagesBinary(const std::string& path)
-        void Reconstruction::WriteImagesBinary(const std::string& path)
-    """
-    images = {}
-    with open(path_to_model_file, "rb") as fid:
-        num_reg_images = read_next_bytes(fid, 8, "Q")[0]
-        for image_index in range(num_reg_images):
-            binary_image_properties = read_next_bytes(
-                fid, num_bytes=64, format_char_sequence="idddddddi")
-            image_id = binary_image_properties[0]
-            qvec = np.array(binary_image_properties[1:5])
-            tvec = np.array(binary_image_properties[5:8])
-            camera_id = binary_image_properties[8]
-            image_name = ""
-            current_char = read_next_bytes(fid, 1, "c")[0]
-            while current_char != b"\x00":   # look for the ASCII 0 entry
-                image_name += current_char.decode("utf-8")
-                current_char = read_next_bytes(fid, 1, "c")[0]
-            num_points2D = read_next_bytes(fid, num_bytes=8,
-                                           format_char_sequence="Q")[0]
-            x_y_id_s = read_next_bytes(fid, num_bytes=24*num_points2D,
-                                       format_char_sequence="ddq"*num_points2D)
-            xys = np.column_stack([tuple(map(float, x_y_id_s[0::3])),
-                                   tuple(map(float, x_y_id_s[1::3]))])
-            point3D_ids = np.array(tuple(map(int, x_y_id_s[2::3])))
-            images[image_id] = Image(
-                id=image_id, qvec=qvec, tvec=tvec,
-                camera_id=camera_id, name=image_name,
-                xys=xys, point3D_ids=point3D_ids)
-    return images
-
+def read_images_binary(path):
+    imgs={}
+    with open(path,"rb") as f:
+        n=_read(f,8,"Q")[0]
+        for _ in range(n):
+            iid,*vals=_read(f,64,"idddddddi")
+            qvec=np.array(vals[0:4]); tvec=np.array(vals[4:7]); cid=vals[7]
+            # read null-terminated name
+            name=b""
+            while True:
+                c=_read(f,1,"c")[0]
+                if c==b"\x00": break
+                name+=c
+            name=name.decode()
+            npts=_read(f,8,"Q")[0]
+            data=_read(f,24*npts,"ddq"*npts)
+            xys=np.column_stack([data[0::3],data[1::3]])
+            pids=np.array(data[2::3],dtype=int)
+            imgs[iid]=Image(iid,qvec,tvec,cid,name,xys,pids)
+    return imgs
 
 def read_points3D_text(path):
-    """
-    see: src/base/reconstruction.cc
-        void Reconstruction::ReadPoints3DText(const std::string& path)
-        void Reconstruction::WritePoints3DText(const std::string& path)
-    """
-    points3D = {}
-    with open(path, "r") as fid:
-        while True:
-            line = fid.readline()
-            if not line:
-                break
-            line = line.strip()
-            if len(line) > 0 and line[0] != "#":
-                elems = line.split()
-                point3D_id = int(elems[0])
-                xyz = np.array(tuple(map(float, elems[1:4])))
-                rgb = np.array(tuple(map(int, elems[4:7])))
-                error = float(elems[7])
-                image_ids = np.array(tuple(map(int, elems[8::2])))
-                point2D_idxs = np.array(tuple(map(int, elems[9::2])))
-                points3D[point3D_id] = Point3D(id=point3D_id, xyz=xyz, rgb=rgb,
-                                               error=error, image_ids=image_ids,
-                                               point2D_idxs=point2D_idxs)
-    return points3D
+    pts={}
+    with open(path) as f:
+        for ln in f:
+            if ln.lstrip().startswith("#") or not ln.strip(): continue
+            s=ln.split(); pid=int(s[0])
+            xyz=np.fromiter(map(float,s[1:4]),float)
+            rgb=np.fromiter(map(int,s[4:7]),int); err=float(s[7])
+            img_ids=np.array(list(map(int,s[8::2])),dtype=int)
+            idxs   =np.array(list(map(int,s[9::2])),dtype=int)
+            pts[pid]=Point3D(pid,xyz,rgb,err,img_ids,idxs)
+    return pts
 
+def read_points3d_binary(path):
+    pts={}
+    with open(path,"rb") as f:
+        n=_read(f,8,"Q")[0]
+        for _ in range(n):
+            pid,x,y,z,r,g,b,err=_read(f,43,"QdddBBBd")
+            length=_read(f,8,"Q")[0]
+            track=_read(f,8*length,"ii"*length)
+            img_ids=np.array(track[0::2],dtype=int)
+            idxs   =np.array(track[1::2],dtype=int)
+            pts[pid]=Point3D(pid,np.array([x,y,z]),np.array([r,g,b]),err,img_ids,idxs)
+    return pts
 
-def read_points3d_binary(path_to_model_file):
-    """
-    see: src/base/reconstruction.cc
-        void Reconstruction::ReadPoints3DBinary(const std::string& path)
-        void Reconstruction::WritePoints3DBinary(const std::string& path)
-    """
-    points3D = {}
-    with open(path_to_model_file, "rb") as fid:
-        num_points = read_next_bytes(fid, 8, "Q")[0]
-        for point_line_index in range(num_points):
-            binary_point_line_properties = read_next_bytes(
-                fid, num_bytes=43, format_char_sequence="QdddBBBd")
-            point3D_id = binary_point_line_properties[0]
-            xyz = np.array(binary_point_line_properties[1:4])
-            rgb = np.array(binary_point_line_properties[4:7])
-            error = np.array(binary_point_line_properties[7])
-            track_length = read_next_bytes(
-                fid, num_bytes=8, format_char_sequence="Q")[0]
-            track_elems = read_next_bytes(
-                fid, num_bytes=8*track_length,
-                format_char_sequence="ii"*track_length)
-            image_ids = np.array(tuple(map(int, track_elems[0::2])))
-            point2D_idxs = np.array(tuple(map(int, track_elems[1::2])))
-            points3D[point3D_id] = Point3D(
-                id=point3D_id, xyz=xyz, rgb=rgb,
-                error=error, image_ids=image_ids,
-                point2D_idxs=point2D_idxs)
-    return points3D
-
-
-def read_model(path, ext):
-    if ext == ".txt":
-        cameras = read_cameras_text(os.path.join(path, "cameras" + ext))
-        images = read_images_text(os.path.join(path, "images" + ext))
-        points3D = read_points3D_text(os.path.join(path, "points3D") + ext)
+def read_model(sparse_dir, ext):
+    if ext==".txt":
+        cams=read_cameras_text(os.path.join(sparse_dir,"cameras"+ext))
+        imgs=read_images_text(os.path.join(sparse_dir,"images"+ext))
+        pts =read_points3D_text(os.path.join(sparse_dir,"points3D"+ext))
     else:
-        cameras = read_cameras_binary(os.path.join(path, "cameras" + ext))
-        images = read_images_binary(os.path.join(path, "images" + ext))
-        points3D = read_points3d_binary(os.path.join(path, "points3D") + ext)
-    return cameras, images, points3D
+        cams=read_cameras_binary(os.path.join(sparse_dir,"cameras"+ext))
+        imgs=read_images_binary(os.path.join(sparse_dir,"images"+ext))
+        pts =read_points3d_binary(os.path.join(sparse_dir,"points3D"+ext))
+    return cams,imgs,pts
 
-
-def qvec2rotmat(qvec):
+# ───────────────────────────────────────────────────────────────────────────────
+# 4.  Math helpers
+# ───────────────────────────────────────────────────────────────────────────────
+def qvec2rotmat(q):
+    w,x,y,z=q
     return np.array([
-        [1 - 2 * qvec[2]**2 - 2 * qvec[3]**2,
-         2 * qvec[1] * qvec[2] - 2 * qvec[0] * qvec[3],
-         2 * qvec[3] * qvec[1] + 2 * qvec[0] * qvec[2]],
-        [2 * qvec[1] * qvec[2] + 2 * qvec[0] * qvec[3],
-         1 - 2 * qvec[1]**2 - 2 * qvec[3]**2,
-         2 * qvec[2] * qvec[3] - 2 * qvec[0] * qvec[1]],
-        [2 * qvec[3] * qvec[1] - 2 * qvec[0] * qvec[2],
-         2 * qvec[2] * qvec[3] + 2 * qvec[0] * qvec[1],
-         1 - 2 * qvec[1]**2 - 2 * qvec[2]**2]])
+        [1-2*y*y-2*z*z,  2*x*y-2*w*z,  2*x*z+2*w*y],
+        [2*x*y+2*w*z,    1-2*x*x-2*z*z,2*y*z-2*w*x],
+        [2*x*z-2*w*y,    2*y*z+2*w*x,  1-2*x*x-2*y*y],
+    ])
 
-
-def rotmat2qvec(R):
-    Rxx, Ryx, Rzx, Rxy, Ryy, Rzy, Rxz, Ryz, Rzz = R.flat
-    K = np.array([
-        [Rxx - Ryy - Rzz, 0, 0, 0],
-        [Ryx + Rxy, Ryy - Rxx - Rzz, 0, 0],
-        [Rzx + Rxz, Rzy + Ryz, Rzz - Rxx - Ryy, 0],
-        [Ryz - Rzy, Rzx - Rxz, Rxy - Ryx, Rxx + Ryy + Rzz]]) / 3.0
-    eigvals, eigvecs = np.linalg.eigh(K)
-    qvec = eigvecs[[3, 0, 1, 2], np.argmax(eigvals)]
-    if qvec[0] < 0:
-        qvec *= -1
-    return qvec
-
-
-
-def calc_score(inputs, images, points3d, extrinsic, args):
-    i, j = inputs
-    id_i = images[i+1].point3D_ids
-    id_j = images[j+1].point3D_ids
-    id_intersect = [it for it in id_i if it in id_j]
-    cam_center_i = -np.matmul(extrinsic[i+1][:3, :3].transpose(), extrinsic[i+1][:3, 3:4])[:, 0]
-    cam_center_j = -np.matmul(extrinsic[j+1][:3, :3].transpose(), extrinsic[j+1][:3, 3:4])[:, 0]
-    score = 0
-    angles = []
-    for pid in id_intersect:
-        if pid == -1:
-            continue
-        p = points3d[pid].xyz
-        theta = (180 / np.pi) * np.arccos(np.dot(cam_center_i - p, cam_center_j - p) / np.linalg.norm(cam_center_i - p) / np.linalg.norm(cam_center_j - p)) # triangulation angle
-        # score += np.exp(-(theta - args.theta0) * (theta - args.theta0) / (2 * (args.sigma1 if theta <= args.theta0 else args.sigma2) ** 2))
-        angles.append(theta)
-        score += 1
-    if len(angles) > 0:
-        angles_sorted = sorted(angles)
-        triangulationangle = angles_sorted[int(len(angles_sorted) * 0.75)]
-        if triangulationangle < 1:
-            score = 0.0
-    return i, j, score
-
-def processing_single_scene(args):
-
-    image_dir = os.path.join(args.dense_folder, 'images')
-    model_dir = os.path.join(args.dense_folder, 'sparse')
-    cam_dir = os.path.join(args.save_folder, 'cams')
-    image_converted_dir = os.path.join(args.save_folder, 'images')
-
-    if os.path.exists(image_converted_dir):
-        print("remove:{}".format(image_converted_dir))
-        shutil.rmtree(image_converted_dir)
-    os.makedirs(image_converted_dir)
-    if os.path.exists(cam_dir):
-        print("remove:{}".format(cam_dir))
-        shutil.rmtree(cam_dir)
-
-    cameras, images, points3d = read_model(model_dir, args.model_ext)
-    num_images = len(list(images.items()))
-
-    param_type = {
-        'SIMPLE_PINHOLE': ['f', 'cx', 'cy'],
-        'PINHOLE': ['fx', 'fy', 'cx', 'cy'],
-        'SIMPLE_RADIAL': ['f', 'cx', 'cy', 'k'],
-        'SIMPLE_RADIAL_FISHEYE': ['f', 'cx', 'cy', 'k'],
-        'RADIAL': ['f', 'cx', 'cy', 'k1', 'k2'],
-        'RADIAL_FISHEYE': ['f', 'cx', 'cy', 'k1', 'k2'],
-        'OPENCV': ['fx', 'fy', 'cx', 'cy', 'k1', 'k2', 'p1', 'p2'],
-        'OPENCV_FISHEYE': ['fx', 'fy', 'cx', 'cy', 'k1', 'k2', 'k3', 'k4'],
-        'FULL_OPENCV': ['fx', 'fy', 'cx', 'cy', 'k1', 'k2', 'p1', 'p2', 'k3', 'k4', 'k5', 'k6'],
-        'FOV': ['fx', 'fy', 'cx', 'cy', 'omega'],
-        'THIN_PRISM_FISHEYE': ['fx', 'fy', 'cx', 'cy', 'k1', 'k2', 'p1', 'p2', 'k3', 'k4', 'sx1', 'sy1']
-    }
-
-    # intrinsic
-    intrinsic = {}
-    for camera_id, cam in cameras.items():
-        params_dict = {key: value for key, value in zip(param_type[cam.model], cam.params)}
-        if 'f' in param_type[cam.model]:
-            params_dict['fx'] = params_dict['f']
-            params_dict['fy'] = params_dict['f']
-        i = np.array([
-            [params_dict['fx'], 0, params_dict['cx']],
-            [0, params_dict['fy'], params_dict['cy']],
-            [0, 0, 1]
-        ])
-        intrinsic[camera_id] = i
-    print('intrinsic\n', intrinsic, end='\n\n')
-
-    new_images = {}
-    for i, image_id in enumerate(sorted(images.keys())):
-        new_images[i+1] = images[image_id]
-    images = new_images
-
-    # extrinsic
-    extrinsic = {}
-    for image_id, image in images.items():
-        e = np.zeros((4, 4))
-        e[:3, :3] = qvec2rotmat(image.qvec)
-        e[:3, 3] = image.tvec
-        e[3, 3] = 1
-        extrinsic[image_id] = e
-    print('extrinsic[1]\n', extrinsic[1], end='\n\n')
-
-    # depth range and interval
-    depth_ranges = {}
-    for i in range(num_images):
-        zs = []
-        for p3d_id in images[i+1].point3D_ids:
-            if p3d_id == -1:
+# ───────────────────────────────────────────────────────────────────────────────
+# 5.  Depth-range computation
+# ───────────────────────────────────────────────────────────────────────────────
+def compute_depth_ranges(images, points3d, extrinsic, intrinsic,
+                          max_d, interval_scale,cams):
+    depth_ranges={}
+    for i,img in images.items():
+        zs=[]
+        cam_model = cams[img.camera_id].model   # NEW – look up model
+        for pid in img.point3D_ids:
+            if pid < 0:          # invalid point
                 continue
-            transformed = np.matmul(extrinsic[i+1], [points3d[p3d_id].xyz[0], points3d[p3d_id].xyz[1], points3d[p3d_id].xyz[2], 1])
-            zs.append(np.asscalar(transformed[2]))
+            X = np.append(points3d[pid].xyz, 1.0)
+            X_cam = extrinsic[i] @ X            # 4×4 · (x,y,z,1)
+            if cam_model == "SPHERE":            # radial depth
+                d = np.linalg.norm(X_cam[:3])
+            else:                                # pinhole: use z only
+                d = X_cam[2]
+            if d <= 0:                          # point is behind cam
+                continue
+            zs.append(d)
         zs_sorted = sorted(zs)
-        # relaxed depth range
-        depth_min = zs_sorted[int(len(zs) * .01)] * 0.75
-        depth_max = zs_sorted[int(len(zs) * .99)] * 1.25
-        # determine depth number by inverse depth setting, see supplementary material
-        if args.max_d == 0:
-            image_int = intrinsic[images[i+1].camera_id]
-            image_ext = extrinsic[i+1]
-            image_r = image_ext[0:3, 0:3]
-            image_t = image_ext[0:3, 3]
-            p1 = [image_int[0, 2], image_int[1, 2], 1]
-            p2 = [image_int[0, 2] + 1, image_int[1, 2], 1]
-            P1 = np.matmul(np.linalg.inv(image_int), p1) * depth_min
-            P1 = np.matmul(np.linalg.inv(image_r), (P1 - image_t))
-            P2 = np.matmul(np.linalg.inv(image_int), p2) * depth_min
-            P2 = np.matmul(np.linalg.inv(image_r), (P2 - image_t))
-            depth_num = (1 / depth_min - 1 / depth_max) / (1 / depth_min - 1 / (depth_min + np.linalg.norm(P2 - P1)))
+        dmin=zs_sorted[int(len(zs_sorted)*0.2)]*0.75
+        dmax=zs_sorted[int(len(zs_sorted)*0.8)]*1.25
+        if max_d==0:
+            K = intrinsic[img.camera_id]
+            p1=np.array([K[0,2],K[1,2],1])
+            p2=p1+np.array([1,0,0])
+            P1=(np.linalg.inv(K)@p1)*dmin
+            P1=np.linalg.inv(extrinsic[i][:3,:3])@(P1-extrinsic[i][:3,3])
+            P2=(np.linalg.inv(K)@p2)*dmin
+            P2=np.linalg.inv(extrinsic[i][:3,:3])@(P2-extrinsic[i][:3,3])
+            depth_num=int((1/dmin-1/dmax)/(1/dmin-1/(dmin+np.linalg.norm(P2-P1))))
         else:
-            depth_num = args.max_d
-        depth_interval = (depth_max - depth_min) / (depth_num - 1) / args.interval_scale
-        depth_ranges[i+1] = (depth_min, depth_interval, depth_num, depth_max)
-    print('depth_ranges[1]\n', depth_ranges[1], end='\n\n')
+            depth_num=max_d
+        dint=(dmax-dmin)/(depth_num-1)/interval_scale
+        depth_ranges[i]=(dmin,dint,depth_num,dmax)
+    return depth_ranges
 
-    # view selection
-    score = np.zeros((len(images), len(images)))
-    queue = []
-    for i in range(len(images)):
-        for j in range(i + 1, len(images)):
-            queue.append((i, j))
+# ───────────────────────────────────────────────────────────────────────────────
+# 6.  Pair scoring util (triangulation-angle filter)
+# ───────────────────────────────────────────────────────────────────────────────
+def angle_between(ci,cj,p):
+    return np.degrees(np.arccos(
+        np.clip(np.dot(ci-p,cj-p)/
+                (np.linalg.norm(ci-p)*np.linalg.norm(cj-p)), -1.0,1.0)))
 
-    p = mp.Pool(processes=mp.cpu_count())
-    func = partial(calc_score, images=images, points3d=points3d, args=args, extrinsic=extrinsic)
-    result = p.map(func, queue)
-    for i, j, s in result:
-        score[i, j] = s
-        score[j, i] = s
-    view_sel = []
-    num_view = min(20, len(images) - 1)
-    for i in range(len(images)):
-        sorted_score = np.argsort(score[i])[::-1]
-        view_sel.append([(k, score[i, k]) for k in sorted_score[:num_view]])
-    print('view_sel[0]\n', view_sel[0], end='\n\n')
+def calc_shared(pair,images):
+    i,j=pair
+    return len(set(images[i+1].point3D_ids) &
+               set(images[j+1].point3D_ids))
 
-    # write
-    try:
-        os.makedirs(cam_dir)
-    except os.error:
-        print(cam_dir + ' already exist.')
-    for i in range(num_images):
-        with open(os.path.join(cam_dir, '%08d_cam.txt' % i), 'w') as f:
-            f.write('extrinsic\n')
-            for j in range(4):
-                for k in range(4):
-                    f.write(str(extrinsic[i+1][j, k]) + ' ')
-                f.write('\n')
-            f.write('\nintrinsic\n')
-            for j in range(3):
-                for k in range(3):
-                    f.write(str(intrinsic[images[i+1].camera_id][j, k]) + ' ')
-                f.write('\n')
-            f.write('\n%f %f %f %f\n' % (depth_ranges[i+1][0], depth_ranges[i+1][1], depth_ranges[i+1][2], depth_ranges[i+1][3]))
-    with open(os.path.join(args.save_folder, 'pair.txt'), 'w') as f:
-        f.write('%d\n' % len(images))
-        for i, sorted_score in enumerate(view_sel):
-            f.write('%d\n%d ' % (i, len(sorted_score)))
-            for image_id, s in sorted_score:
-                f.write('%d %d ' % (image_id, s))
-            f.write('\n')
+def calc_score(pair,images,points3d,theta0,extrinsic):
+    i,j=pair
+    shared=set(images[i+1].point3D_ids)&set(images[j+1].point3D_ids)
+    if not shared:
+        return i,j,0.0
+    ci=-(extrinsic[i+1][:3,:3].T@extrinsic[i+1][:3,3])
+    cj=-(extrinsic[j+1][:3,:3].T@extrinsic[j+1][:3,3])
+    angs=[angle_between(ci,cj,points3d[pid].xyz)
+          for pid in shared if pid!=-1]
+    if not angs: return i,j,0.0
+    if np.percentile(angs,75)<theta0:
+        return i,j,0.0
+    return i,j,float(len(shared))
 
-    #convert to jpg
-    for i in range(num_images):
-        img_path = os.path.join(image_dir, images[i + 1].name)
-        if not img_path.endswith(".jpg"):
-            img = cv2.imread(img_path)
-            cv2.imwrite(os.path.join(image_converted_dir, '%08d.jpg' % i), img)
+# ───────────────────────────────────────────────────────────────────────────────
+# 7.  Main processing routine
+# ───────────────────────────────────────────────────────────────────────────────
+def process_scene(args):
+    dense=args.dense_folder
+    sparse=os.path.join(dense,"sparse")
+    imgs_dir=os.path.join(dense,"images")
+    out_img=os.path.join(args.save_folder,"images")
+    cam_dir=os.path.join(args.save_folder,"cams")
+    os.makedirs(out_img,exist_ok=True)
+    os.makedirs(cam_dir,exist_ok=True)
+
+    # ---------- Load model ----------
+    cams,imgs_raw,pts=read_model(sparse,args.model_ext)
+    imgs={i+1:imgs_raw[k] for i,k in enumerate(sorted(imgs_raw))}
+    N=len(imgs)
+
+    # ---------- Build intrinsics ----------
+    param_map={
+        'SIMPLE_PINHOLE':['f','cx','cy'],
+        'PINHOLE':['fx','fy','cx','cy'],
+        'SIMPLE_RADIAL':['f','cx','cy','k'],
+        'RADIAL':['f','cx','cy','k1','k2'],
+        'OPENCV':['fx','fy','cx','cy','k1','k2','p1','p2'],
+        'OPENCV_FISHEYE':['fx','fy','cx','cy','k1','k2','k3','k4'],
+        'FULL_OPENCV':['fx','fy','cx','cy','k1','k2','p1','p2',
+                       'k3','k4','k5','k6'],
+        'FOV':['fx','fy','cx','cy','omega'],
+        'THIN_PRISM_FISHEYE':['fx','fy','cx','cy','k1','k2',
+                              'p1','p2','k3','k4','sx1','sy1'],
+                              'SPHERE': ['f','cx','cy'],
+    }
+    Kdict={}
+    for cid,cam in cams.items():
+        keys=param_map[cam.model]
+        vals=dict(zip(keys,cam.params))
+        if 'f' in vals:
+            vals['fx']=vals['fy']=vals['f']
+        K=np.eye(3)
+        K[0,0]=vals['fx']; K[1,1]=vals['fy']
+        K[0,2]=vals['cx']; K[1,2]=vals['cy']
+        Kdict[cid]=K
+
+    # ---------- Extrinsics ----------
+    extr={}
+    for i,img in imgs.items():
+        E=np.eye(4)
+        E[:3,:3]=qvec2rotmat(img.qvec)
+        E[:3,3]=img.tvec
+        extr[i]=E
+
+    # ---------- Depth ranges ----------
+    depth_ranges=compute_depth_ranges(imgs,pts,extr,Kdict,
+                                      args.max_d,args.interval_scale,cams)
+    print("depth_ranges[1]",depth_ranges.get(1))
+
+    # ---------- Candidate pairs via camera-center proximity ----------
+    from scipy.spatial import cKDTree
+
+    # 1) collect only the images that survived depth_ranges
+    keys = sorted(depth_ranges.keys())           # e.g. [1,2,5,7,…] (1-based)
+
+    # 2) build an (M×3) array of world-space centers C_i = -(Rᵀ·t)
+    centers = np.stack([
+        -(extr[i][:3,:3].T @ extr[i][:3,3])
+        for i in keys
+    ])
+
+    # 3) KD-tree & K-nearest lookup
+    tree     = cKDTree(centers)
+    k_search = args.top_k + 1   # +1 b/c query includes self
+    _, nnidx = tree.query(centers, k=k_search)
+
+    # 4) collect unique zero-based index pairs
+    candidate_pairs = set()
+    for src_idx, neighs in enumerate(nnidx):
+        src = keys[src_idx] - 1          # convert to 0-based
+        for n in neighs:
+            if n == src_idx: continue   # skip self
+            dst = keys[n] - 1
+            a, b = min(src, dst), max(src, dst)
+            candidate_pairs.add((a, b))
+
+    all_pairs = list(candidate_pairs)
+    # now len(all_pairs) ≃ N·top_k instead of ~N²/2
+    shared_cnt = [calc_shared(p, imgs) for p in all_pairs]
+
+    top_pairs=[]
+    valid = [i-1 for i in depth_ranges.keys()]
+    neighbor_bins={i:[] for i in valid}
+    for (pair,s) in sorted(zip(all_pairs,shared_cnt),
+                           key=lambda x:x[1],reverse=True):
+        i,j=pair
+        if s<args.min_shared: break
+        if (len(neighbor_bins[i])<args.top_k and
+            len(neighbor_bins[j])<args.top_k):
+            neighbor_bins[i].append(pair)
+            neighbor_bins[j].append(pair)
+            top_pairs.append(pair)
+    print(f"[INFO] Kept {len(top_pairs)} pairs "
+          f"(≤{args.top_k} per image, ≥{args.min_shared} shared tracks)")
+
+    # ---------- Score pairs (triangulation angle) ----------
+    func=partial(calc_score,images=imgs,points3d=pts,
+                 theta0=args.theta0,extrinsic=extr)
+    score=np.zeros((N,N))
+    with mp.Pool(processes=mp.cpu_count()) as pool:
+        for i,j,s in tqdm(pool.imap_unordered(func,top_pairs,
+                                              chunksize=args.chunksize),
+                          total=len(top_pairs)):
+            score[i,j]=score[j,i]=s
+
+    # ---------- neighbour list for each image ----------
+    view_sel=[]
+    for i in range(N):
+        top=np.argsort(score[i])[::-1]
+        view_sel.append([(k,score[i,k]) for k in top
+                         if score[i,k]>0][:args.top_k])
+
+    # ---------- Write camera files ----------
+    for i in range(N):
+        if (i+1) not in depth_ranges: continue
+        cam_path=os.path.join(cam_dir,f"{i:08d}_cam.txt")
+        with open(cam_path,"w") as f:
+            f.write("extrinsic\n")
+            for r in range(4):
+                f.write(" ".join(map(str,extr[i+1][r]))+"\n")
+            # now special-case SPHERE
+            f.write("\nintrinsic\n")
+            # look up the original COLMAP Camera entry
+            cam = cams[imgs[i+1].camera_id]
+            if cam.model == "SPHERE":
+                # SPHERE wants: model name + f, cx, cy
+                f.write("SPHERE\n")
+                # cam.params is [f, cx, cy]
+                f.write(f"{cam.params[0]} {cam.params[1]} {cam.params[2]}\n")
+            else:
+                # all other models: write full 3×3 K
+                K = Kdict[cam.id]
+                for r in range(3):
+                    f.write(" ".join(map(str, K[r])) + "\n")
+            d0,dint,Nd,dmax=depth_ranges[i+1]
+            f.write(f"\n{d0} {dint} {Nd} {dmax}\n")
+
+    # ---------- Write pair.txt ----------
+    with open(os.path.join(args.save_folder,"pair.txt"),"w") as f:
+        f.write(f"{N}\n")
+        for i,nbrs in enumerate(view_sel):
+            f.write(f"{i}\n{len(nbrs)} ")
+            for j,s in nbrs:
+                f.write(f"{j} {int(s)} ")
+            f.write("\n")
+
+    # ---------- Copy/convert images ----------
+    for i in range(N):
+        src=os.path.join(imgs_dir,imgs[i+1].name)
+        dst=os.path.join(out_img,f"{i:08d}.jpg")
+        if not src.lower().endswith(".jpg"):
+            cv2.imwrite(dst,cv2.imread(src))
         else:
-            shutil.copyfile(os.path.join(image_dir, images[i+1].name), os.path.join(image_converted_dir, '%08d.jpg' % i))
+            shutil.copyfile(src,dst)
 
-
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Convert colmap camera')
-
-    parser.add_argument('--dense_folder', required=True, type=str, help='dense_folder.')
-    parser.add_argument('--save_folder', required=True, type=str, help='save_folder.')
-
-    parser.add_argument('--max_d', type=int, default=192)
-    parser.add_argument('--interval_scale', type=float, default=1)
-
-    parser.add_argument('--theta0', type=float, default=5)
-    parser.add_argument('--sigma1', type=float, default=1)
-    parser.add_argument('--sigma2', type=float, default=10)
-    parser.add_argument('--model_ext', type=str, default=".txt",  choices=[".txt", ".bin"], help='sparse model ext')
-
-    args = parser.parse_args()
-
-    os.makedirs(os.path.join(args.save_folder), exist_ok=True)
-    processing_single_scene(args)
+# ───────────────────────────────────────────────────────────────────────────────
+# 8.  CLI
+# ───────────────────────────────────────────────────────────────────────────────
+if __name__=="__main__":
+    ap=argparse.ArgumentParser(
+       description="Convert COLMAP sparse model to ACMMP/MVSNet format "
+                   "with neighbour pruning.")
+    ap.add_argument("--dense_folder",required=True,
+                    help="Folder with sparse/ & images/")
+    ap.add_argument("--save_folder",required=True,
+                    help="Output dir")
+    ap.add_argument("--model_ext",default=".txt",choices=[".txt",".bin"])
+    ap.add_argument("--max_d",type=int,default=192)
+    ap.add_argument("--interval_scale",type=float,default=1.0)
+    ap.add_argument("--theta0",type=float,default=1.0,
+                    help="Min triangulation angle (deg)")
+    ap.add_argument("--top_k",type=int,default=20,
+                    help="Max neighbours kept per image")
+    ap.add_argument("--min_shared",type=int,default=10,
+                    help="Min shared tracks to keep a pair")
+    ap.add_argument("--chunksize",type=int,default=512,
+                    help="mp.pool imap chunk")
+    args=ap.parse_args()
+    os.makedirs(args.save_folder,exist_ok=True)
+    process_scene(args)
