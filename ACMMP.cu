@@ -1046,14 +1046,14 @@ __device__ void CheckerboardPropagation(const cudaTextureObject_t *images, const
         costMinPoint = up_near;
         for (int i = 0; i < 3; ++i) {
             if (p.y > 1 + i && p.x > i) {
-                int pointTemp = up_near - (1 + i) * width - i;
+                int pointTemp = up_near - (1 + i) * width - (1+i);
                 if (costs[pointTemp] < costMin) {
                     costMin = costs[pointTemp];
                     costMinPoint = pointTemp;
                 }
             }
             if (p.y > 1 + i && p.x < width - 1 - i) {
-                int pointTemp = up_near - (1 + i) * width + i;
+                int pointTemp = up_near - (1 + i) * width + (1+i);
                 if (costs[pointTemp] < costMin) {
                     costMin = costs[pointTemp];
                     costMinPoint = pointTemp;
@@ -1072,14 +1072,14 @@ __device__ void CheckerboardPropagation(const cudaTextureObject_t *images, const
         costMinPoint = down_near;
         for (int i = 0; i < 3; ++i) {
             if (p.y < height - 2 - i && p.x > i) {
-                int pointTemp = down_near + (1 + i) * width - i;
+                int pointTemp = down_near + (1 + i) * width - (1+i);
                 if (costs[pointTemp] < costMin) {
                     costMin = costs[pointTemp];
                     costMinPoint = pointTemp;
                 }
             }
             if (p.y < height - 2 - i && p.x < width - 1 - i) {
-                int pointTemp = down_near + (1 + i) * width + i;
+                int pointTemp = down_near + (1 + i) * width + (1+i);
                 if (costs[pointTemp] < costMin) {
                     costMin = costs[pointTemp];
                     costMinPoint = pointTemp;
@@ -1098,14 +1098,14 @@ __device__ void CheckerboardPropagation(const cudaTextureObject_t *images, const
         costMinPoint = left_near;
         for (int i = 0; i < 3; ++i) {
             if (p.x > 1 + i && p.y > i) {
-                int pointTemp = left_near - (1 + i) - i * width;
+                int pointTemp = left_near - (1 + i) - (1+i) * width;
                 if (costs[pointTemp] < costMin) {
                     costMin = costs[pointTemp];
                     costMinPoint = pointTemp;
                 }
             }
             if (p.x > 1 + i && p.y < height - 1 - i) {
-                int pointTemp = left_near - (1 + i) + i * width;
+                int pointTemp = left_near - (1 + i) + (1+i) * width;
                 if (costs[pointTemp] < costMin) {
                     costMin = costs[pointTemp];
                     costMinPoint = pointTemp;
@@ -1124,14 +1124,14 @@ __device__ void CheckerboardPropagation(const cudaTextureObject_t *images, const
         costMinPoint = right_near;
         for (int i = 0; i < 3; ++i) {
             if (p.x < width - 2 - i && p.y > i) {
-                int pointTemp = right_near + (1 + i) - i * width;
+                int pointTemp = right_near + (1 + i) - (1+i) * width;
                 if (costs[pointTemp] < costMin) {
                     costMin = costs[pointTemp];
                     costMinPoint = pointTemp;
                 }
             }
             if (p.x < width - 2 - i && p.y < height - 1- i) {
-                int pointTemp = right_near + (1 + i) + i * width;
+                int pointTemp = right_near + (1 + i) + (1+i) * width;
                 if (costs[pointTemp] < costMin) {
                     costMin = costs[pointTemp];
                     costMinPoint = pointTemp;
@@ -1647,464 +1647,6 @@ void JBU::CudaRun()
     cudaEventElapsedTime(&milliseconds, start, stop);
     printf("Total time needed for computation: %f seconds\n", milliseconds / 1000.f);
 }
-
-
-// #include <thrust/device_vector.h>
-// #include <thrust/host_vector.h>
-
-// // ─── Simple fusion data structures ──────────────────────────
-// struct FusionProblem {
-//     int ref_image_id;
-//     int num_src_images;
-//     int src_image_ids[32];
-//     int src_image_indices[32];
-// };
-
-// // ─── Simple Per-pixel fusion kernel (mirroring CPU logic) ─────────────
-// __global__ void SimpleFusionKernel(
-//     cudaTextureObject_t* depth_textures,
-//     cudaTextureObject_t* normal_textures,
-//     cudaTextureObject_t* image_textures,
-//     Camera* cameras,
-//     int ref_image_idx,
-//     FusionProblem problem,
-//     PointList* output_points,
-//     int* valid_flags,
-//     int width,
-//     int height
-// ) {
-//     int c = blockIdx.x * blockDim.x + threadIdx.x;  // column (x)
-//     int r = blockIdx.y * blockDim.y + threadIdx.y;  // row (y)
-    
-//     if (c >= width || r >= height) return;
-    
-//     int idx = r * width + c;
-//     const Camera& ref_cam = cameras[ref_image_idx];
-
-//     // Sample reference depth
-//     float ref_depth = tex2D<float>(depth_textures[ref_image_idx], c, r);
-    
-//     if (ref_depth <= 0.0f) {
-//         valid_flags[idx] = 0;
-//         return;
-//     }
-
-//     // Get 3D point in world coordinates
-//     float3 PointX = Get3DPointonWorld_cu(static_cast<float>(c), static_cast<float>(r), ref_depth, ref_cam);
-    
-//     // Sample reference normal and color
-//     float4 ref_normal_tex = tex2D<float4>(normal_textures[ref_image_idx], c, r);
-//     float3 ref_normal = make_float3(ref_normal_tex.x, ref_normal_tex.y, ref_normal_tex.z);
-    
-//     float4 ref_color = tex2D<float4>(image_textures[ref_image_idx], c, r);
-    
-//     // Initialize sums for averaging
-//     float3 point_sum = PointX;
-//     float3 normal_sum = ref_normal;
-//     float color_sum[3] = {
-//         ref_color.z * 255.0f,  // R (OpenCV uses BGR)
-//         ref_color.y * 255.0f,  // G
-//         ref_color.x * 255.0f   // B
-//     };
-//     int num_consistent = 1;
-    
-//     // Check all source images
-//     for (int j = 0; j < problem.num_src_images; ++j) {
-//         int src_idx = problem.src_image_indices[j];
-//         if (src_idx < 0) continue;
-        
-//         const Camera& src_cam = cameras[src_idx];
-        
-//         // Project 3D point to source camera
-//         float2 proj_point;
-//         float proj_depth_in_src;
-//         ProjectonCamera_cu(PointX, src_cam, proj_point, proj_depth_in_src);
-        
-//         int src_c = static_cast<int>(proj_point.x + 0.5f);
-//         int src_r = static_cast<int>(proj_point.y + 0.5f);
-        
-//         // Check if projection is within image bounds
-//         if (src_c < 0 || src_c >= src_cam.width || src_r < 0 || src_r >= src_cam.height) 
-//             continue;
-        
-//         // Sample source depth
-//         float src_depth = tex2D<float>(depth_textures[src_idx], src_c, src_r);
-//         if (src_depth <= 0.0f) continue;
-        
-//         // Get 3D point from source depth
-//         float3 PointX_src = Get3DPointonWorld_cu(static_cast<float>(src_c), static_cast<float>(src_r), src_depth, src_cam);
-        
-//         // Reproject source 3D point back to reference camera
-//         float2 reproj_point_in_ref;
-//         float dummy_depth;
-//         ProjectonCamera_cu(PointX_src, ref_cam, reproj_point_in_ref, dummy_depth);
-        
-//         // Calculate reprojection error
-//         float reproj_error = hypotf(c - reproj_point_in_ref.x, r - reproj_point_in_ref.y);
-        
-//         // Calculate relative depth difference
-//         float relative_depth_diff = fabsf(proj_depth_in_src - src_depth) / src_depth;
-        
-//         // Sample source normal
-//         float4 src_normal_tex = tex2D<float4>(normal_textures[src_idx], src_c, src_r);
-//         float3 src_normal = make_float3(src_normal_tex.x, src_normal_tex.y, src_normal_tex.z);
-        
-//         // Calculate angle between normals
-//         float dot_product = ref_normal.x * src_normal.x + ref_normal.y * src_normal.y + ref_normal.z * src_normal.z;
-//         dot_product = fmaxf(-1.0f, fminf(1.0f, dot_product));  // Clamp to [-1,1]
-//         float angle = acosf(dot_product);
-        
-//         // Check consistency (same thresholds as CPU version)
-//         if (reproj_error < 1.0 && relative_depth_diff < 0.01f && angle < 0.149f) {
-//             // Add to sums for averaging
-//             point_sum.x += PointX_src.x;
-//             point_sum.y += PointX_src.y;
-//             point_sum.z += PointX_src.z;
-            
-//             normal_sum.x += src_normal.x;
-//             normal_sum.y += src_normal.y;
-//             normal_sum.z += src_normal.z;
-            
-//             float4 src_color = tex2D<float4>(image_textures[src_idx], src_c, src_r);
-//             color_sum[0] += src_color.z * 255.0f;  // R
-//             color_sum[1] += src_color.y * 255.0f;  // G
-//             color_sum[2] += src_color.x * 255.0f;  // B
-            
-//             num_consistent++;
-//         }
-//     }
-    
-//     // Check if we have enough consistent views (same as CPU: >= 3)
-//     if (num_consistent >= 3) {
-//         PointList final_point;
-        
-//         // Average the 3D points
-//         final_point.coord = make_float3(
-//             point_sum.x / num_consistent,
-//             point_sum.y / num_consistent,
-//             point_sum.z / num_consistent
-//         );
-        
-//         // Average and normalize the normals
-//         float3 avg_normal = make_float3(
-//             normal_sum.x / num_consistent,
-//             normal_sum.y / num_consistent,
-//             normal_sum.z / num_consistent
-//         );
-//         float normal_length = hypotf(hypotf(avg_normal.x, avg_normal.y), avg_normal.z);
-//         if (normal_length > 0.0f) {
-//             avg_normal.x /= normal_length;
-//             avg_normal.y /= normal_length;
-//             avg_normal.z /= normal_length;
-//         }
-//         final_point.normal = avg_normal;
-        
-//         // Average the colors
-//         final_point.color = make_float3(
-//             color_sum[0] / num_consistent,
-//             color_sum[1] / num_consistent,
-//             color_sum[2] / num_consistent
-//         );
-        
-//         output_points[idx] = final_point;
-//         valid_flags[idx] = 1;
-//     } else {
-//         valid_flags[idx] = 0;
-//     }
-// }
-
-// // ─── Simplified CUDA Fusion implementation ──────────────
-// void RunFusionCuda(const std::string &dense_folder,
-//                    const std::vector<Problem> &problems,
-//                    bool geom_consistency)
-// {
-//     const size_t N = problems.size();
-//     const std::string imgF = dense_folder + "/images";
-//     const std::string camF = dense_folder + "/cams";
-//     char buf[256];
-
-//     std::cout << "[CUDA Fusion] Starting simple fusion with " << N << " images..." << std::endl;
-
-//     // Load and validate all data
-//     std::vector<Camera> cams;
-//     std::vector<cv::Mat_<float>> deps;
-//     std::vector<cv::Mat_<cv::Vec3f>> normals;
-//     std::vector<cv::Mat> imgs;
-//     std::vector<Problem> valid_problems;
-//     std::map<int, int> id_to_index;
-
-//     for (size_t i = 0; i < N; ++i) {
-//         int id = problems[i].ref_image_id;
-        
-//         // Load camera
-//         sprintf(buf, "%s/%08d_cam.txt", camF.c_str(), id);
-//         Camera cam = ReadCamera(buf);
-        
-//         // Load depth
-//         std::string depth_suffix = geom_consistency ? "/depths_geom.dmb" : "/depths.dmb";
-//         sprintf(buf, "%s/ACMMP/2333_%08d%s", dense_folder.c_str(), id, depth_suffix.c_str());
-//         cv::Mat_<float> depth;
-//         if (readDepthDmb(buf, depth) != 0) {
-//             std::cerr << "Warning: Could not load depth for image " << id << std::endl;
-//             continue;
-//         }
-        
-//         // Load normals
-//         sprintf(buf, "%s/ACMMP/2333_%08d/normals.dmb", dense_folder.c_str(), id);
-//         cv::Mat_<cv::Vec3f> normal;
-//         if (readNormalDmb(buf, normal) != 0) {
-//             std::cerr << "Warning: Could not load normals for image " << id << std::endl;
-//             continue;
-//         }
-        
-//         // Load image
-//         sprintf(buf, "%s/%08d.jpg", imgF.c_str(), id);
-//         cv::Mat img = cv::imread(buf, cv::IMREAD_COLOR);
-//         if (img.empty()) {
-//             std::cerr << "Warning: Could not load image " << id << std::endl;
-//             continue;
-//         }
-        
-//         // Rescale image and camera to match depth resolution
-//         cv::Mat_<cv::Vec3b> img_color(img);
-//         cv::Mat_<cv::Vec3b> scaled_color;
-//         RescaleImageAndCamera(img_color, scaled_color, depth, cam);
-//         img = cv::Mat(scaled_color);
-        
-//         // Store valid data
-//         id_to_index[id] = cams.size();
-//         cams.push_back(cam);
-//         deps.push_back(depth);
-//         normals.push_back(normal);
-//         imgs.push_back(img);
-//         valid_problems.push_back(problems[i]);
-//     }
-    
-//     size_t num_valid = cams.size();
-//     std::cout << "[CUDA Fusion] Successfully loaded " << num_valid << "/" << N << " images" << std::endl;
-    
-//     if (num_valid == 0) {
-//         std::cerr << "Error: No valid images to process!" << std::endl;
-//         return;
-//     }
-
-//     // Allocate texture arrays
-//     std::vector<cudaArray*> depth_arrays(num_valid);
-//     std::vector<cudaArray*> normal_arrays(num_valid);
-//     std::vector<cudaArray*> image_arrays(num_valid);
-//     std::vector<cudaTextureObject_t> depth_textures_host(num_valid);
-//     std::vector<cudaTextureObject_t> normal_textures_host(num_valid);
-//     std::vector<cudaTextureObject_t> image_textures_host(num_valid);
-
-//     // Create textures for each image
-//     for (size_t i = 0; i < num_valid; ++i) {
-//         int width = deps[i].cols;
-//         int height = deps[i].rows;
-        
-//         // Create depth texture (single channel float)
-//         cudaChannelFormatDesc depth_desc = cudaCreateChannelDesc<float>();
-//         CUDA_SAFE_CALL(cudaMallocArray(&depth_arrays[i], &depth_desc, width, height));
-//         CUDA_SAFE_CALL(cudaMemcpy2DToArray(depth_arrays[i], 0, 0, 
-//                                            deps[i].ptr<float>(), deps[i].step[0], 
-//                                            width * sizeof(float), height, 
-//                                            cudaMemcpyHostToDevice));
-
-//         cudaResourceDesc depth_res_desc = {};
-//         depth_res_desc.resType = cudaResourceTypeArray;
-//         depth_res_desc.res.array.array = depth_arrays[i];
-
-//         cudaTextureDesc depth_tex_desc = {};
-//         depth_tex_desc.addressMode[0] = cudaAddressModeWrap;
-//         depth_tex_desc.addressMode[1] = cudaAddressModeClamp;
-//         depth_tex_desc.filterMode = cudaFilterModePoint;
-//         depth_tex_desc.readMode = cudaReadModeElementType;
-//         depth_tex_desc.normalizedCoords = false;
-
-//         CUDA_SAFE_CALL(cudaCreateTextureObject(&depth_textures_host[i], 
-//                                                &depth_res_desc, &depth_tex_desc, NULL));
-
-//         // Create normal texture (4 channel float for Vec3f + padding)
-//         cv::Mat normal_rgba;
-//         cv::cvtColor(normals[i], normal_rgba, cv::COLOR_RGB2RGBA);  // Add alpha channel
-        
-//         cudaChannelFormatDesc normal_desc = cudaCreateChannelDesc<float4>();
-//         CUDA_SAFE_CALL(cudaMallocArray(&normal_arrays[i], &normal_desc, width, height));
-//         CUDA_SAFE_CALL(cudaMemcpy2DToArray(normal_arrays[i], 0, 0, 
-//                                            normal_rgba.ptr<float>(), normal_rgba.step[0], 
-//                                            width * sizeof(float4), height, 
-//                                            cudaMemcpyHostToDevice));
-
-//         cudaResourceDesc normal_res_desc = {};
-//         normal_res_desc.resType = cudaResourceTypeArray;
-//         normal_res_desc.res.array.array = normal_arrays[i];
-
-//         cudaTextureDesc normal_tex_desc = {};
-//         normal_tex_desc.addressMode[0] = cudaAddressModeWrap;
-//         normal_tex_desc.addressMode[1] = cudaAddressModeClamp;
-//         normal_tex_desc.filterMode = cudaFilterModePoint;
-//         normal_tex_desc.readMode = cudaReadModeElementType;
-//         normal_tex_desc.normalizedCoords = false;
-
-//         CUDA_SAFE_CALL(cudaCreateTextureObject(&normal_textures_host[i], 
-//                                                &normal_res_desc, &normal_tex_desc, NULL));
-
-//         // Create image texture (4 channel float for RGBA)
-//         cv::Mat rgba_float;
-//         cv::Mat rgba;
-//         cv::cvtColor(imgs[i], rgba, cv::COLOR_BGR2RGBA);
-//         rgba.convertTo(rgba_float, CV_32FC4, 1.0/255.0);
-
-//         cudaChannelFormatDesc image_desc = cudaCreateChannelDesc<float4>();
-//         CUDA_SAFE_CALL(cudaMallocArray(&image_arrays[i], &image_desc, width, height));
-//         CUDA_SAFE_CALL(cudaMemcpy2DToArray(image_arrays[i], 0, 0, 
-//                                            rgba_float.ptr<float>(), rgba_float.step[0], 
-//                                            width * sizeof(float4), height, 
-//                                            cudaMemcpyHostToDevice));
-
-//         cudaResourceDesc image_res_desc = {};
-//         image_res_desc.resType = cudaResourceTypeArray;
-//         image_res_desc.res.array.array = image_arrays[i];
-
-//         cudaTextureDesc image_tex_desc = {};
-//         image_tex_desc.addressMode[0] = cudaAddressModeWrap;
-//         image_tex_desc.addressMode[1] = cudaAddressModeClamp;
-//         image_tex_desc.filterMode = cudaFilterModeLinear;
-//         image_tex_desc.readMode = cudaReadModeElementType;
-//         image_tex_desc.normalizedCoords = false;
-
-//         CUDA_SAFE_CALL(cudaCreateTextureObject(&image_textures_host[i], 
-//                                                &image_res_desc, &image_tex_desc, NULL));
-//     }
-
-//     // Copy texture objects to device
-//     cudaTextureObject_t* depth_textures_cuda;
-//     cudaTextureObject_t* normal_textures_cuda;
-//     cudaTextureObject_t* image_textures_cuda;
-//     CUDA_SAFE_CALL(cudaMalloc(&depth_textures_cuda, num_valid * sizeof(cudaTextureObject_t)));
-//     CUDA_SAFE_CALL(cudaMalloc(&normal_textures_cuda, num_valid * sizeof(cudaTextureObject_t)));
-//     CUDA_SAFE_CALL(cudaMalloc(&image_textures_cuda, num_valid * sizeof(cudaTextureObject_t)));
-    
-//     CUDA_SAFE_CALL(cudaMemcpy(depth_textures_cuda, depth_textures_host.data(), 
-//                               num_valid * sizeof(cudaTextureObject_t), cudaMemcpyHostToDevice));
-//     CUDA_SAFE_CALL(cudaMemcpy(normal_textures_cuda, normal_textures_host.data(), 
-//                               num_valid * sizeof(cudaTextureObject_t), cudaMemcpyHostToDevice));
-//     CUDA_SAFE_CALL(cudaMemcpy(image_textures_cuda, image_textures_host.data(), 
-//                               num_valid * sizeof(cudaTextureObject_t), cudaMemcpyHostToDevice));
-
-//     // Copy cameras to device
-//     Camera* cameras_cuda;
-//     CUDA_SAFE_CALL(cudaMalloc(&cameras_cuda, num_valid * sizeof(Camera)));
-//     CUDA_SAFE_CALL(cudaMemcpy(cameras_cuda, cams.data(), 
-//                               num_valid * sizeof(Camera), cudaMemcpyHostToDevice));
-
-//     // Prepare fusion problems
-//     std::vector<FusionProblem> fusion_problems(num_valid);
-//     for (size_t i = 0; i < num_valid; ++i) {
-//         fusion_problems[i].ref_image_id = valid_problems[i].ref_image_id;
-//         fusion_problems[i].num_src_images = std::min((int)valid_problems[i].src_image_ids.size(), 32);
-        
-//         for (int j = 0; j < fusion_problems[i].num_src_images; ++j) {
-//             int src_id = valid_problems[i].src_image_ids[j];
-//             fusion_problems[i].src_image_ids[j] = src_id;
-            
-//             auto it = id_to_index.find(src_id);
-//             if (it != id_to_index.end()) {
-//                 fusion_problems[i].src_image_indices[j] = it->second;
-//             } else {
-//                 fusion_problems[i].src_image_indices[j] = -1;
-//             }
-//         }
-//     }
-
-//     // Process each image
-//     std::vector<PointList> all_points;
-//     size_t total_points = 0;
-    
-//     for (size_t i = 0; i < num_valid; ++i) {
-//         int width = cams[i].width;
-//         int height = cams[i].height;
-//         int total_pixels = width * height;
-        
-//         std::cout << "[CUDA Fusion] Processing image " << (i+1) << "/" << num_valid 
-//                   << " (ID=" << valid_problems[i].ref_image_id << ", " 
-//                   << width << "x" << height << ")" << std::endl;
-
-//         // Allocate device memory
-//         PointList* output_points_cuda;
-//         int* valid_flags_cuda;
-//         CUDA_SAFE_CALL(cudaMalloc(&output_points_cuda, total_pixels * sizeof(PointList)));
-//         CUDA_SAFE_CALL(cudaMalloc(&valid_flags_cuda, total_pixels * sizeof(int)));
-//         CUDA_SAFE_CALL(cudaMemset(valid_flags_cuda, 0, total_pixels * sizeof(int)));
-
-//         // Launch kernel
-//         dim3 block_size(16, 16);
-//         dim3 grid_size((width + block_size.x - 1) / block_size.x, 
-//                       (height + block_size.y - 1) / block_size.y);
-
-//         SimpleFusionKernel<<<grid_size, block_size>>>(
-//             depth_textures_cuda,
-//             normal_textures_cuda,
-//             image_textures_cuda,
-//             cameras_cuda,
-//             i,
-//             fusion_problems[i],
-//             output_points_cuda,
-//             valid_flags_cuda,
-//             width,
-//             height
-//         );
-
-//         CUDA_SAFE_CALL(cudaGetLastError());
-//         CUDA_SAFE_CALL(cudaDeviceSynchronize());
-
-//         // Copy results back
-//         std::vector<PointList> points(total_pixels);
-//         std::vector<int> valid_flags(total_pixels);
-        
-//         CUDA_SAFE_CALL(cudaMemcpy(points.data(), output_points_cuda, 
-//                                   total_pixels * sizeof(PointList), cudaMemcpyDeviceToHost));
-//         CUDA_SAFE_CALL(cudaMemcpy(valid_flags.data(), valid_flags_cuda, 
-//                                   total_pixels * sizeof(int), cudaMemcpyDeviceToHost));
-
-//         // Collect valid points
-//         size_t valid_count = 0;
-//         for (int j = 0; j < total_pixels; ++j) {
-//             if (valid_flags[j]) {
-//                 all_points.push_back(points[j]);
-//                 valid_count++;
-//             }
-//         }
-        
-//         total_points += valid_count;
-//         std::cout << "  -> Generated " << valid_count << " points" << std::endl;
-
-//         // Cleanup
-//         cudaFree(output_points_cuda);
-//         cudaFree(valid_flags_cuda);
-//     }
-
-//     // Write output
-//     std::string output_path = dense_folder + "/ACMMP/ACMM_model_cuda_5.ply";
-//     StoreColorPlyFileBinaryPointCloud(output_path, all_points);
-//     std::cout << "[CUDA Fusion] Complete! Wrote " << total_points 
-//               << " points to " << output_path << std::endl;
-
-//     // Cleanup
-//     for (size_t i = 0; i < num_valid; ++i) {
-//         cudaDestroyTextureObject(depth_textures_host[i]);
-//         cudaDestroyTextureObject(normal_textures_host[i]);
-//         cudaDestroyTextureObject(image_textures_host[i]);
-//         cudaFreeArray(depth_arrays[i]);
-//         cudaFreeArray(normal_arrays[i]);
-//         cudaFreeArray(image_arrays[i]);
-//     }
-//     cudaFree(depth_textures_cuda);
-//     cudaFree(normal_textures_cuda);
-//     cudaFree(image_textures_cuda);
-//     cudaFree(cameras_cuda);
-// }
-
-// Memory-efficient CUDA fusion implementation
 #include <memory>
 #include <unordered_set>
 #include <queue>
