@@ -1,6 +1,6 @@
 #include "ACMMP.h"
 #include <math_constants.h>  // for CUDART_PI_F
-
+#include <memory>
 // these two get used before their definitions, so forward‐declare them
 __device__ float3 Get3DPointonWorld_cu(const float x,
                                        const float y,
@@ -304,76 +304,6 @@ __device__ float4 GeneratePertubedPlaneHypothesis(const Camera camera, const int
     return out;
 }
 
-__device__ void ComputeHomography(const Camera ref_camera, const Camera src_camera, const float4 plane_hypothesis, float *H)
-{
-    float ref_C[3];
-    float src_C[3];
-    ref_C[0] = -(ref_camera.R[0] * ref_camera.t[0] + ref_camera.R[3] * ref_camera.t[1] + ref_camera.R[6] * ref_camera.t[2]);
-    ref_C[1] = -(ref_camera.R[1] * ref_camera.t[0] + ref_camera.R[4] * ref_camera.t[1] + ref_camera.R[7] * ref_camera.t[2]);
-    ref_C[2] = -(ref_camera.R[2] * ref_camera.t[0] + ref_camera.R[5] * ref_camera.t[1] + ref_camera.R[8] * ref_camera.t[2]);
-    src_C[0] = -(src_camera.R[0] * src_camera.t[0] + src_camera.R[3] * src_camera.t[1] + src_camera.R[6] * src_camera.t[2]);
-    src_C[1] = -(src_camera.R[1] * src_camera.t[0] + src_camera.R[4] * src_camera.t[1] + src_camera.R[7] * src_camera.t[2]);
-    src_C[2] = -(src_camera.R[2] * src_camera.t[0] + src_camera.R[5] * src_camera.t[1] + src_camera.R[8] * src_camera.t[2]);
-
-    float R_relative[9];
-    float C_relative[3];
-    float t_relative[3];
-    R_relative[0] = src_camera.R[0] * ref_camera.R[0] + src_camera.R[1] * ref_camera.R[1] + src_camera.R[2] *ref_camera.R[2];
-    R_relative[1] = src_camera.R[0] * ref_camera.R[3] + src_camera.R[1] * ref_camera.R[4] + src_camera.R[2] *ref_camera.R[5];
-    R_relative[2] = src_camera.R[0] * ref_camera.R[6] + src_camera.R[1] * ref_camera.R[7] + src_camera.R[2] *ref_camera.R[8];
-    R_relative[3] = src_camera.R[3] * ref_camera.R[0] + src_camera.R[4] * ref_camera.R[1] + src_camera.R[5] *ref_camera.R[2];
-    R_relative[4] = src_camera.R[3] * ref_camera.R[3] + src_camera.R[4] * ref_camera.R[4] + src_camera.R[5] *ref_camera.R[5];
-    R_relative[5] = src_camera.R[3] * ref_camera.R[6] + src_camera.R[4] * ref_camera.R[7] + src_camera.R[5] *ref_camera.R[8];
-    R_relative[6] = src_camera.R[6] * ref_camera.R[0] + src_camera.R[7] * ref_camera.R[1] + src_camera.R[8] *ref_camera.R[2];
-    R_relative[7] = src_camera.R[6] * ref_camera.R[3] + src_camera.R[7] * ref_camera.R[4] + src_camera.R[8] *ref_camera.R[5];
-    R_relative[8] = src_camera.R[6] * ref_camera.R[6] + src_camera.R[7] * ref_camera.R[7] + src_camera.R[8] *ref_camera.R[8];
-    C_relative[0] = (ref_C[0] - src_C[0]);
-    C_relative[1] = (ref_C[1] - src_C[1]);
-    C_relative[2] = (ref_C[2] - src_C[2]);
-    t_relative[0] = src_camera.R[0] * C_relative[0] + src_camera.R[1] * C_relative[1] + src_camera.R[2] * C_relative[2];
-    t_relative[1] = src_camera.R[3] * C_relative[0] + src_camera.R[4] * C_relative[1] + src_camera.R[5] * C_relative[2];
-    t_relative[2] = src_camera.R[6] * C_relative[0] + src_camera.R[7] * C_relative[1] + src_camera.R[8] * C_relative[2];
-
-    H[0] = R_relative[0] - t_relative[0] * plane_hypothesis.x / plane_hypothesis.w;
-    H[1] = R_relative[1] - t_relative[0] * plane_hypothesis.y / plane_hypothesis.w;
-    H[2] = R_relative[2] - t_relative[0] * plane_hypothesis.z / plane_hypothesis.w;
-    H[3] = R_relative[3] - t_relative[1] * plane_hypothesis.x / plane_hypothesis.w;
-    H[4] = R_relative[4] - t_relative[1] * plane_hypothesis.y / plane_hypothesis.w;
-    H[5] = R_relative[5] - t_relative[1] * plane_hypothesis.z / plane_hypothesis.w;
-    H[6] = R_relative[6] - t_relative[2] * plane_hypothesis.x / plane_hypothesis.w;
-    H[7] = R_relative[7] - t_relative[2] * plane_hypothesis.y / plane_hypothesis.w;
-    H[8] = R_relative[8] - t_relative[2] * plane_hypothesis.z / plane_hypothesis.w;
-
-    float tmp[9];
-    tmp[0] = H[0] / ref_camera.K[0];
-    tmp[1] = H[1] / ref_camera.K[4];
-    tmp[2] = -H[0] * ref_camera.K[2] / ref_camera.K[0] - H[1] * ref_camera.K[5] / ref_camera.K[4] + H[2];
-    tmp[3] = H[3] / ref_camera.K[0];
-    tmp[4] = H[4] / ref_camera.K[4];
-    tmp[5] = -H[3] * ref_camera.K[2] / ref_camera.K[0] - H[4] * ref_camera.K[5] / ref_camera.K[4] + H[5];
-    tmp[6] = H[6] / ref_camera.K[0];
-    tmp[7] = H[7] / ref_camera.K[4];
-    tmp[8] = -H[6] * ref_camera.K[2] / ref_camera.K[0] - H[7] * ref_camera.K[5] / ref_camera.K[4] + H[8];
-
-    H[0] = src_camera.K[0] * tmp[0] + src_camera.K[2] * tmp[6];
-    H[1] = src_camera.K[0] * tmp[1] + src_camera.K[2] * tmp[7];
-    H[2] = src_camera.K[0] * tmp[2] + src_camera.K[2] * tmp[8];
-    H[3] = src_camera.K[4] * tmp[3] + src_camera.K[5] * tmp[6];
-    H[4] = src_camera.K[4] * tmp[4] + src_camera.K[5] * tmp[7];
-    H[5] = src_camera.K[4] * tmp[5] + src_camera.K[5] * tmp[8];
-    H[6] = src_camera.K[8] * tmp[6];
-    H[7] = src_camera.K[8] * tmp[7];
-    H[8] = src_camera.K[8] * tmp[8];
-}
-
-__device__ float2 ComputeCorrespondingPoint(const float *H, const int2 p)
-{
-    float3 pt;
-    pt.x = H[0] * p.x + H[1] * p.y + H[2];
-    pt.y = H[3] * p.x + H[4] * p.y + H[5];
-    pt.z = H[6] * p.x + H[7] * p.y + H[8];
-    return make_float2(pt.x / pt.z, pt.y / pt.z);
-}
 
 __device__ float4 TransformNormal(const Camera camera, float4 plane_hypothesis)
 {
@@ -414,77 +344,62 @@ __device__ float ComputeBilateralNCC(
     const float cost_max = 2.0f;
     const int radius = params.patch_size / 2;
 
-    // 1) Depth of the ref center under the hypothesis, world point
+    // 1) Compute the 3D point of the reference center under this plane:
     float depth_ref = ComputeDepthfromPlaneHypothesis(ref_camera, plane_hypothesis, p);
     float3 Pw_center = Get3DPointonWorld_cu(p.x, p.y, depth_ref, ref_camera);
 
-    // 2) Project the center into the source; validate (SPHERE uses wrap/clamp)
+    // 2) Project that center into the source to check validity:
     float2 pt_center; float dummy_depth;
     ProjectonCamera_cu(Pw_center, src_camera, pt_center, dummy_depth);
-
-    if (src_camera.model == SPHERE) {
-        pt_center.x = pt_center.x - floorf(pt_center.x / (float)src_camera.width) * (float)src_camera.width;   // wrap lon
-        pt_center.y = fminf(fmaxf(pt_center.y, 0.0f), (float)src_camera.height - 1.0f);                         // clamp lat
-    } else {
-        if (pt_center.x < 0.0f || pt_center.x >= src_camera.width ||
-            pt_center.y < 0.0f || pt_center.y >= src_camera.height) {
-            return cost_max;
-        }
+    if (pt_center.x < 0.0f || pt_center.x >= src_camera.width ||
+        pt_center.y < 0.0f || pt_center.y >= src_camera.height) {
+        return cost_max;
     }
 
-    // 3) Angular pixel scaling for SPHERE (use local small-angle metric)
-    float scale_x = 1.0f, scale_y = 1.0f, sigma_spatial_eff = params.sigma_spatial;
-    if (ref_camera.model == SPHERE) {
-        const float lat_c = -((float)p.y - ref_camera.params[2]) / (float)ref_camera.height * CUDART_PI_F;
-        scale_x = (2.0f * CUDART_PI_F / (float)ref_camera.width) * cosf(lat_c);  // dlon * cos(lat)
-        scale_y = (CUDART_PI_F / (float)ref_camera.height);                       // dlat
-        sigma_spatial_eff = params.sigma_spatial * (CUDART_PI_F / (float)ref_camera.height); // px → rad
-    }
-
-    // 4) Bilateral-weighted NCC accumulation
+    // 3) Now accumulate bilateral‐weighted NCC over the patch:
+    float cost = 0.0f;
     const float ref_center_pix = tex2D<float>(ref_image, p.x + 0.5f, p.y + 0.5f);
-    float sum_ref = 0.0f, sum_ref_ref = 0.0f;
-    float sum_src = 0.0f, sum_src_src = 0.0f;
-    float sum_ref_src = 0.0f, sum_bw = 0.0f;
+    float sum_ref = 0, sum_ref_ref = 0;
+    float sum_src = 0, sum_src_src = 0;
+    float sum_ref_src = 0, sum_bw = 0;
 
     for (int i = -radius; i <= radius; i += params.radius_increment) {
         for (int j = -radius; j <= radius; j += params.radius_increment) {
-            const int2 ref_pt = make_int2(p.x + i, p.y + j);
+            int2 ref_pt = make_int2(p.x + i, p.y + j);
 
-            // sample reference (assumes texture addressing handles edges as configured)
-            const float ref_pix = tex2D<float>(ref_image, ref_pt.x + 0.5f, ref_pt.y + 0.5f);
-
-            // compute 3D point for this ref offset under the same plane
-            const float depth_n = ComputeDepthfromPlaneHypothesis(ref_camera, plane_hypothesis, ref_pt);
-            float3 Pw_n = Get3DPointonWorld_cu(ref_pt.x, ref_pt.y, depth_n, ref_camera);
+            // sample reference
+            float ref_pix = tex2D<float>(ref_image,
+                                         ref_pt.x + 0.5f,
+                                         ref_pt.y + 0.5f);
+            // compute 3D under same plane
+            float depth_n = ComputeDepthfromPlaneHypothesis(ref_camera,
+                                                            plane_hypothesis,
+                                                            ref_pt);
+            float3 Pw_n = Get3DPointonWorld_cu(ref_pt.x,
+                                               ref_pt.y,
+                                               depth_n,
+                                               ref_camera);
 
             // project into source
             float2 src_pt; float src_d;
             ProjectonCamera_cu(Pw_n, src_camera, src_pt, src_d);
-
-            if (src_camera.model == SPHERE) {
-                // wrap longitude, clamp latitude
-                src_pt.x = src_pt.x - floorf(src_pt.x / (float)src_camera.width) * (float)src_camera.width;
-                src_pt.y = fminf(fmaxf(src_pt.y, 0.0f), (float)src_camera.height - 1.0f);
-            } else {
-                if (src_pt.x < 0.0f || src_pt.x >= src_camera.width ||
-                    src_pt.y < 0.0f || src_pt.y >= src_camera.height) {
-                    continue;
-                }
+            // out‐of‐bounds?
+            if (src_pt.x < 0.0f || src_pt.x >= src_camera.width ||
+                src_pt.y < 0.0f || src_pt.y >= src_camera.height) {
+                continue;
             }
+            float src_pix = tex2D<float>(src_image,
+                                         src_pt.x + 0.5f,
+                                         src_pt.y + 0.5f);
 
-            const float src_pix = tex2D<float>(src_image, src_pt.x + 0.5f, src_pt.y + 0.5f);
+            // bilateral weight
+            float w = ComputeBilateralWeight(i, j,
+                                             ref_pix,
+                                             ref_center_pix,
+                                             params.sigma_spatial,
+                                             params.sigma_color);
 
-            // bilateral weight: angular distances for SPHERE, pixel distances otherwise
-            const float dx = (ref_camera.model == SPHERE) ? (i * scale_x) : (float)i;
-            const float dy = (ref_camera.model == SPHERE) ? (j * scale_y) : (float)j;
-
-            const float w = ComputeBilateralWeight(dx, dy,
-                                                   ref_pix,
-                                                   ref_center_pix,
-                                                   (ref_camera.model == SPHERE) ? sigma_spatial_eff : params.sigma_spatial,
-                                                   params.sigma_color);
-
+            // accumulate
             sum_bw      += w;
             sum_ref     += w * ref_pix;
             sum_ref_ref += w * ref_pix * ref_pix;
@@ -495,25 +410,26 @@ __device__ float ComputeBilateralNCC(
     }
 
     if (sum_bw < 1e-6f) return cost_max;
+    float inv_bw = 1.0f / sum_bw;
+    sum_ref     *= inv_bw;
+    sum_ref_ref *= inv_bw;
+    sum_src     *= inv_bw;
+    sum_src_src *= inv_bw;
+    sum_ref_src *= inv_bw;
 
-    // normalize by total weight
-    const float inv_bw = 1.0f / sum_bw;
-    const float m_ref = sum_ref * inv_bw;
-    const float m_src = sum_src * inv_bw;
-    const float e_ref_ref = sum_ref_ref * inv_bw;
-    const float e_src_src = sum_src_src * inv_bw;
-    const float e_ref_src = sum_ref_src * inv_bw;
-
-    const float var_ref = e_ref_ref - m_ref * m_ref;
-    const float var_src = e_src_src - m_src * m_src;
+    float var_ref = sum_ref_ref - sum_ref * sum_ref;
+    float var_src = sum_src_src - sum_src * sum_src;
     const float kMinVar = 1e-5f;
-    if (var_ref < kMinVar || var_src < kMinVar) return cost_max;
-
-    const float covar = e_ref_src - m_ref * m_src;
-    float ncc_cost = 1.0f - covar / sqrtf(var_ref * var_src);
+    if (var_ref < kMinVar || var_src < kMinVar) {
+        return cost_max;
+    }
+    float covar    = sum_ref_src - sum_ref * sum_src;
+    float denom    = sqrtf(var_ref * var_src);
+    float ncc_cost = 1.0f - covar / denom;
     ncc_cost = fmaxf(0.0f, fminf(cost_max, ncc_cost));
     return ncc_cost;
 }
+
 
 
 __device__ float ComputeMultiViewInitialCostandSelectedViews(const cudaTextureObject_t *images, const Camera *cameras, const int2 p, const float4 plane_hypothesis, unsigned int *selected_views, const PatchMatchParams params)
@@ -1647,403 +1563,826 @@ void JBU::CudaRun()
     cudaEventElapsedTime(&milliseconds, start, stop);
     printf("Total time needed for computation: %f seconds\n", milliseconds / 1000.f);
 }
+
 #include <memory>
 #include <unordered_set>
+#include <unordered_map>
 #include <queue>
+#include <map>
+#include <set>
+#include <vector>
+#include <string>
+#include <iostream>
+#include <fstream>
+#include <opencv2/opencv.hpp>
+#include <opencv2/imgproc.hpp>
+#include <thread>
+#include <future>
+#include <atomic>
+#include <chrono>
+#include <mutex>
+#include <algorithm>
+#include <cstdio>
+#include <cuda_runtime.h>
+#include <cuda.h>
+#include <condition_variable>
+#include <list>
 
-
-// CUDA error checking macro
-#ifndef CUDA_SAFE_CALL
-#define CUDA_SAFE_CALL(call) do { \
-    cudaError_t err = call; \
-    if (err != cudaSuccess) { \
-        std::cerr << "CUDA error at " << __FILE__ << ":" << __LINE__ << " - " << cudaGetErrorString(err) << std::endl; \
-        exit(EXIT_FAILURE); \
-    } \
-} while(0)
-#endif
-
-// Helper function to check GPU memory
-bool checkGPUMemory(size_t required_bytes) {
-    size_t free_mem, total_mem;
-    cudaError_t mem_error = cudaMemGetInfo(&free_mem, &total_mem);
-    if (mem_error != cudaSuccess) {
-        std::cerr << "Warning: Could not query GPU memory" << std::endl;
-        return true; // Assume it's okay
-    }
-    
-    std::cout << "GPU Memory: " << free_mem / (1024*1024) << " MB free / " 
-              << total_mem / (1024*1024) << " MB total" << std::endl;
-    
-    if (required_bytes > free_mem) {
-        std::cerr << "Error: Insufficient GPU memory. Required: " << required_bytes / (1024*1024) 
-                  << " MB, Available: " << free_mem / (1024*1024) << " MB" << std::endl;
-        return false;
-    }
-    return true;
-}
-
-// Helper class to manage GPU texture resources
-class TextureManager {
+// Thread pool for parallel file I/O
+class ThreadPool {
 private:
-    struct TextureData {
-        cudaArray* depth_array = nullptr;
-        cudaArray* normal_array = nullptr; 
-        cudaArray* image_array = nullptr;
-        cudaTextureObject_t depth_texture = 0;
-        cudaTextureObject_t normal_texture = 0;
-        cudaTextureObject_t image_texture = 0;
-        bool loaded = false;
-    };
-    
-    std::unordered_map<int, TextureData> textures;
-    size_t max_textures_in_memory;
-    std::queue<int> lru_queue;
-    
+    std::vector<std::thread> workers;
+    std::queue<std::function<void()>> tasks;
+    std::mutex queue_mutex;
+    std::condition_variable condition;
+    bool stop;
+
 public:
-    TextureManager(size_t max_textures = 10) : max_textures_in_memory(max_textures) {}
-    
-    ~TextureManager() {
-        for (auto& pair : textures) {
-            releaseTexture(pair.first);
+    ThreadPool(size_t threads = std::thread::hardware_concurrency()) : stop(false) {
+        for (size_t i = 0; i < threads; ++i) {
+            workers.emplace_back([this] {
+                for (;;) {
+                    std::function<void()> task;
+                    {
+                        std::unique_lock<std::mutex> lock(this->queue_mutex);
+                        this->condition.wait(lock, [this] { return this->stop || !this->tasks.empty(); });
+                        if (this->stop && this->tasks.empty())
+                            return;
+                        task = std::move(this->tasks.front());
+                        this->tasks.pop();
+                    }
+                    task();
+                }
+            });
         }
     }
-    
-    bool loadTexture(int image_id, const cv::Mat_<float>& depth, 
-                    const cv::Mat_<cv::Vec3f>& normal, const cv::Mat& image) {
-        // Check if we need to free some memory
-        while (lru_queue.size() >= max_textures_in_memory) {
-            int old_id = lru_queue.front();
-            lru_queue.pop();
-            releaseTexture(old_id);
+
+    template<class F, class... Args>
+    auto enqueue(F&& f, Args&&... args) -> std::future<typename std::result_of<F(Args...)>::type> {
+        using return_type = typename std::result_of<F(Args...)>::type;
+        
+        auto task = std::make_shared<std::packaged_task<return_type()>>(
+            std::bind(std::forward<F>(f), std::forward<Args>(args)...)
+        );
+        
+        std::future<return_type> res = task->get_future();
+        {
+            std::unique_lock<std::mutex> lock(queue_mutex);
+            if (stop)
+                throw std::runtime_error("enqueue on stopped ThreadPool");
+            tasks.emplace([task]() { (*task)(); });
         }
-        
-        TextureData& data = textures[image_id];
-        if (data.loaded) {
-            return true; // Already loaded
+        condition.notify_one();
+        return res;
+    }
+
+    ~ThreadPool() {
+        {
+            std::unique_lock<std::mutex> lock(queue_mutex);
+            stop = true;
         }
-        
-        int width = depth.cols;
-        int height = depth.rows;
-        
-        try {
-            // Create depth texture
-            cudaChannelFormatDesc depth_desc = cudaCreateChannelDesc<float>();
-            CUDA_SAFE_CALL(cudaMallocArray(&data.depth_array, &depth_desc, width, height));
-            CUDA_SAFE_CALL(cudaMemcpy2DToArray(data.depth_array, 0, 0, 
-                                               depth.ptr<float>(), depth.step[0], 
-                                               width * sizeof(float), height, 
-                                               cudaMemcpyHostToDevice));
-
-            cudaResourceDesc depth_res_desc = {};
-            depth_res_desc.resType = cudaResourceTypeArray;
-            depth_res_desc.res.array.array = data.depth_array;
-
-            cudaTextureDesc depth_tex_desc = {};
-            depth_tex_desc.addressMode[0] = cudaAddressModeWrap;
-            depth_tex_desc.addressMode[1] = cudaAddressModeClamp;
-            depth_tex_desc.filterMode = cudaFilterModePoint;
-            depth_tex_desc.readMode = cudaReadModeElementType;
-            depth_tex_desc.normalizedCoords = false;
-
-            CUDA_SAFE_CALL(cudaCreateTextureObject(&data.depth_texture, 
-                                                   &depth_res_desc, &depth_tex_desc, NULL));
-
-            // Create normal texture
-            cv::Mat normal_rgba;
-            cv::cvtColor(normal, normal_rgba, cv::COLOR_RGB2RGBA);
-            
-            cudaChannelFormatDesc normal_desc = cudaCreateChannelDesc<float4>();
-            CUDA_SAFE_CALL(cudaMallocArray(&data.normal_array, &normal_desc, width, height));
-            CUDA_SAFE_CALL(cudaMemcpy2DToArray(data.normal_array, 0, 0, 
-                                               normal_rgba.ptr<float>(), normal_rgba.step[0], 
-                                               width * sizeof(float4), height, 
-                                               cudaMemcpyHostToDevice));
-
-            cudaResourceDesc normal_res_desc = {};
-            normal_res_desc.resType = cudaResourceTypeArray;
-            normal_res_desc.res.array.array = data.normal_array;
-
-            cudaTextureDesc normal_tex_desc = {};
-            normal_tex_desc.addressMode[0] = cudaAddressModeWrap;
-            normal_tex_desc.addressMode[1] = cudaAddressModeClamp;
-            normal_tex_desc.filterMode = cudaFilterModePoint;
-            normal_tex_desc.readMode = cudaReadModeElementType;
-            normal_tex_desc.normalizedCoords = false;
-
-            CUDA_SAFE_CALL(cudaCreateTextureObject(&data.normal_texture, 
-                                                   &normal_res_desc, &normal_tex_desc, NULL));
-
-            // Create image texture
-            cv::Mat rgba_float;
-            cv::Mat rgba;
-            cv::cvtColor(image, rgba, cv::COLOR_BGR2RGBA);
-            rgba.convertTo(rgba_float, CV_32FC4, 1.0/255.0);
-
-            cudaChannelFormatDesc image_desc = cudaCreateChannelDesc<float4>();
-            CUDA_SAFE_CALL(cudaMallocArray(&data.image_array, &image_desc, width, height));
-            CUDA_SAFE_CALL(cudaMemcpy2DToArray(data.image_array, 0, 0, 
-                                               rgba_float.ptr<float>(), rgba_float.step[0], 
-                                               width * sizeof(float4), height, 
-                                               cudaMemcpyHostToDevice));
-
-            cudaResourceDesc image_res_desc = {};
-            image_res_desc.resType = cudaResourceTypeArray;
-            image_res_desc.res.array.array = data.image_array;
-
-            cudaTextureDesc image_tex_desc = {};
-            image_tex_desc.addressMode[0] = cudaAddressModeWrap;
-            image_tex_desc.addressMode[1] = cudaAddressModeClamp;
-            image_tex_desc.filterMode = cudaFilterModeLinear;
-            image_tex_desc.readMode = cudaReadModeElementType;
-            image_tex_desc.normalizedCoords = false;
-
-            CUDA_SAFE_CALL(cudaCreateTextureObject(&data.image_texture, 
-                                                   &image_res_desc, &image_tex_desc, NULL));
-
-            data.loaded = true;
-            lru_queue.push(image_id);
-            return true;
-            
-        } catch (...) {
-            releaseTexture(image_id);
-            return false;
-        }
-    }
-    
-    void releaseTexture(int image_id) {
-        auto it = textures.find(image_id);
-        if (it == textures.end() || !it->second.loaded) return;
-        
-        TextureData& data = it->second;
-        if (data.depth_texture) cudaDestroyTextureObject(data.depth_texture);
-        if (data.normal_texture) cudaDestroyTextureObject(data.normal_texture);
-        if (data.image_texture) cudaDestroyTextureObject(data.image_texture);
-        if (data.depth_array) cudaFreeArray(data.depth_array);
-        if (data.normal_array) cudaFreeArray(data.normal_array);
-        if (data.image_array) cudaFreeArray(data.image_array);
-        
-        data = TextureData(); // Reset to defaults
-    }
-    
-    cudaTextureObject_t getDepthTexture(int image_id) {
-        auto it = textures.find(image_id);
-        return (it != textures.end() && it->second.loaded) ? it->second.depth_texture : 0;
-    }
-    
-    cudaTextureObject_t getNormalTexture(int image_id) {
-        auto it = textures.find(image_id);
-        return (it != textures.end() && it->second.loaded) ? it->second.normal_texture : 0;
-    }
-    
-    cudaTextureObject_t getImageTexture(int image_id) {
-        auto it = textures.find(image_id);
-        return (it != textures.end() && it->second.loaded) ? it->second.image_texture : 0;
+        condition.notify_all();
+        for (std::thread &worker : workers)
+            worker.join();
     }
 };
 
-// Streaming data loader - loads data on demand
-class StreamingDataLoader {
+// Persistent GPU buffer manager to avoid allocation overhead
+class PersistentGPUBuffers {
+private:
+    // Texture arrays for batch processing
+    cudaTextureObject_t* depth_textures_buffer;
+    cudaTextureObject_t* normal_textures_buffer;
+    cudaTextureObject_t* image_textures_buffer;
+    int* texture_image_ids_buffer;
+    
+    // Problem data buffers
+    int* ref_image_ids_buffer;
+    int* all_src_image_ids_buffer;
+    int* src_counts_buffer;
+    int* src_offsets_buffer;
+    int* problem_offsets_buffer;
+    int* widths_buffer;
+    int* heights_buffer;
+    
+    // Output buffers
+    PointList* output_points_buffer;
+    int* valid_flags_buffer;
+    
+    // Buffer sizes
+    size_t max_textures;
+    size_t max_problems;
+    size_t max_src_images;
+    size_t max_pixels;
+    
+    bool buffers_allocated;
+
+public:
+    PersistentGPUBuffers() : buffers_allocated(false) {
+        // Initialize all pointers to nullptr
+        depth_textures_buffer = nullptr;
+        normal_textures_buffer = nullptr;
+        image_textures_buffer = nullptr;
+        texture_image_ids_buffer = nullptr;
+        ref_image_ids_buffer = nullptr;
+        all_src_image_ids_buffer = nullptr;
+        src_counts_buffer = nullptr;
+        src_offsets_buffer = nullptr;
+        problem_offsets_buffer = nullptr;
+        widths_buffer = nullptr;
+        heights_buffer = nullptr;
+        output_points_buffer = nullptr;
+        valid_flags_buffer = nullptr;
+    }
+    
+    void allocateBuffers(size_t est_max_textures, size_t est_max_problems, 
+                        size_t est_max_src_images, size_t est_max_pixels) {
+        if (buffers_allocated) return;
+        
+        // Add 50% buffer to avoid reallocations
+        max_textures = est_max_textures * 1.5;
+        max_problems = est_max_problems * 1.5;
+        max_src_images = est_max_src_images * 1.5;
+        max_pixels = est_max_pixels * 1.5;
+        
+        std::cout << "[PersistentGPU] Allocating buffers for max: " 
+                  << max_textures << " textures, " << max_problems << " problems, "
+                  << max_pixels << " pixels" << std::endl;
+        
+        // Allocate all buffers once
+        CUDA_SAFE_CALL(cudaMalloc(&depth_textures_buffer, max_textures * sizeof(cudaTextureObject_t)));
+        CUDA_SAFE_CALL(cudaMalloc(&normal_textures_buffer, max_textures * sizeof(cudaTextureObject_t)));
+        CUDA_SAFE_CALL(cudaMalloc(&image_textures_buffer, max_textures * sizeof(cudaTextureObject_t)));
+        CUDA_SAFE_CALL(cudaMalloc(&texture_image_ids_buffer, max_textures * sizeof(int)));
+        
+        CUDA_SAFE_CALL(cudaMalloc(&ref_image_ids_buffer, max_problems * sizeof(int)));
+        CUDA_SAFE_CALL(cudaMalloc(&all_src_image_ids_buffer, max_src_images * sizeof(int)));
+        CUDA_SAFE_CALL(cudaMalloc(&src_counts_buffer, max_problems * sizeof(int)));
+        CUDA_SAFE_CALL(cudaMalloc(&src_offsets_buffer, max_problems * sizeof(int)));
+        CUDA_SAFE_CALL(cudaMalloc(&problem_offsets_buffer, max_problems * sizeof(int)));
+        CUDA_SAFE_CALL(cudaMalloc(&widths_buffer, max_problems * sizeof(int)));
+        CUDA_SAFE_CALL(cudaMalloc(&heights_buffer, max_problems * sizeof(int)));
+        
+        CUDA_SAFE_CALL(cudaMalloc(&output_points_buffer, max_pixels * sizeof(PointList)));
+        CUDA_SAFE_CALL(cudaMalloc(&valid_flags_buffer, max_pixels * sizeof(int)));
+        
+        buffers_allocated = true;
+        
+        // Check allocated memory
+        size_t free_mem, total_mem;
+        cudaMemGetInfo(&free_mem, &total_mem);
+        std::cout << "[PersistentGPU] Buffers allocated. GPU memory: " 
+                  << free_mem / (1024*1024) << " MB free / " 
+                  << total_mem / (1024*1024) << " MB total" << std::endl;
+    }
+    
+    ~PersistentGPUBuffers() {
+        if (buffers_allocated) {
+            cudaFree(depth_textures_buffer);
+            cudaFree(normal_textures_buffer);
+            cudaFree(image_textures_buffer);
+            cudaFree(texture_image_ids_buffer);
+            cudaFree(ref_image_ids_buffer);
+            cudaFree(all_src_image_ids_buffer);
+            cudaFree(src_counts_buffer);
+            cudaFree(src_offsets_buffer);
+            cudaFree(problem_offsets_buffer);
+            cudaFree(widths_buffer);
+            cudaFree(heights_buffer);
+            cudaFree(output_points_buffer);
+            cudaFree(valid_flags_buffer);
+        }
+    }
+    
+    // Get buffers with size checking
+    cudaTextureObject_t* getDepthTexturesBuffer(size_t needed) {
+        if (needed > max_textures) {
+            throw std::runtime_error("Texture buffer size exceeded");
+        }
+        return depth_textures_buffer;
+    }
+    
+    cudaTextureObject_t* getNormalTexturesBuffer(size_t needed) {
+        if (needed > max_textures) {
+            throw std::runtime_error("Texture buffer size exceeded");
+        }
+        return normal_textures_buffer;
+    }
+    
+    cudaTextureObject_t* getImageTexturesBuffer(size_t needed) {
+        if (needed > max_textures) {
+            throw std::runtime_error("Texture buffer size exceeded");
+        }
+        return image_textures_buffer;
+    }
+    
+    int* getTextureImageIdsBuffer(size_t needed) {
+        if (needed > max_textures) {
+            throw std::runtime_error("Texture buffer size exceeded");
+        }
+        return texture_image_ids_buffer;
+    }
+    
+    int* getRefImageIdsBuffer(size_t needed) {
+        if (needed > max_problems) {
+            throw std::runtime_error("Problem buffer size exceeded");
+        }
+        return ref_image_ids_buffer;
+    }
+    
+    int* getAllSrcImageIdsBuffer(size_t needed) {
+        if (needed > max_src_images) {
+            throw std::runtime_error("Source images buffer size exceeded");
+        }
+        return all_src_image_ids_buffer;
+    }
+    
+    int* getSrcCountsBuffer(size_t needed) {
+        if (needed > max_problems) {
+            throw std::runtime_error("Problem buffer size exceeded");
+        }
+        return src_counts_buffer;
+    }
+    
+    int* getSrcOffsetsBuffer(size_t needed) {
+        if (needed > max_problems) {
+            throw std::runtime_error("Problem buffer size exceeded");
+        }
+        return src_offsets_buffer;
+    }
+    
+    int* getProblemOffsetsBuffer(size_t needed) {
+        if (needed > max_problems) {
+            throw std::runtime_error("Problem buffer size exceeded");
+        }
+        return problem_offsets_buffer;
+    }
+    
+    int* getWidthsBuffer(size_t needed) {
+        if (needed > max_problems) {
+            throw std::runtime_error("Problem buffer size exceeded");
+        }
+        return widths_buffer;
+    }
+    
+    int* getHeightsBuffer(size_t needed) {
+        if (needed > max_problems) {
+            throw std::runtime_error("Problem buffer size exceeded");
+        }
+        return heights_buffer;
+    }
+    
+    PointList* getOutputPointsBuffer(size_t needed) {
+        if (needed > max_pixels) {
+            throw std::runtime_error("Output buffer size exceeded");
+        }
+        return output_points_buffer;
+    }
+    
+    int* getValidFlagsBuffer(size_t needed) {
+        if (needed > max_pixels) {
+            throw std::runtime_error("Valid flags buffer size exceeded");
+        }
+        return valid_flags_buffer;
+    }
+};
+
+// Image data structure for efficient caching
+struct ImageData {
+    Camera camera;
+    cv::Mat_<float> depth;
+    cv::Mat_<cv::Vec3f> normal;
+    cv::Mat image;
+    bool valid;
+    std::chrono::steady_clock::time_point last_accessed;
+    
+    ImageData() : valid(false) {}
+};
+
+// Optimized data loader with parallel I/O and LRU cache
+class OptimizedDataLoader {
 private:
     std::string dense_folder;
-    std::string img_folder;
+    std::string img_folder; 
     std::string cam_folder;
     bool geom_consistency;
     
-    // Cache recently loaded data
-    std::unordered_map<int, Camera> camera_cache;
-    std::unordered_map<int, cv::Mat_<float>> depth_cache;
-    std::unordered_map<int, cv::Mat_<cv::Vec3f>> normal_cache;
-    std::unordered_map<int, cv::Mat> image_cache;
+    // LRU cache with thread safety
+    std::unordered_map<int, std::shared_ptr<ImageData>> cache;
+    std::list<int> lru_order;
+    std::unordered_map<int, std::list<int>::iterator> lru_map;
     
-    size_t max_cache_size = 5; // Keep only 5 items in each cache
+    size_t max_cache_size;
+    mutable std::mutex cache_mutex;
     
-public:
-    StreamingDataLoader(const std::string& folder, bool geom = false) 
-        : dense_folder(folder), geom_consistency(geom) {
-        img_folder = folder + "/images";
-        cam_folder = folder + "/cams";
+    // Thread pool for parallel I/O
+    std::unique_ptr<ThreadPool> thread_pool;
+    
+    void updateLRU(int image_id) {
+        auto it = lru_map.find(image_id);
+        if (it != lru_map.end()) {
+            lru_order.erase(it->second);
+        }
+        lru_order.push_front(image_id);
+        lru_map[image_id] = lru_order.begin();
     }
     
-    bool loadCamera(int image_id, Camera& cam) {
-        auto it = camera_cache.find(image_id);
-        if (it != camera_cache.end()) {
-            cam = it->second;
-            return true;
+    void trimCache() {
+        while (cache.size() > max_cache_size && !lru_order.empty()) {
+            int oldest = lru_order.back();
+            lru_order.pop_back();
+            lru_map.erase(oldest);
+            cache.erase(oldest);
         }
+    }
+    
+    std::shared_ptr<ImageData> loadImageDataSync(int image_id) {
+        auto data = std::make_shared<ImageData>();
+        data->valid = false;
         
+        // Load camera
         char buf[256];
         sprintf(buf, "%s/%08d_cam.txt", cam_folder.c_str(), image_id);
-        std::string cam_file(buf);
-        
         try {
-            cam = ReadCamera(cam_file);
-            
-            // Validate camera after loading
-            if (cam.width <= 0 || cam.height <= 0) {
-                std::cerr << "Warning: Camera file " << cam_file << " has invalid dimensions: " 
-                          << cam.width << "x" << cam.height << std::endl;
-                return false;
+            data->camera = ReadCamera(std::string(buf));
+            if (data->camera.width <= 0 || data->camera.height <= 0) {
+                return data;
             }
-            
-            // Manage cache size
-            if (camera_cache.size() >= max_cache_size) {
-                camera_cache.erase(camera_cache.begin());
-            }
-            camera_cache[image_id] = cam;
-            return true;
         } catch (...) {
-            std::cerr << "Warning: Failed to read camera file: " << cam_file << std::endl;
-            return false;
-        }
-    }
-    
-    bool loadDepth(int image_id, cv::Mat_<float>& depth) {
-        auto it = depth_cache.find(image_id);
-        if (it != depth_cache.end()) {
-            depth = it->second;
-            return true;
+            return data;
         }
         
-        char buf[256];
+        // Load depth
         std::string depth_suffix = geom_consistency ? "/depths_geom.dmb" : "/depths.dmb";
         sprintf(buf, "%s/ACMMP/2333_%08d%s", dense_folder.c_str(), image_id, depth_suffix.c_str());
-        std::string depth_file(buf);
-        
-        if (readDepthDmb(depth_file, depth) != 0) {
-            std::cerr << "Warning: Failed to read depth file: " << depth_file << std::endl;
-            return false;
+        if (readDepthDmb(std::string(buf), data->depth) != 0 || 
+            data->depth.cols <= 0 || data->depth.rows <= 0) {
+            return data;
         }
         
-        // Validate depth dimensions
-        if (depth.cols <= 0 || depth.rows <= 0) {
-            std::cerr << "Warning: Depth file " << depth_file << " has invalid dimensions: " 
-                      << depth.cols << "x" << depth.rows << std::endl;
-            return false;
-        }
-        
-        // Manage cache size
-        if (depth_cache.size() >= max_cache_size) {
-            depth_cache.erase(depth_cache.begin());
-        }
-        depth_cache[image_id] = depth;
-        return true;
-    }
-    
-    bool loadNormal(int image_id, cv::Mat_<cv::Vec3f>& normal) {
-        auto it = normal_cache.find(image_id);
-        if (it != normal_cache.end()) {
-            normal = it->second;
-            return true;
-        }
-        
-        char buf[256];
+        // Load normal
         sprintf(buf, "%s/ACMMP/2333_%08d/normals.dmb", dense_folder.c_str(), image_id);
-        std::string normal_file(buf);
+        if (readNormalDmb(std::string(buf), data->normal) != 0 || 
+            data->normal.cols <= 0 || data->normal.rows <= 0) {
+            return data;
+        }
         
-        if (readNormalDmb(normal_file, normal) != 0) {
-            std::cerr << "Warning: Failed to read normal file: " << normal_file << std::endl;
+        // Load image
+        sprintf(buf, "%s/%08d.jpg", img_folder.c_str(), image_id);
+        data->image = cv::imread(std::string(buf), cv::IMREAD_COLOR);
+        if (data->image.empty()) {
+            return data;
+        }
+        
+        // Rescale image to match depth
+        cv::Mat_<cv::Vec3b> img_color;
+        if (data->image.channels() == 3) {
+            img_color = cv::Mat_<cv::Vec3b>(data->image);
+        } else {
+            cv::cvtColor(data->image, img_color, cv::COLOR_GRAY2BGR);
+        }
+        cv::Mat_<cv::Vec3b> scaled_color;
+        RescaleImageAndCamera(img_color, scaled_color, data->depth, data->camera);
+        data->image = cv::Mat(scaled_color);
+        
+        data->valid = true;
+        data->last_accessed = std::chrono::steady_clock::now();
+        return data;
+    }
+    
+public:
+    OptimizedDataLoader(const std::string& folder, bool geom = false, size_t cache_size = 100) 
+        : dense_folder(folder), geom_consistency(geom), max_cache_size(cache_size) {
+        img_folder = folder + "/images";
+        cam_folder = folder + "/cams";
+        
+        // Create thread pool with optimal number of threads for I/O
+        unsigned int hw_threads = std::thread::hardware_concurrency();
+        size_t io_threads = 16;
+        if (hw_threads >= 4) {
+            io_threads = std::min(static_cast<size_t>(16), static_cast<size_t>(hw_threads));
+        } else {
+            io_threads = 4;
+        }
+        thread_pool = std::unique_ptr<ThreadPool>(new ThreadPool(io_threads));
+        
+        std::cout << "[OptimizedLoader] Using " << io_threads << " threads for parallel I/O" << std::endl;
+    }
+    
+    // Parallel preload for a chunk of images
+    void preloadChunkParallel(const std::vector<int>& image_ids) {
+        std::vector<std::future<std::shared_ptr<ImageData>>> futures;
+        std::mutex results_mutex;
+        
+        std::cout << "  Preloading " << image_ids.size() << " images in parallel..." << std::endl;
+        auto start_time = std::chrono::high_resolution_clock::now();
+        
+        // Launch parallel loading tasks
+        for (int image_id : image_ids) {
+            {
+                std::lock_guard<std::mutex> lock(cache_mutex);
+                if (cache.find(image_id) != cache.end()) {
+                    // Already cached, skip
+                    continue;
+                }
+            }
+            
+            // Submit loading task to thread pool
+            auto future = thread_pool->enqueue([this, image_id]() {
+                return loadImageDataSync(image_id);
+            });
+            futures.push_back(std::move(future));
+        }
+        
+        // Collect results and store in cache
+        size_t loaded_count = 0;
+        for (size_t i = 0; i < futures.size(); ++i) {
+            int image_id = image_ids[i];
+            auto data = futures[i].get();
+            
+            if (data && data->valid) {
+                std::lock_guard<std::mutex> lock(cache_mutex);
+                cache[image_id] = data;
+                updateLRU(image_id);
+                loaded_count++;
+            }
+        }
+        
+        {
+            std::lock_guard<std::mutex> lock(cache_mutex);
+            trimCache();
+        }
+        
+        auto end_time = std::chrono::high_resolution_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
+        
+        std::cout << "  Loaded " << loaded_count << "/" << image_ids.size() 
+                  << " images in " << duration.count() << " ms" << std::endl;
+    }
+    
+    bool getData(int image_id, Camera& cam, cv::Mat_<float>& depth, 
+                cv::Mat_<cv::Vec3f>& normal, cv::Mat& image) {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        
+        auto it = cache.find(image_id);
+        if (it == cache.end() || !it->second->valid) {
             return false;
         }
         
-        // Validate normal dimensions
-        if (normal.cols <= 0 || normal.rows <= 0) {
-            std::cerr << "Warning: Normal file " << normal_file << " has invalid dimensions: " 
-                      << normal.cols << "x" << normal.rows << std::endl;
-            return false;
-        }
+        auto data = it->second;
+        cam = data->camera;
+        depth = data->depth;
+        normal = data->normal;
+        image = data->image;
         
-        // Manage cache size
-        if (normal_cache.size() >= max_cache_size) {
-            normal_cache.erase(normal_cache.begin());
-        }
-        normal_cache[image_id] = normal;
+        updateLRU(image_id);
+        data->last_accessed = std::chrono::steady_clock::now();
+        
         return true;
     }
     
-    bool loadImage(int image_id, cv::Mat& image) {
-        auto it = image_cache.find(image_id);
-        if (it != image_cache.end()) {
-            image = it->second;
-            return true;
-        }
-        
-        char buf[256];
-        sprintf(buf, "%s/%08d.jpg", img_folder.c_str(), image_id);
-        std::string img_file(buf);
-        
-        image = cv::imread(img_file, cv::IMREAD_COLOR);
-        if (image.empty()) {
-            return false;
-        }
-        
-        // Manage cache size
-        if (image_cache.size() >= max_cache_size) {
-            image_cache.erase(image_cache.begin());
-        }
-        image_cache[image_id] = image;
-        return true;
+    size_t getCacheSize() const {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        return cache.size();
+    }
+    
+    void clearCache() {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        cache.clear();
+        lru_order.clear();
+        lru_map.clear();
     }
 };
 
-// Modified fusion kernel that works with sparse texture arrays
-__global__ void EfficientFusionKernel(
+// Optimized texture manager with reduced allocation overhead
+class OptimizedTextureManager {
+private:
+    struct TextureData {
+        cudaArray* depth_array;
+        cudaArray* normal_array;
+        cudaArray* image_array;
+        cudaTextureObject_t depth_texture;
+        cudaTextureObject_t normal_texture;
+        cudaTextureObject_t image_texture;
+        bool is_valid;
+        
+        TextureData() : depth_array(nullptr), normal_array(nullptr), image_array(nullptr),
+                       depth_texture(0), normal_texture(0), image_texture(0), is_valid(false) {}
+        
+        void cleanup() {
+            if (depth_texture != 0) {
+                cudaDestroyTextureObject(depth_texture);
+                depth_texture = 0;
+            }
+            if (normal_texture != 0) {
+                cudaDestroyTextureObject(normal_texture);
+                normal_texture = 0;
+            }
+            if (image_texture != 0) {
+                cudaDestroyTextureObject(image_texture);
+                image_texture = 0;
+            }
+            
+            if (depth_array != nullptr) {
+                cudaFreeArray(depth_array);
+                depth_array = nullptr;
+            }
+            if (normal_array != nullptr) {
+                cudaFreeArray(normal_array);
+                normal_array = nullptr;
+            }
+            if (image_array != nullptr) {
+                cudaFreeArray(image_array);
+                image_array = nullptr;
+            }
+            
+            is_valid = false;
+        }
+    };
+    
+    std::vector<TextureData> textures;
+    std::vector<int> current_image_ids;
+    bool loaded = false;
+    
+    // Use multiple streams for parallel texture creation
+    static const int num_streams = 4;
+    cudaStream_t streams[num_streams];
+    
+    void release() {
+        if (!loaded && textures.empty()) {
+            return;
+        }
+        
+        // Synchronize all streams
+        for (int i = 0; i < num_streams; ++i) {
+            cudaStreamSynchronize(streams[i]);
+        }
+        cudaDeviceSynchronize();
+        
+        // Clean up all textures
+        for (auto& tex : textures) {
+            tex.cleanup();
+        }
+        
+        textures.clear();
+        current_image_ids.clear();
+        loaded = false;
+    }
+
+public:
+    OptimizedTextureManager() {
+        for (int i = 0; i < num_streams; ++i) {
+            CUDA_SAFE_CALL(cudaStreamCreate(&streams[i]));
+        }
+    }
+    
+    ~OptimizedTextureManager() {
+        release();
+        for (int i = 0; i < num_streams; ++i) {
+            cudaStreamDestroy(streams[i]);
+        }
+    }
+    
+    bool loadChunk(const std::vector<int>& image_ids, OptimizedDataLoader& loader) {
+        release();  // Clean up previous chunk
+        
+        if (image_ids.empty()) {
+            return false;
+        }
+        
+        current_image_ids = image_ids;
+        textures.resize(image_ids.size());
+        
+        bool overall_success = true;
+        size_t successful_textures = 0;
+        
+        // Process textures in parallel using streams
+        for (size_t i = 0; i < image_ids.size(); ++i) {
+            int image_id = image_ids[i];
+            cudaStream_t stream = streams[i % num_streams];
+            
+            Camera cam;
+            cv::Mat_<float> depth;
+            cv::Mat_<cv::Vec3f> normal;
+            cv::Mat image;
+            
+            if (!loader.getData(image_id, cam, depth, normal, image)) {
+                continue;
+            }
+            
+            TextureData& tex = textures[i];
+            bool texture_success = true;
+            
+            // Create textures with error handling
+            try {
+                // Create depth texture
+                cudaChannelFormatDesc depth_desc = cudaCreateChannelDesc<float>();
+                CUDA_SAFE_CALL(cudaMallocArray(&tex.depth_array, &depth_desc, cam.width, cam.height));
+                CUDA_SAFE_CALL(cudaMemcpy2DToArrayAsync(tex.depth_array, 0, 0, 
+                                                       depth.ptr<float>(), depth.step[0], 
+                                                       cam.width * sizeof(float), cam.height, 
+                                                       cudaMemcpyHostToDevice, stream));
+                
+                cudaResourceDesc depth_res_desc = {};
+                depth_res_desc.resType = cudaResourceTypeArray;
+                depth_res_desc.res.array.array = tex.depth_array;
+                
+                cudaTextureDesc depth_tex_desc = {};
+                depth_tex_desc.addressMode[0] = cudaAddressModeWrap;
+                depth_tex_desc.addressMode[1] = cudaAddressModeClamp;
+                depth_tex_desc.filterMode = cudaFilterModePoint;
+                depth_tex_desc.readMode = cudaReadModeElementType;
+                depth_tex_desc.normalizedCoords = false;
+                
+                CUDA_SAFE_CALL(cudaCreateTextureObject(&tex.depth_texture, &depth_res_desc, &depth_tex_desc, NULL));
+                
+                // Create normal texture
+                cv::Mat normal_rgba = cv::Mat(normal.rows, normal.cols, CV_32FC4, cv::Scalar(0.0f, 0.0f, 0.0f, 0.0f));
+                cv::Mat src_mats[1] = {normal};
+                cv::Mat dst_mats[1] = {normal_rgba};
+                int from_to[6] = {0, 0, 1, 1, 2, 2};
+                cv::mixChannels(src_mats, 1, dst_mats, 1, from_to, 3);
+                
+                cudaChannelFormatDesc normal_desc = cudaCreateChannelDesc<float4>();
+                CUDA_SAFE_CALL(cudaMallocArray(&tex.normal_array, &normal_desc, cam.width, cam.height));
+                CUDA_SAFE_CALL(cudaMemcpy2DToArrayAsync(tex.normal_array, 0, 0, 
+                                                       normal_rgba.ptr<float>(), normal_rgba.step[0], 
+                                                       cam.width * sizeof(float4), cam.height, 
+                                                       cudaMemcpyHostToDevice, stream));
+                
+                cudaResourceDesc normal_res_desc = {};
+                normal_res_desc.resType = cudaResourceTypeArray;
+                normal_res_desc.res.array.array = tex.normal_array;
+                
+                cudaTextureDesc normal_tex_desc = {};
+                normal_tex_desc.addressMode[0] = cudaAddressModeWrap;
+                normal_tex_desc.addressMode[1] = cudaAddressModeClamp;
+                normal_tex_desc.filterMode = cudaFilterModePoint;
+                normal_tex_desc.readMode = cudaReadModeElementType;
+                normal_tex_desc.normalizedCoords = false;
+                
+                CUDA_SAFE_CALL(cudaCreateTextureObject(&tex.normal_texture, &normal_res_desc, &normal_tex_desc, NULL));
+                
+                // Create image texture
+                cv::Mat rgba, rgba_float;
+                cv::cvtColor(image, rgba, cv::COLOR_BGR2RGBA);
+                rgba.convertTo(rgba_float, CV_32FC4, 1.0/255.0);
+                
+                cudaChannelFormatDesc image_desc = cudaCreateChannelDesc<float4>();
+                CUDA_SAFE_CALL(cudaMallocArray(&tex.image_array, &image_desc, cam.width, cam.height));
+                CUDA_SAFE_CALL(cudaMemcpy2DToArrayAsync(tex.image_array, 0, 0, 
+                                                       rgba_float.ptr<float>(), rgba_float.step[0], 
+                                                       cam.width * sizeof(float4), cam.height, 
+                                                       cudaMemcpyHostToDevice, stream));
+                
+                cudaResourceDesc image_res_desc = {};
+                image_res_desc.resType = cudaResourceTypeArray;
+                image_res_desc.res.array.array = tex.image_array;
+                
+                cudaTextureDesc image_tex_desc = {};
+                image_tex_desc.addressMode[0] = cudaAddressModeWrap;
+                image_tex_desc.addressMode[1] = cudaAddressModeClamp;
+                image_tex_desc.filterMode = cudaFilterModeLinear;
+                image_tex_desc.readMode = cudaReadModeElementType;
+                image_tex_desc.normalizedCoords = false;
+                
+                CUDA_SAFE_CALL(cudaCreateTextureObject(&tex.image_texture, &image_res_desc, &image_tex_desc, NULL));
+                
+                tex.is_valid = true;
+                successful_textures++;
+                
+            } catch (const std::exception& e) {
+                std::cerr << "    Failed to create texture for image " << image_id << ": " << e.what() << std::endl;
+                tex.cleanup();
+                texture_success = false;
+                overall_success = false;
+            }
+        }
+        
+        // Sync all streams
+        for (int i = 0; i < num_streams; ++i) {
+            cudaStreamSynchronize(streams[i]);
+        }
+        
+        std::cout << "    Successfully loaded " << successful_textures << "/" << image_ids.size() << " textures" << std::endl;
+        
+        loaded = (successful_textures > 0);
+        return loaded;
+    }
+    
+    std::vector<cudaTextureObject_t> getDepthTextures() const {
+        std::vector<cudaTextureObject_t> result;
+        for (const auto& tex : textures) {
+            if (tex.is_valid && tex.depth_texture != 0) {
+                result.push_back(tex.depth_texture);
+            }
+        }
+        return result;
+    }
+    
+    std::vector<cudaTextureObject_t> getNormalTextures() const {
+        std::vector<cudaTextureObject_t> result;
+        for (const auto& tex : textures) {
+            if (tex.is_valid && tex.normal_texture != 0) {
+                result.push_back(tex.normal_texture);
+            }
+        }
+        return result;
+    }
+    
+    std::vector<cudaTextureObject_t> getImageTextures() const {
+        std::vector<cudaTextureObject_t> result;
+        for (const auto& tex : textures) {
+            if (tex.is_valid && tex.image_texture != 0) {
+                result.push_back(tex.image_texture);
+            }
+        }
+        return result;
+    }
+    
+    std::vector<int> getValidImageIds() const {
+        std::vector<int> result;
+        for (size_t i = 0; i < textures.size() && i < current_image_ids.size(); ++i) {
+            if (textures[i].is_valid) {
+                result.push_back(current_image_ids[i]);
+            }
+        }
+        return result;
+    }
+};
+
+// Fast batch kernel (unchanged from original)
+__global__ void ChunkBatchKernel(
     cudaTextureObject_t* depth_textures,
-    cudaTextureObject_t* normal_textures,
+    cudaTextureObject_t* normal_textures, 
     cudaTextureObject_t* image_textures,
-    int* texture_image_ids,  // Maps texture indices to image IDs
-    int num_loaded_textures,
+    int* texture_image_ids,
+    int num_textures,
     Camera* cameras,
-    int* camera_image_ids,   // Maps camera indices to image IDs
+    int* camera_image_ids,
     int num_cameras,
-    int ref_image_id,
+    int* ref_image_ids,
     int* src_image_ids,
-    int num_src_images,
+    int* src_counts,
+    int* src_offsets,
+    int* problem_offsets,
+    int* widths,
+    int* heights,
     PointList* output_points,
     int* valid_flags,
-    int width,
-    int height
+    int num_problems_in_chunk
 ) {
-    int c = blockIdx.x * blockDim.x + threadIdx.x;
-    int r = blockIdx.y * blockDim.y + threadIdx.y;
+    int global_idx = blockIdx.x * blockDim.x + threadIdx.x;
     
-    if (c >= width || r >= height) return;
+    // Find which problem this thread belongs to
+    int problem_id = 0;
+    while (problem_id < num_problems_in_chunk - 1 && global_idx >= problem_offsets[problem_id + 1]) {
+        problem_id++;
+    }
     
-    int idx = r * width + c;
+    if (problem_id >= num_problems_in_chunk) return;
     
-    // Find reference camera
+    int local_idx = global_idx - problem_offsets[problem_id];
+    int width = widths[problem_id];
+    int height = heights[problem_id];
+    
+    if (local_idx >= width * height) return;
+    
+    int c = local_idx % width;
+    int r = local_idx / width;
+    
+    int ref_image_id = ref_image_ids[problem_id];
+    
+    // Find reference camera and texture
     int ref_cam_idx = -1;
+    int ref_tex_idx = -1;
+    
     for (int i = 0; i < num_cameras; ++i) {
         if (camera_image_ids[i] == ref_image_id) {
             ref_cam_idx = i;
             break;
         }
     }
-    if (ref_cam_idx == -1) {
-        valid_flags[idx] = 0;
-        return;
-    }
     
-    // Find reference texture
-    int ref_tex_idx = -1;
-    for (int i = 0; i < num_loaded_textures; ++i) {
+    for (int i = 0; i < num_textures; ++i) {
         if (texture_image_ids[i] == ref_image_id) {
             ref_tex_idx = i;
             break;
         }
     }
-    if (ref_tex_idx == -1) {
-        valid_flags[idx] = 0;
+    
+    if (ref_cam_idx == -1 || ref_tex_idx == -1) {
+        valid_flags[global_idx] = 0;
         return;
     }
     
     const Camera& ref_cam = cameras[ref_cam_idx];
     
     // Sample reference depth
-    float ref_depth = tex2D<float>(depth_textures[ref_tex_idx], c, r);
+    float ref_depth = tex2D<float>(depth_textures[ref_tex_idx], c + 0.5f, r + 0.5f);
     
     if (ref_depth <= 0.0f) {
-        valid_flags[idx] = 0;
+        valid_flags[global_idx] = 0;
         return;
     }
 
@@ -2051,48 +2390,51 @@ __global__ void EfficientFusionKernel(
     float3 PointX = Get3DPointonWorld_cu(static_cast<float>(c), static_cast<float>(r), ref_depth, ref_cam);
     
     // Sample reference normal and color
-    float4 ref_normal_tex = tex2D<float4>(normal_textures[ref_tex_idx], c, r);
+    float4 ref_normal_tex = tex2D<float4>(normal_textures[ref_tex_idx], c + 0.5f, r + 0.5f);
     float3 ref_normal = make_float3(ref_normal_tex.x, ref_normal_tex.y, ref_normal_tex.z);
     
-    float4 ref_color = tex2D<float4>(image_textures[ref_tex_idx], c, r);
+    float4 ref_color = tex2D<float4>(image_textures[ref_tex_idx], c + 0.5f, r + 0.5f);
     
     // Initialize sums for averaging
     float3 point_sum = PointX;
     float3 normal_sum = ref_normal;
     float color_sum[3] = {
-        ref_color.z * 255.0f,  // R (OpenCV uses BGR)
+        ref_color.z * 255.0f,  // R
         ref_color.y * 255.0f,  // G
         ref_color.x * 255.0f   // B
     };
     int num_consistent = 1;
     
-    // Check all source images
-    for (int j = 0; j < num_src_images; ++j) {
-        int src_image_id = src_image_ids[j];
+    // Check source images for this problem
+    int src_start = src_offsets[problem_id];
+    int src_count = src_counts[problem_id];
+    
+    for (int j = 0; j < src_count; ++j) {
+        int src_image_id = src_image_ids[src_start + j];
         
-        // Find source camera
+        // Find source camera and texture
         int src_cam_idx = -1;
+        int src_tex_idx = -1;
+        
         for (int i = 0; i < num_cameras; ++i) {
             if (camera_image_ids[i] == src_image_id) {
                 src_cam_idx = i;
                 break;
             }
         }
-        if (src_cam_idx == -1) continue;
         
-        // Find source texture
-        int src_tex_idx = -1;
-        for (int i = 0; i < num_loaded_textures; ++i) {
+        for (int i = 0; i < num_textures; ++i) {
             if (texture_image_ids[i] == src_image_id) {
                 src_tex_idx = i;
                 break;
             }
         }
-        if (src_tex_idx == -1) continue;
+        
+        if (src_cam_idx == -1 || src_tex_idx == -1) continue;
         
         const Camera& src_cam = cameras[src_cam_idx];
         
-        // Project 3D point to source camera
+        // Project and check consistency
         float2 proj_point;
         float proj_depth_in_src;
         ProjectonCamera_cu(PointX, src_cam, proj_point, proj_depth_in_src);
@@ -2100,39 +2442,29 @@ __global__ void EfficientFusionKernel(
         int src_c = static_cast<int>(proj_point.x + 0.5f);
         int src_r = static_cast<int>(proj_point.y + 0.5f);
         
-        // Check if projection is within image bounds
         if (src_c < 0 || src_c >= src_cam.width || src_r < 0 || src_r >= src_cam.height) 
             continue;
         
-        // Sample source depth
-        float src_depth = tex2D<float>(depth_textures[src_tex_idx], src_c, src_r);
+        float src_depth = tex2D<float>(depth_textures[src_tex_idx], src_c + 0.5f, src_r + 0.5f);
         if (src_depth <= 0.0f) continue;
         
-        // Get 3D point from source depth
         float3 PointX_src = Get3DPointonWorld_cu(static_cast<float>(src_c), static_cast<float>(src_r), src_depth, src_cam);
         
-        // Reproject source 3D point back to reference camera
         float2 reproj_point_in_ref;
         float dummy_depth;
         ProjectonCamera_cu(PointX_src, ref_cam, reproj_point_in_ref, dummy_depth);
         
-        // Calculate reprojection error
         float reproj_error = hypotf(c - reproj_point_in_ref.x, r - reproj_point_in_ref.y);
-        
-        // Calculate relative depth difference
         float relative_depth_diff = fabsf(proj_depth_in_src - src_depth) / src_depth;
         
-        // Sample source normal
-        float4 src_normal_tex = tex2D<float4>(normal_textures[src_tex_idx], src_c, src_r);
+        float4 src_normal_tex = tex2D<float4>(normal_textures[src_tex_idx], src_c + 0.5f, src_r + 0.5f);
         float3 src_normal = make_float3(src_normal_tex.x, src_normal_tex.y, src_normal_tex.z);
         
-        // Calculate angle between normals
         float dot_product = ref_normal.x * src_normal.x + ref_normal.y * src_normal.y + ref_normal.z * src_normal.z;
         dot_product = fmaxf(-1.0f, fminf(1.0f, dot_product));
         float angle = acosf(dot_product);
         
-        // Check consistency
-        if (reproj_error < 1.0 && relative_depth_diff < 0.01f && angle < 0.1f) {
+        if (reproj_error < 1.0 && relative_depth_diff < 0.005f && angle < 0.05f) {
             point_sum.x += PointX_src.x;
             point_sum.y += PointX_src.y;
             point_sum.z += PointX_src.z;
@@ -2141,7 +2473,7 @@ __global__ void EfficientFusionKernel(
             normal_sum.y += src_normal.y;
             normal_sum.z += src_normal.z;
             
-            float4 src_color = tex2D<float4>(image_textures[src_tex_idx], src_c, src_r);
+            float4 src_color = tex2D<float4>(image_textures[src_tex_idx], src_c + 0.5f, src_r + 0.5f);
             color_sum[0] += src_color.z * 255.0f;
             color_sum[1] += src_color.y * 255.0f;
             color_sum[2] += src_color.x * 255.0f;
@@ -2150,7 +2482,6 @@ __global__ void EfficientFusionKernel(
         }
     }
     
-    // Check if we have enough consistent views
     if (num_consistent >= 3) {
         PointList final_point;
         
@@ -2179,54 +2510,96 @@ __global__ void EfficientFusionKernel(
             color_sum[2] / num_consistent
         );
         
-        output_points[idx] = final_point;
-        valid_flags[idx] = 1;
+        output_points[global_idx] = final_point;
+        valid_flags[global_idx] = 1;
     } else {
-        valid_flags[idx] = 0;
+        valid_flags[global_idx] = 0;
     }
 }
 
-// Memory-efficient main fusion function
+// Smart chunking strategy
+std::vector<std::vector<size_t>> createSmartChunks(const std::vector<Problem>& problems, 
+                                                   size_t max_images_per_chunk) {
+    std::vector<std::vector<size_t>> chunks;
+    std::vector<size_t> current_chunk;
+    std::unordered_set<int> current_images;
+    
+    for (size_t i = 0; i < problems.size(); ++i) {
+        std::unordered_set<int> problem_images;
+        problem_images.insert(problems[i].ref_image_id);
+        for (int src_id : problems[i].src_image_ids) {
+            problem_images.insert(src_id);
+        }
+        
+        // Check if adding this problem would exceed image limit
+        std::unordered_set<int> combined_images = current_images;
+        combined_images.insert(problem_images.begin(), problem_images.end());
+        
+        if (combined_images.size() > max_images_per_chunk && !current_chunk.empty()) {
+            // Start new chunk
+            chunks.push_back(current_chunk);
+            current_chunk.clear();
+            current_images.clear();
+        }
+        
+        // Add problem to current chunk
+        current_chunk.push_back(i);
+        current_images.insert(problem_images.begin(), problem_images.end());
+    }
+    
+    if (!current_chunk.empty()) {
+        chunks.push_back(current_chunk);
+    }
+    
+    return chunks;
+}
+
+// Main optimized fusion function
 void RunFusionCuda(const std::string &dense_folder,
                            const std::vector<Problem> &problems,
                            bool geom_consistency,
-                           size_t max_textures_in_memory)
+                           size_t max_images_per_chunk)
 {
-    const size_t N = problems.size();
+    std::cout << "[Optimized Fusion] Starting with " << problems.size() << " problems..." << std::endl;
     
-    // Input validation
-    if (N == 0) {
-        std::cerr << "Error: No problems to process!" << std::endl;
-        return;
+    // Estimate buffer sizes
+    size_t est_max_textures = max_images_per_chunk;
+    size_t est_max_problems = 0;
+    size_t est_max_src_images = 0;
+    size_t est_max_pixels = 0;
+    
+    auto chunks = createSmartChunks(problems, max_images_per_chunk);
+    
+    for (const auto& chunk : chunks) {
+        est_max_problems = std::max(est_max_problems, chunk.size());
+        size_t chunk_src_images = 0;
+        size_t chunk_pixels = 0;
+        
+        for (size_t prob_idx : chunk) {
+            const Problem& problem = problems[prob_idx];
+            chunk_src_images += problem.src_image_ids.size();
+            
+            // Estimate pixels (assume average image size)
+            chunk_pixels += 3200 * 1600;  // Conservative estimate
+        }
+        
+        est_max_src_images = std::max(est_max_src_images, chunk_src_images);
+        est_max_pixels = std::max(est_max_pixels, chunk_pixels);
     }
     
-    if (max_textures_in_memory < 3) {
-        std::cerr << "Warning: max_textures_in_memory too low, setting to 3" << std::endl;
-        max_textures_in_memory = 3;
-    }
+    std::cout << "[Optimized Fusion] Created " << chunks.size() << " chunks" << std::endl;
+    std::cout << "[Optimized Fusion] Estimated max: " << est_max_textures << " textures, " 
+              << est_max_problems << " problems, " << est_max_pixels << " pixels" << std::endl;
     
-    // Check CUDA device
-    int device_count;
-    cudaError_t cuda_status = cudaGetDeviceCount(&device_count);
-    if (cuda_status != cudaSuccess || device_count == 0) {
-        std::cerr << "Error: No CUDA devices available!" << std::endl;
-        return;
-    }
+    // Initialize optimized managers
+    OptimizedDataLoader loader(dense_folder, geom_consistency, 200);
+    OptimizedTextureManager texture_manager;
+    PersistentGPUBuffers gpu_buffers;
     
-    // Print device info
-    cudaDeviceProp prop;
-    cudaGetDeviceProperties(&prop, 0);
-    std::cout << "[Efficient CUDA Fusion] Using device: " << prop.name << std::endl;
-    std::cout << "[Efficient CUDA Fusion] Total GPU memory: " << prop.totalGlobalMem / (1024*1024) << " MB" << std::endl;
-    std::cout << "[Efficient CUDA Fusion] Max threads per block: " << prop.maxThreadsPerBlock << std::endl;
+    // Allocate persistent GPU buffers once
+    gpu_buffers.allocateBuffers(est_max_textures, est_max_problems, est_max_src_images, est_max_pixels);
     
-    std::cout << "[Efficient CUDA Fusion] Starting with " << N << " images, max " 
-              << max_textures_in_memory << " textures in memory..." << std::endl;
-
-    StreamingDataLoader loader(dense_folder, geom_consistency);
-    TextureManager texture_manager(max_textures_in_memory);
-    
-    // Collect all unique image IDs
+    // Pre-load all cameras (they're small)
     std::unordered_set<int> all_image_ids;
     for (const auto& problem : problems) {
         all_image_ids.insert(problem.ref_image_id);
@@ -2235,466 +2608,212 @@ void RunFusionCuda(const std::string &dense_folder,
         }
     }
     
-    std::cout << "[Efficient CUDA Fusion] Total unique images: " << all_image_ids.size() << std::endl;
-    
-    // Pre-load all cameras (they're small)
     std::vector<Camera> all_cameras;
     std::vector<int> camera_image_ids;
-    std::unordered_map<int, int> image_id_to_camera_idx;
-    
     for (int image_id : all_image_ids) {
-        Camera cam;
-        if (loader.loadCamera(image_id, cam)) {
-            image_id_to_camera_idx[image_id] = all_cameras.size();
-            all_cameras.push_back(cam);
-            camera_image_ids.push_back(image_id);
+        char buf[256];
+        sprintf(buf, "%s/cams/%08d_cam.txt", dense_folder.c_str(), image_id);
+        try {
+            Camera cam = ReadCamera(std::string(buf));
+            if (cam.width > 0 && cam.height > 0) {
+                all_cameras.push_back(cam);
+                camera_image_ids.push_back(image_id);
+            }
+        } catch (...) {
+            continue;
         }
     }
     
-    std::cout << "[Efficient CUDA Fusion] Loaded " << all_cameras.size() << " cameras" << std::endl;
-    
-    // Copy cameras to GPU (small memory footprint)
-    Camera* cameras_cuda = nullptr;
-    int* camera_image_ids_cuda = nullptr;
-    
-    cudaError_t alloc_error;
-    alloc_error = cudaMalloc(&cameras_cuda, all_cameras.size() * sizeof(Camera));
-    if (alloc_error != cudaSuccess) {
-        std::cerr << "Error allocating camera memory: " << cudaGetErrorString(alloc_error) << std::endl;
-        return;
-    }
-    
-    alloc_error = cudaMalloc(&camera_image_ids_cuda, camera_image_ids.size() * sizeof(int));
-    if (alloc_error != cudaSuccess) {
-        std::cerr << "Error allocating camera IDs memory: " << cudaGetErrorString(alloc_error) << std::endl;
-        cudaFree(cameras_cuda);
-        return;
-    }
-    
-    cudaError_t copy_error;
-    copy_error = cudaMemcpy(cameras_cuda, all_cameras.data(), 
-                           all_cameras.size() * sizeof(Camera), cudaMemcpyHostToDevice);
-    if (copy_error != cudaSuccess) {
-        std::cerr << "Error copying cameras to GPU: " << cudaGetErrorString(copy_error) << std::endl;
-        cudaFree(cameras_cuda);
-        cudaFree(camera_image_ids_cuda);
-        return;
-    }
-    
-    copy_error = cudaMemcpy(camera_image_ids_cuda, camera_image_ids.data(), 
-                           camera_image_ids.size() * sizeof(int), cudaMemcpyHostToDevice);
-    if (copy_error != cudaSuccess) {
-        std::cerr << "Error copying camera IDs to GPU: " << cudaGetErrorString(copy_error) << std::endl;
-        cudaFree(cameras_cuda);
-        cudaFree(camera_image_ids_cuda);
-        return;
-    }
+    // Copy cameras to GPU once
+    Camera* cameras_cuda;
+    int* camera_image_ids_cuda;
+    CUDA_SAFE_CALL(cudaMalloc(&cameras_cuda, all_cameras.size() * sizeof(Camera)));
+    CUDA_SAFE_CALL(cudaMalloc(&camera_image_ids_cuda, camera_image_ids.size() * sizeof(int)));
+    CUDA_SAFE_CALL(cudaMemcpy(cameras_cuda, all_cameras.data(), 
+                               all_cameras.size() * sizeof(Camera), cudaMemcpyHostToDevice));
+    CUDA_SAFE_CALL(cudaMemcpy(camera_image_ids_cuda, camera_image_ids.data(), 
+                               camera_image_ids.size() * sizeof(int), cudaMemcpyHostToDevice));
     
     std::vector<PointList> all_points;
-    size_t total_points = 0;
+    auto total_start = std::chrono::high_resolution_clock::now();
     
-    // Process each reference image
-    for (size_t prob_idx = 0; prob_idx < problems.size(); ++prob_idx) {
-        const Problem& problem = problems[prob_idx];
-        int ref_image_id = problem.ref_image_id;
+    // Process each chunk with optimized pipeline
+    for (size_t chunk_idx = 0; chunk_idx < chunks.size(); ++chunk_idx) {
+        const auto& chunk = chunks[chunk_idx];
         
-        std::cout << "[Efficient CUDA Fusion] Processing " << (prob_idx + 1) << "/" << problems.size() 
-                  << " (ID=" << ref_image_id << ")" << std::endl;
+        std::cout << "[Optimized Fusion] Processing chunk " << (chunk_idx + 1) << "/" << chunks.size() 
+                  << " (" << chunk.size() << " problems)" << std::endl;
         
-        // Determine which images we need for this problem
-        std::unordered_set<int> needed_images;
-        needed_images.insert(ref_image_id);
-        for (int src_id : problem.src_image_ids) {
-            needed_images.insert(src_id);
+        // Get unique images for this chunk
+        std::unordered_set<int> chunk_images;
+        for (size_t prob_idx : chunk) {
+            const Problem& problem = problems[prob_idx];
+            chunk_images.insert(problem.ref_image_id);
+            for (int src_id : problem.src_image_ids) {
+                chunk_images.insert(src_id);
+            }
         }
         
-        // Load required data for these images
-        std::vector<int> loaded_image_ids;
-        std::vector<cudaTextureObject_t> depth_textures_host;
-        std::vector<cudaTextureObject_t> normal_textures_host;
-        std::vector<cudaTextureObject_t> image_textures_host;
+        std::vector<int> chunk_image_ids(chunk_images.begin(), chunk_images.end());
+        std::cout << "  Chunk images: " << chunk_image_ids.size() << std::endl;
         
-        Camera ref_camera;
-        bool ref_camera_found = false;
+        // Parallel preload chunk data
+        loader.preloadChunkParallel(chunk_image_ids);
         
-        for (int image_id : needed_images) {
-            // Load CPU data
-            Camera cam;
+        // Load chunk textures
+        if (!texture_manager.loadChunk(chunk_image_ids, loader)) {
+            std::cerr << "Warning: Failed to load textures for chunk " << chunk_idx << std::endl;
+            continue;
+        }
+        
+        // Prepare batch data for this chunk
+        std::vector<int> ref_image_ids;
+        std::vector<int> all_src_image_ids;
+        std::vector<int> src_counts;
+        std::vector<int> src_offsets;
+        std::vector<int> problem_offsets;
+        std::vector<int> widths;
+        std::vector<int> heights;
+        
+        int total_pixels = 0;
+        int src_offset = 0;
+        
+        for (size_t i = 0; i < chunk.size(); ++i) {
+            size_t prob_idx = chunk[i];
+            const Problem& problem = problems[prob_idx];
+            
+            ref_image_ids.push_back(problem.ref_image_id);
+            
+            Camera ref_cam;
             cv::Mat_<float> depth;
             cv::Mat_<cv::Vec3f> normal;
             cv::Mat image;
-            
-            if (!loader.loadCamera(image_id, cam) ||
-                !loader.loadDepth(image_id, depth) ||
-                !loader.loadNormal(image_id, normal) ||
-                !loader.loadImage(image_id, image)) {
-                std::cerr << "Warning: Failed to load data for image " << image_id << std::endl;
+            if (!loader.getData(problem.ref_image_id, ref_cam, depth, normal, image)) {
                 continue;
             }
             
-            // Validate loaded data dimensions
-            if (depth.cols <= 0 || depth.rows <= 0) {
-                std::cerr << "Warning: Invalid depth dimensions for image " << image_id 
-                          << ": " << depth.cols << "x" << depth.rows << std::endl;
-                continue;
+            widths.push_back(ref_cam.width);
+            heights.push_back(ref_cam.height);
+            problem_offsets.push_back(total_pixels);
+            total_pixels += ref_cam.width * ref_cam.height;
+            
+            src_offsets.push_back(src_offset);
+            src_counts.push_back(problem.src_image_ids.size());
+            
+            for (int src_id : problem.src_image_ids) {
+                all_src_image_ids.push_back(src_id);
             }
-            
-            if (normal.cols != depth.cols || normal.rows != depth.rows) {
-                std::cerr << "Warning: Normal/depth dimension mismatch for image " << image_id 
-                          << ": normal=" << normal.cols << "x" << normal.rows 
-                          << " depth=" << depth.cols << "x" << depth.rows << std::endl;
-                continue;
-            }
-            
-            std::cout << "    Loaded image " << image_id << " with dimensions: " 
-                      << depth.cols << "x" << depth.rows << std::endl;
-            
-            if (image_id == ref_image_id) {
-                ref_camera = cam;
-                ref_camera_found = true;
-                
-                // Extra validation for reference camera since it's critical
-                if (ref_camera.width != depth.cols || ref_camera.height != depth.rows) {
-                    std::cerr << "Warning: Reference camera/depth dimension mismatch for image " << image_id 
-                              << ": camera=" << ref_camera.width << "x" << ref_camera.height 
-                              << " depth=" << depth.cols << "x" << depth.rows << std::endl;
-                    // Force correct dimensions
-                    ref_camera.width = depth.cols;
-                    ref_camera.height = depth.rows;
-                }
-                
-                std::cout << "    Reference camera set with dimensions: " 
-                          << ref_camera.width << "x" << ref_camera.height << std::endl;
-            }
-            
-            // Rescale image and camera to match depth resolution
-            cv::Mat_<cv::Vec3b> img_color;
-            if (image.channels() == 3) {
-                img_color = cv::Mat_<cv::Vec3b>(image);
-            } else {
-                cv::cvtColor(image, img_color, cv::COLOR_GRAY2BGR);
-            }
-            cv::Mat_<cv::Vec3b> scaled_color;
-            RescaleImageAndCamera(img_color, scaled_color, depth, cam);
-            image = cv::Mat(scaled_color);
-            
-            // Ensure camera dimensions are correctly set
-            cam.width = depth.cols;
-            cam.height = depth.rows;
-            
-            // Final validation
-            if (cam.width <= 0 || cam.height <= 0) {
-                std::cerr << "Warning: Invalid camera dimensions for image " << image_id 
-                          << ": " << cam.width << "x" << cam.height << std::endl;
-                continue;
-            }
-            
-            // Load into GPU textures
-            if (texture_manager.loadTexture(image_id, depth, normal, image)) {
-                loaded_image_ids.push_back(image_id);
-                depth_textures_host.push_back(texture_manager.getDepthTexture(image_id));
-                normal_textures_host.push_back(texture_manager.getNormalTexture(image_id));
-                image_textures_host.push_back(texture_manager.getImageTexture(image_id));
-            }
+            src_offset += problem.src_image_ids.size();
         }
         
-        if (!ref_camera_found || loaded_image_ids.empty()) {
-            std::cerr << "Warning: Could not load reference image " << ref_image_id << std::endl;
+        if (total_pixels == 0) continue;
+        
+        // Use persistent GPU buffers instead of allocating new ones
+        const auto& depth_textures = texture_manager.getDepthTextures();
+        const auto& normal_textures = texture_manager.getNormalTextures();
+        const auto& image_textures = texture_manager.getImageTextures();
+        const auto& texture_image_ids = texture_manager.getValidImageIds();
+        
+        if (depth_textures.empty() || normal_textures.empty() || image_textures.empty()) {
+            std::cerr << "Warning: No valid textures loaded for chunk " << chunk_idx << std::endl;
             continue;
         }
         
-        // Final validation of reference camera dimensions
-        if (ref_camera.width <= 0 || ref_camera.height <= 0) {
-            std::cerr << "Error: Invalid reference camera dimensions for image " << ref_image_id 
-                      << ": " << ref_camera.width << "x" << ref_camera.height << std::endl;
-            continue;
-        }
+        // Get reusable buffers
+        auto depth_textures_cuda = gpu_buffers.getDepthTexturesBuffer(depth_textures.size());
+        auto normal_textures_cuda = gpu_buffers.getNormalTexturesBuffer(normal_textures.size());
+        auto image_textures_cuda = gpu_buffers.getImageTexturesBuffer(image_textures.size());
+        auto texture_image_ids_cuda = gpu_buffers.getTextureImageIdsBuffer(texture_image_ids.size());
+        auto ref_image_ids_cuda = gpu_buffers.getRefImageIdsBuffer(ref_image_ids.size());
+        auto all_src_image_ids_cuda = gpu_buffers.getAllSrcImageIdsBuffer(all_src_image_ids.size());
+        auto src_counts_cuda = gpu_buffers.getSrcCountsBuffer(src_counts.size());
+        auto src_offsets_cuda = gpu_buffers.getSrcOffsetsBuffer(src_offsets.size());
+        auto problem_offsets_cuda = gpu_buffers.getProblemOffsetsBuffer(problem_offsets.size());
+        auto widths_cuda = gpu_buffers.getWidthsBuffer(widths.size());
+        auto heights_cuda = gpu_buffers.getHeightsBuffer(heights.size());
+        auto output_points_cuda = gpu_buffers.getOutputPointsBuffer(total_pixels);
+        auto valid_flags_cuda = gpu_buffers.getValidFlagsBuffer(total_pixels);
         
-        std::cout << "  Loaded " << loaded_image_ids.size() << " textures for this problem" << std::endl;
-        std::cout << "  Reference camera dimensions: " << ref_camera.width << "x" << ref_camera.height << std::endl;
+        // Copy data to GPU (reusing buffers)
+        CUDA_SAFE_CALL(cudaMemcpy(depth_textures_cuda, depth_textures.data(), depth_textures.size() * sizeof(cudaTextureObject_t), cudaMemcpyHostToDevice));
+        CUDA_SAFE_CALL(cudaMemcpy(normal_textures_cuda, normal_textures.data(), normal_textures.size() * sizeof(cudaTextureObject_t), cudaMemcpyHostToDevice));
+        CUDA_SAFE_CALL(cudaMemcpy(image_textures_cuda, image_textures.data(), image_textures.size() * sizeof(cudaTextureObject_t), cudaMemcpyHostToDevice));
+        CUDA_SAFE_CALL(cudaMemcpy(texture_image_ids_cuda, texture_image_ids.data(), texture_image_ids.size() * sizeof(int), cudaMemcpyHostToDevice));
+        CUDA_SAFE_CALL(cudaMemcpy(ref_image_ids_cuda, ref_image_ids.data(), ref_image_ids.size() * sizeof(int), cudaMemcpyHostToDevice));
+        CUDA_SAFE_CALL(cudaMemcpy(all_src_image_ids_cuda, all_src_image_ids.data(), all_src_image_ids.size() * sizeof(int), cudaMemcpyHostToDevice));
+        CUDA_SAFE_CALL(cudaMemcpy(src_counts_cuda, src_counts.data(), src_counts.size() * sizeof(int), cudaMemcpyHostToDevice));
+        CUDA_SAFE_CALL(cudaMemcpy(src_offsets_cuda, src_offsets.data(), src_offsets.size() * sizeof(int), cudaMemcpyHostToDevice));
+        CUDA_SAFE_CALL(cudaMemcpy(problem_offsets_cuda, problem_offsets.data(), problem_offsets.size() * sizeof(int), cudaMemcpyHostToDevice));
+        CUDA_SAFE_CALL(cudaMemcpy(widths_cuda, widths.data(), widths.size() * sizeof(int), cudaMemcpyHostToDevice));
+        CUDA_SAFE_CALL(cudaMemcpy(heights_cuda, heights.data(), heights.size() * sizeof(int), cudaMemcpyHostToDevice));
+        CUDA_SAFE_CALL(cudaMemset(valid_flags_cuda, 0, total_pixels * sizeof(int)));
         
-        // Process this reference image
-        int width = ref_camera.width;
-        int height = ref_camera.height;
-        int total_pixels = width * height;
+        // Launch kernel
+        int block_size = 256;
+        int grid_size = (total_pixels + block_size - 1) / block_size;
         
-        // Copy texture arrays to GPU with error checking
-        size_t texture_array_size = loaded_image_ids.size() * sizeof(cudaTextureObject_t);
-        size_t image_ids_size = loaded_image_ids.size() * sizeof(int);
-        size_t src_ids_size = problem.src_image_ids.size() * sizeof(int);
-        size_t points_size = total_pixels * sizeof(PointList);
-        size_t flags_size = total_pixels * sizeof(int);
+        auto chunk_start = std::chrono::high_resolution_clock::now();
         
-        size_t total_required = 3 * texture_array_size + image_ids_size + src_ids_size + points_size + flags_size;
-        
-        if (!checkGPUMemory(total_required)) {
-            std::cerr << "Warning: Skipping image " << ref_image_id << " due to insufficient GPU memory" << std::endl;
-            continue;
-        }
-        
-        // Declare all variables at the beginning to avoid goto issues
-        cudaTextureObject_t* depth_textures_cuda = nullptr;
-        cudaTextureObject_t* normal_textures_cuda = nullptr;
-        cudaTextureObject_t* image_textures_cuda = nullptr;
-        int* texture_image_ids_cuda = nullptr;
-        int* src_image_ids_cuda = nullptr;
-        PointList* output_points_cuda = nullptr;
-        int* valid_flags_cuda = nullptr;
-        cudaError_t alloc_error = cudaSuccess;
-        cudaError_t copy_error = cudaSuccess;
-        bool allocation_successful = true;
-        
-        // Allocate GPU memory
-        alloc_error = cudaMalloc(&depth_textures_cuda, texture_array_size);
-        if (alloc_error != cudaSuccess) allocation_successful = false;
-        
-        if (allocation_successful) {
-            alloc_error = cudaMalloc(&normal_textures_cuda, texture_array_size);
-            if (alloc_error != cudaSuccess) allocation_successful = false;
-        }
-        
-        if (allocation_successful) {
-            alloc_error = cudaMalloc(&image_textures_cuda, texture_array_size);
-            if (alloc_error != cudaSuccess) allocation_successful = false;
-        }
-        
-        if (allocation_successful) {
-            alloc_error = cudaMalloc(&texture_image_ids_cuda, image_ids_size);
-            if (alloc_error != cudaSuccess) allocation_successful = false;
-        }
-        
-        if (allocation_successful) {
-            alloc_error = cudaMalloc(&src_image_ids_cuda, src_ids_size);
-            if (alloc_error != cudaSuccess) allocation_successful = false;
-        }
-        
-        if (allocation_successful) {
-            alloc_error = cudaMalloc(&output_points_cuda, points_size);
-            if (alloc_error != cudaSuccess) allocation_successful = false;
-        }
-        
-        if (allocation_successful) {
-            alloc_error = cudaMalloc(&valid_flags_cuda, flags_size);
-            if (alloc_error != cudaSuccess) allocation_successful = false;
-        }
-        
-        if (!allocation_successful) {
-            std::cerr << "Error allocating GPU memory for image " << ref_image_id << ": " << cudaGetErrorString(alloc_error) << std::endl;
-            // Cleanup allocated memory
-            if (depth_textures_cuda) cudaFree(depth_textures_cuda);
-            if (normal_textures_cuda) cudaFree(normal_textures_cuda);
-            if (image_textures_cuda) cudaFree(image_textures_cuda);
-            if (texture_image_ids_cuda) cudaFree(texture_image_ids_cuda);
-            if (src_image_ids_cuda) cudaFree(src_image_ids_cuda);
-            if (output_points_cuda) cudaFree(output_points_cuda);
-            if (valid_flags_cuda) cudaFree(valid_flags_cuda);
-            continue;
-        }
-        
-        // Copy data to GPU
-        bool copy_successful = true;
-        
-        copy_error = cudaMemcpy(depth_textures_cuda, depth_textures_host.data(), texture_array_size, cudaMemcpyHostToDevice);
-        if (copy_error != cudaSuccess) copy_successful = false;
-        
-        if (copy_successful) {
-            copy_error = cudaMemcpy(normal_textures_cuda, normal_textures_host.data(), texture_array_size, cudaMemcpyHostToDevice);
-            if (copy_error != cudaSuccess) copy_successful = false;
-        }
-        
-        if (copy_successful) {
-            copy_error = cudaMemcpy(image_textures_cuda, image_textures_host.data(), texture_array_size, cudaMemcpyHostToDevice);
-            if (copy_error != cudaSuccess) copy_successful = false;
-        }
-        
-        if (copy_successful) {
-            copy_error = cudaMemcpy(texture_image_ids_cuda, loaded_image_ids.data(), image_ids_size, cudaMemcpyHostToDevice);
-            if (copy_error != cudaSuccess) copy_successful = false;
-        }
-        
-        if (copy_successful) {
-            copy_error = cudaMemcpy(src_image_ids_cuda, problem.src_image_ids.data(), src_ids_size, cudaMemcpyHostToDevice);
-            if (copy_error != cudaSuccess) copy_successful = false;
-        }
-        
-        if (copy_successful) {
-            copy_error = cudaMemset(valid_flags_cuda, 0, flags_size);
-            if (copy_error != cudaSuccess) copy_successful = false;
-        }
-        
-        if (!copy_successful) {
-            std::cerr << "Error copying data to GPU for image " << ref_image_id << ": " << cudaGetErrorString(copy_error) << std::endl;
-            // Cleanup
-            cudaFree(depth_textures_cuda);
-            cudaFree(normal_textures_cuda);
-            cudaFree(image_textures_cuda);
-            cudaFree(texture_image_ids_cuda);
-            cudaFree(src_image_ids_cuda);
-            cudaFree(output_points_cuda);
-            cudaFree(valid_flags_cuda);
-            continue;
-        }
-        
-        // Validate dimensions
-        if (width <= 0 || height <= 0) {
-            std::cerr << "Error: Invalid image dimensions " << width << "x" << height << std::endl;
-            cudaFree(depth_textures_cuda);
-            cudaFree(normal_textures_cuda);
-            cudaFree(image_textures_cuda);
-            cudaFree(texture_image_ids_cuda);
-            cudaFree(src_image_ids_cuda);
-            cudaFree(output_points_cuda);
-            cudaFree(valid_flags_cuda);
-            continue;
-        }
-        
-        // Safe block size - check device properties
-        cudaDeviceProp prop;
-        cudaGetDeviceProperties(&prop, 0);
-        
-        int max_threads_per_block = prop.maxThreadsPerBlock;
-        int max_block_dim_x = prop.maxThreadsDim[0];
-        int max_block_dim_y = prop.maxThreadsDim[1];
-        
-        // Use smaller block size for compatibility
-        dim3 block_size(16, 16);
-        if (16 * 16 > max_threads_per_block || 16 > max_block_dim_x || 16 > max_block_dim_y) {
-            // Fallback to smaller block size
-            block_size = dim3(8, 8);
-            if (8 * 8 > max_threads_per_block) {
-                block_size = dim3(16, 1);  // Linear block
-            }
-        }
-        
-        // Calculate grid size with bounds checking
-        dim3 grid_size((width + block_size.x - 1) / block_size.x, 
-                      (height + block_size.y - 1) / block_size.y);
-        
-        // Validate grid dimensions
-        if (grid_size.x == 0 || grid_size.y == 0 || 
-            grid_size.x > prop.maxGridSize[0] || grid_size.y > prop.maxGridSize[1]) {
-            std::cerr << "Error: Invalid grid size " << grid_size.x << "x" << grid_size.y << std::endl;
-            std::cerr << "Max grid size: " << prop.maxGridSize[0] << "x" << prop.maxGridSize[1] << std::endl;
-            cudaFree(depth_textures_cuda);
-            cudaFree(normal_textures_cuda);
-            cudaFree(image_textures_cuda);
-            cudaFree(texture_image_ids_cuda);
-            cudaFree(src_image_ids_cuda);
-            cudaFree(output_points_cuda);
-            cudaFree(valid_flags_cuda);
-            continue;
-        }
-        
-        std::cout << "  Launching kernel with block(" << block_size.x << "," << block_size.y 
-                  << ") grid(" << grid_size.x << "," << grid_size.y << ")" << std::endl;
-        
-        // Launch kernel with error checking
-        EfficientFusionKernel<<<grid_size, block_size>>>(
+        ChunkBatchKernel<<<grid_size, block_size>>>(
             depth_textures_cuda,
             normal_textures_cuda,
             image_textures_cuda,
             texture_image_ids_cuda,
-            (int)loaded_image_ids.size(),
+            (int)texture_image_ids.size(),
             cameras_cuda,
             camera_image_ids_cuda,
             (int)all_cameras.size(),
-            ref_image_id,
-            src_image_ids_cuda,
-            (int)problem.src_image_ids.size(),
+            ref_image_ids_cuda,
+            all_src_image_ids_cuda,
+            src_counts_cuda,
+            src_offsets_cuda,
+            problem_offsets_cuda,
+            widths_cuda,
+            heights_cuda,
             output_points_cuda,
             valid_flags_cuda,
-            width,
-            height
+            (int)chunk.size()
         );
         
-        cudaError_t launch_error = cudaGetLastError();
-        if (launch_error != cudaSuccess) {
-            std::cerr << "Error launching kernel: " << cudaGetErrorString(launch_error) << std::endl;
-            cudaFree(depth_textures_cuda);
-            cudaFree(normal_textures_cuda);
-            cudaFree(image_textures_cuda);
-            cudaFree(texture_image_ids_cuda);
-            cudaFree(src_image_ids_cuda);
-            cudaFree(output_points_cuda);
-            cudaFree(valid_flags_cuda);
-            continue;
-        }
+        CUDA_SAFE_CALL(cudaDeviceSynchronize());
         
-        cudaError_t sync_error = cudaDeviceSynchronize();
-        if (sync_error != cudaSuccess) {
-            std::cerr << "Error synchronizing device: " << cudaGetErrorString(sync_error) << std::endl;
-            cudaFree(depth_textures_cuda);
-            cudaFree(normal_textures_cuda);
-            cudaFree(image_textures_cuda);
-            cudaFree(texture_image_ids_cuda);
-            cudaFree(src_image_ids_cuda);
-            cudaFree(output_points_cuda);
-            cudaFree(valid_flags_cuda);
-            continue;
-        }
+        auto chunk_end = std::chrono::high_resolution_clock::now();
+        auto chunk_duration = std::chrono::duration_cast<std::chrono::milliseconds>(chunk_end - chunk_start);
         
         // Copy results back
-        std::vector<PointList> points(total_pixels);
-        std::vector<int> valid_flags(total_pixels);
+        std::vector<PointList> chunk_points(total_pixels);
+        std::vector<int> valid_flags_host(total_pixels);
         
-        CUDA_SAFE_CALL(cudaMemcpy(points.data(), output_points_cuda, 
-                                  total_pixels * sizeof(PointList), cudaMemcpyDeviceToHost));
-        CUDA_SAFE_CALL(cudaMemcpy(valid_flags.data(), valid_flags_cuda, 
-                                  total_pixels * sizeof(int), cudaMemcpyDeviceToHost));
+        CUDA_SAFE_CALL(cudaMemcpy(chunk_points.data(), output_points_cuda, total_pixels * sizeof(PointList), cudaMemcpyDeviceToHost));
+        CUDA_SAFE_CALL(cudaMemcpy(valid_flags_host.data(), valid_flags_cuda, total_pixels * sizeof(int), cudaMemcpyDeviceToHost));
         
         // Collect valid points
-        size_t valid_count = 0;
-        for (int j = 0; j < total_pixels; ++j) {
-            if (valid_flags[j]) {
-                all_points.push_back(points[j]);
-                valid_count++;
+        size_t chunk_valid_count = 0;
+        for (int i = 0; i < total_pixels; ++i) {
+            if (valid_flags_host[i]) {
+                all_points.push_back(chunk_points[i]);
+                chunk_valid_count++;
             }
         }
         
-        total_points += valid_count;
-        std::cout << "  Generated " << valid_count << " points" << std::endl;
-        
-        // Cleanup GPU memory for this iteration
-        cudaFree(depth_textures_cuda);
-        cudaFree(normal_textures_cuda);
-        cudaFree(image_textures_cuda);
-        cudaFree(texture_image_ids_cuda);
-        cudaFree(src_image_ids_cuda);
-        cudaFree(output_points_cuda);
-        cudaFree(valid_flags_cuda);
-        
-        // Force GPU memory cleanup
-        cudaDeviceSynchronize();
+        std::cout << "  Chunk " << (chunk_idx + 1) << ": " << chunk_valid_count 
+                  << " points in " << chunk_duration.count() << " ms" << std::endl;
     }
     
+    auto total_end = std::chrono::high_resolution_clock::now();
+    auto total_duration = std::chrono::duration_cast<std::chrono::seconds>(total_end - total_start);
+    
+    std::cout << "[Optimized Fusion] Generated " << all_points.size() << " points total" << std::endl;
+    std::cout << "[Optimized Fusion] Total time: " << total_duration.count() << " seconds" << std::endl;
+    
     // Write output
-    std::string output_path = dense_folder + "/ACMMP/ACMM_model_cuda_efficient.ply";
+    std::string output_path = dense_folder + "/ACMMP/ACMM_model_optimized.ply";
     StoreColorPlyFileBinaryPointCloud(output_path, all_points);
-    std::cout << "[Efficient CUDA Fusion] Complete! Wrote " << total_points 
-              << " points to " << output_path << std::endl;
+    
+    std::cout << "[Optimized Fusion] Complete! Output written to: " << output_path << std::endl;
+    std::cout << "[Optimized Fusion] Final cache size: " << loader.getCacheSize() << " images" << std::endl;
     
     // Cleanup
     cudaFree(cameras_cuda);
     cudaFree(camera_image_ids_cuda);
 }
-
-// Usage example:
-/*
-int main() {
-    std::string dense_folder = "/path/to/your/scene";
-    std::vector<Problem> problems = LoadProblems(dense_folder + "/problems.txt");
-    bool geom_consistency = true;
-    
-    // Adjust based on your GPU memory (10 images ≈ 2-4GB GPU memory for 1920x1080 images)
-    size_t max_textures = 8;  // Reduce if you get out-of-memory errors
-    
-    try {
-        RunFusionCudaEfficient(dense_folder, problems, geom_consistency, max_textures);
-    } catch (const std::exception& e) {
-        std::cerr << "Fusion failed: " << e.what() << std::endl;
-        return -1;
-    }
-    
-    return 0;
-}
-*/
