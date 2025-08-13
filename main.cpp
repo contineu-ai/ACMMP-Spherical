@@ -1,6 +1,6 @@
 #include "main.h"
 #include "ACMMP.h"
-
+#include "FusionGPU.h"
 void GenerateSampleList(const std::string &dense_folder, std::vector<Problem> &problems)
 {
     std::string cluster_list_path = dense_folder + std::string("/pair.txt");
@@ -35,7 +35,7 @@ void GenerateSampleList(const std::string &dense_folder, std::vector<Problem> &p
 int ComputeMultiScaleSettings(const std::string &dense_folder, std::vector<Problem> &problems)
 {
     int max_num_downscale = -1;
-    int size_bound = 1000;
+    int size_bound = 350;
     PatchMatchParams pmp;
     std::string image_folder = dense_folder + std::string("/images");
 
