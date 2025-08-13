@@ -6,11 +6,11 @@
 __device__ __forceinline__ float SampleDepthInv(curandState* rs, float dmin, float dmax) {
     dmin = fmaxf(dmin, 1e-6f);
     dmax = fmaxf(dmax, dmin + 1e-6f);
-    const float inv_min = 1.0f / dmax;
-    const float inv_max = 1.0f / dmin;
-    const float u = curand_uniform(rs);           // (0,1]
-    const float inv = inv_min + u * (inv_max - inv_min);
-    return 1.0f / inv;
+    const float inv_min = __fdividef(1.0f, dmax);
+    const float inv_max = __fdividef(1.0f, dmin);
+    const float u = curand_uniform(rs);
+    const float inv = fmaf(u, inv_max - inv_min, inv_min);
+    return __fdividef(1.0f, inv);
 }
 
 #define mul4(v,k) { \
@@ -108,21 +108,18 @@ __device__ void NormalizeVec3 (float4 *vec)
     vec->z *= inverse_sqrt;
 }
 
-__device__ inline void PixelToDir(const Camera& cam, const int2 p, float3* dir)
+__device__ __forceinline__ void PixelToDir(const Camera& cam, const int2 p, float3* dir)
 {
-    if (cam.model == PINHOLE) {
-        dir->x =  (static_cast<float>(p.x) - cam.K[2]) / cam.K[0];
-        dir->y =  (static_cast<float>(p.y) - cam.K[5]) / cam.K[4];
-        dir->z =  1.f;
-        NormalizeVec3(reinterpret_cast<float4*>(dir));
-    } else { // SPHERE
-        // --- FIX 4: Use cx and cy for spherical projection in CUDA ---
-        const float lon = (static_cast<float>(p.x) - cam.params[1]) / static_cast<float>(cam.width) * 2.0f * CUDART_PI_F;
-        const float lat = -(static_cast<float>(p.y) - cam.params[2]) / static_cast<float>(cam.height) * CUDART_PI_F;
-        dir->x =  cosf(lat) * sinf(lon);
-        dir->y = -sinf(lat);
-        dir->z =  cosf(lat) * cosf(lon);
-    }
+    const float lon = __fdividef((static_cast<float>(p.x) - cam.params[1]), static_cast<float>(cam.width)) * 2.0f * CUDART_PI_F;
+    const float lat = -__fdividef((static_cast<float>(p.y) - cam.params[2]), static_cast<float>(cam.height)) * CUDART_PI_F;
+    
+    float cos_lat, sin_lat, cos_lon, sin_lon;
+    __sincosf(lat, &sin_lat, &cos_lat);
+    __sincosf(lon, &sin_lon, &cos_lon);
+    
+    dir->x = cos_lat * sin_lon;
+    dir->y = -sin_lat;
+    dir->z = cos_lat * cos_lon;
 }
 
 __device__ void TransformPDFToCDF(float* probs, const int num_probs)
