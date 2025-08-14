@@ -2,6 +2,8 @@
 #include "ACMMP_device.cuh"  // Include the device functions header
 #include <math_constants.h>  // for CUDART_PI_F
 #include <memory>
+// extern __constant__ SphericalLUT* d_lut_array_const[10];
+// extern __constant__ int d_num_luts;
 
 __device__ __forceinline__ float SampleDepthInv(curandState* rs, float dmin, float dmax) {
     dmin = fmaxf(dmin, 1e-6f);
@@ -108,20 +110,6 @@ __device__ void NormalizeVec3 (float4 *vec)
     vec->z *= inverse_sqrt;
 }
 
-__device__ __forceinline__ void PixelToDir(const Camera& cam, const int2 p, float3* dir)
-{
-    const float lon = __fdividef((static_cast<float>(p.x) - cam.params[1]), static_cast<float>(cam.width)) * 2.0f * CUDART_PI_F;
-    const float lat = -__fdividef((static_cast<float>(p.y) - cam.params[2]), static_cast<float>(cam.height)) * CUDART_PI_F;
-    
-    float cos_lat, sin_lat, cos_lon, sin_lon;
-    __sincosf(lat, &sin_lat, &cos_lat);
-    __sincosf(lon, &sin_lon, &cos_lon);
-    
-    dir->x = cos_lat * sin_lon;
-    dir->y = -sin_lat;
-    dir->z = cos_lat * cos_lon;
-}
-
 __device__ void TransformPDFToCDF(float* probs, const int num_probs)
 {
     float prob_sum = 0.0f;
@@ -138,19 +126,6 @@ __device__ void TransformPDFToCDF(float* probs, const int num_probs)
     }
 }
 
-__device__ void Get3DPoint(const Camera camera, const int2 p, const float depth, float *X)
-{
-    float3 dir;  PixelToDir(camera, p, &dir);
-    X[0] = dir.x * depth;
-    X[1] = dir.y * depth;
-    X[2] = dir.z * depth;
-}
-
-__device__ float4 GetViewDirection(const Camera camera, const int2 p, const float depth)
-{
-    float3 dir;  PixelToDir(camera, p, &dir);
-    return make_float4(dir.x, dir.y, dir.z, 0);
-}
 
 __device__ float GetDistance2Origin(const Camera camera, const int2 p, const float depth, const float4 normal)
 {
@@ -169,14 +144,6 @@ __device__  float RangeGauss(float x, float sigma, float mu = 0.0)
 {
     float x_p = x - mu;
     return exp(-1.0 * (x_p * x_p) / (2 * sigma * sigma));
-}
-
-__device__ float ComputeDepthfromPlaneHypothesis(const Camera camera, const float4 plane_hypothesis, const int2 p)
-{
-    float3 dir;  PixelToDir(camera, p, &dir);
-    // The plane is passed in as 'plane_hypothesis'
-    const float denom = plane_hypothesis.x*dir.x + plane_hypothesis.y*dir.y + plane_hypothesis.z*dir.z;
-    return (fabsf(denom) < 1e-6f) ? 1e6f : (-plane_hypothesis.w / denom);    
 }
 
 __device__ float4 GenerateRandomNormal(const Camera camera, const int2 p, curandState *rand_state, const float depth)
