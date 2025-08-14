@@ -33,6 +33,7 @@ endif()
 set(CUDA_SOURCES
     ACMMP.cu
     FusionGPU.cu
+    SphericalLUT_MultiRes.cu
 )
 
 set(CXX_SOURCES
@@ -45,6 +46,7 @@ set(HEADERS
     ACMMP.h
     ACMMP_device.cuh
     FusionGPU.h
+    SphericalLUT_MultiRes.h
 )
 
 # ─── Create Executable ──────────────────────────────────────────────
