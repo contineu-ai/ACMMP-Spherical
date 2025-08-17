@@ -6,6 +6,7 @@ COLMAP → ACMMP/MVSNet converter with:
 * pair-pruning (top-K neighbours, min shared tracks)
 * robust skip of images with no 3-D points
 * binary (.bin) or text (.txt) sparse model
+* FIXED: spherical camera support with garbage focal length handling
 
 Example
 -------
@@ -25,6 +26,7 @@ from itertools import combinations
 import numpy as np
 import cv2
 from tqdm import tqdm
+from scipy.spatial import cKDTree
 
 # ───────────────────────────────────────────────────────────────────────────────
 # 1.  Named-tuple data structures
@@ -181,39 +183,65 @@ def qvec2rotmat(q):
 # 5.  Depth-range computation
 # ───────────────────────────────────────────────────────────────────────────────
 def compute_depth_ranges(images, points3d, extrinsic, intrinsic,
-                          max_d, interval_scale,cams):
-    depth_ranges={}
-    for i,img in images.items():
-        zs=[]
-        cam_model = cams[img.camera_id].model   # NEW – look up model
+                          max_d, interval_scale, cams):
+    depth_ranges = {}
+    for i, img in images.items():
+        zs = []
+        cam_model = cams[img.camera_id].model
+        
         for pid in img.point3D_ids:
-            if pid < 0:          # invalid point
+            if pid < 0:
                 continue
             X = np.append(points3d[pid].xyz, 1.0)
-            X_cam = extrinsic[i] @ X            # 4×4 · (x,y,z,1)
-            if cam_model == "SPHERE":            # radial depth
-                d = np.linalg.norm(X_cam[:3])
-            else:                                # pinhole: use z only
-                d = X_cam[2]
-            if d <= 0:                          # point is behind cam
+            X_cam = extrinsic[i] @ X
+            
+            if cam_model == "SPHERE":
+                d = np.linalg.norm(X_cam[:3])  # radial depth
+            else:
+                d = X_cam[2]  # pinhole: use z only
+                
+            if d <= 0:
                 continue
             zs.append(d)
+        
+        if len(zs) == 0:  # Skip images with no valid points
+            continue
+            
         zs_sorted = sorted(zs)
-        dmin=zs_sorted[int(len(zs_sorted)*0.2)]*0.75
-        dmax=zs_sorted[int(len(zs_sorted)*0.8)]*1.25
-        if max_d==0:
-            K = intrinsic[img.camera_id]
-            p1=np.array([K[0,2],K[1,2],1])
-            p2=p1+np.array([1,0,0])
-            P1=(np.linalg.inv(K)@p1)*dmin
-            P1=np.linalg.inv(extrinsic[i][:3,:3])@(P1-extrinsic[i][:3,3])
-            P2=(np.linalg.inv(K)@p2)*dmin
-            P2=np.linalg.inv(extrinsic[i][:3,:3])@(P2-extrinsic[i][:3,3])
-            depth_num=int((1/dmin-1/dmax)/(1/dmin-1/(dmin+np.linalg.norm(P2-P1))))
+        dmin = zs_sorted[int(len(zs_sorted)*0.2)] * 0.75
+        dmax = zs_sorted[int(len(zs_sorted)*0.8)] * 1.25
+        
+        # Handle depth_num calculation differently for spherical cameras
+        if max_d == 0:
+            if cam_model == "SPHERE":
+                # For spherical cameras, don't use focal length (garbage param)
+                # Use depth sampling based on scene scale instead
+                depth_range = dmax - dmin
+                scene_scale = dmin  # use minimum depth as scene scale reference
+                
+                # Heuristic: more depth planes for closer/larger scenes
+                if scene_scale < 1.0:  # very close scene
+                    depth_num = min(256, max(64, int(depth_range / 0.01)))
+                elif scene_scale < 10.0:  # medium distance scene  
+                    depth_num = min(192, max(48, int(depth_range / 0.05)))
+                else:  # far scene
+                    depth_num = min(128, max(32, int(depth_range / 0.1)))
+            else:
+                # Original pinhole calculation
+                K = intrinsic[img.camera_id]
+                p1 = np.array([K[0,2], K[1,2], 1])
+                p2 = p1 + np.array([1, 0, 0])
+                P1 = (np.linalg.inv(K) @ p1) * dmin
+                P1 = np.linalg.inv(extrinsic[i][:3,:3]) @ (P1 - extrinsic[i][:3,3])
+                P2 = (np.linalg.inv(K) @ p2) * dmin
+                P2 = np.linalg.inv(extrinsic[i][:3,:3]) @ (P2 - extrinsic[i][:3,3])
+                depth_num = int((1/dmin - 1/dmax) / (1/dmin - 1/(dmin + np.linalg.norm(P2-P1))))
         else:
-            depth_num=max_d
-        dint=(dmax-dmin)/(depth_num-1)/interval_scale
-        depth_ranges[i]=(dmin,dint,depth_num,dmax)
+            depth_num = max_d
+            
+        dint = (dmax - dmin) / (depth_num - 1) / interval_scale
+        depth_ranges[i] = (dmin, dint, depth_num, dmax)
+    
     return depth_ranges
 
 # ───────────────────────────────────────────────────────────────────────────────
@@ -224,24 +252,28 @@ def angle_between(ci,cj,p):
         np.clip(np.dot(ci-p,cj-p)/
                 (np.linalg.norm(ci-p)*np.linalg.norm(cj-p)), -1.0,1.0)))
 
-def calc_shared(pair,images):
-    i,j=pair
-    return len(set(images[i+1].point3D_ids) &
-               set(images[j+1].point3D_ids))
+def calc_shared(pair, images):
+    i, j = pair
+    return len(set(images[i].point3D_ids) & set(images[j].point3D_ids))
 
-def calc_score(pair,images,points3d,theta0,extrinsic):
-    i,j=pair
-    shared=set(images[i+1].point3D_ids)&set(images[j+1].point3D_ids)
+def calc_score(pair, images, points3d, theta0, extrinsic):
+    i, j = pair
+    shared = set(images[i].point3D_ids) & set(images[j].point3D_ids)
     if not shared:
-        return i,j,0.0
-    ci=-(extrinsic[i+1][:3,:3].T@extrinsic[i+1][:3,3])
-    cj=-(extrinsic[j+1][:3,:3].T@extrinsic[j+1][:3,3])
-    angs=[angle_between(ci,cj,points3d[pid].xyz)
-          for pid in shared if pid!=-1]
-    if not angs: return i,j,0.0
-    if np.percentile(angs,75)<theta0:
-        return i,j,0.0
-    return i,j,float(len(shared))
+        return i, j, 0.0
+    
+    # Use 0-based indexing consistently
+    ci = -(extrinsic[i][:3,:3].T @ extrinsic[i][:3,3])
+    cj = -(extrinsic[j][:3,:3].T @ extrinsic[j][:3,3])
+    
+    angs = [angle_between(ci, cj, points3d[pid].xyz)
+            for pid in shared if pid != -1]
+    
+    if not angs: 
+        return i, j, 0.0
+    if np.percentile(angs, 75) < theta0:
+        return i, j, 0.0
+    return i, j, float(len(shared))
 
 # ───────────────────────────────────────────────────────────────────────────────
 # 7.  Main processing routine
@@ -257,8 +289,9 @@ def process_scene(args):
 
     # ---------- Load model ----------
     cams,imgs_raw,pts=read_model(sparse,args.model_ext)
-    imgs={i+1:imgs_raw[k] for i,k in enumerate(sorted(imgs_raw))}
-    N=len(imgs)
+    # FIXED: Use consistent 0-based indexing
+    imgs = {i: imgs_raw[k] for i, k in enumerate(sorted(imgs_raw))}
+    N = len(imgs)
 
     # ---------- Build intrinsics ----------
     param_map={
@@ -273,18 +306,27 @@ def process_scene(args):
         'FOV':['fx','fy','cx','cy','omega'],
         'THIN_PRISM_FISHEYE':['fx','fy','cx','cy','k1','k2',
                               'p1','p2','k3','k4','sx1','sy1'],
-                              'SPHERE': ['f','cx','cy'],
+        'SPHERE': ['f','cx','cy'],
     }
+    
     Kdict={}
     for cid,cam in cams.items():
-        keys=param_map[cam.model]
-        vals=dict(zip(keys,cam.params))
-        if 'f' in vals:
-            vals['fx']=vals['fy']=vals['f']
-        K=np.eye(3)
-        K[0,0]=vals['fx']; K[1,1]=vals['fy']
-        K[0,2]=vals['cx']; K[1,2]=vals['cy']
-        Kdict[cid]=K
+        if cam.model == "SPHERE":
+            # For spherical cameras, focal length is garbage, estimate from image center
+            _, cx, cy = cam.params[:3]  # ignore focal length (garbage)
+            # Estimate focal length from image center (simple heuristic)
+            estimated_f = max(cx, cy)
+            K = np.array([[estimated_f, 0, cx], [0, estimated_f, cy], [0, 0, 1]])
+            Kdict[cid] = K
+        else:
+            keys=param_map[cam.model]
+            vals=dict(zip(keys,cam.params))
+            if 'f' in vals:
+                vals['fx']=vals['fy']=vals['f']
+            K=np.eye(3)
+            K[0,0]=vals['fx']; K[1,1]=vals['fy']
+            K[0,2]=vals['cx']; K[1,2]=vals['cy']
+            Kdict[cid]=K
 
     # ---------- Extrinsics ----------
     extr={}
@@ -297,13 +339,11 @@ def process_scene(args):
     # ---------- Depth ranges ----------
     depth_ranges=compute_depth_ranges(imgs,pts,extr,Kdict,
                                       args.max_d,args.interval_scale,cams)
-    print("depth_ranges[1]",depth_ranges.get(1))
+    print("depth_ranges for first valid image:",next(iter(depth_ranges.items())))
 
     # ---------- Candidate pairs via camera-center proximity ----------
-    from scipy.spatial import cKDTree
-
     # 1) collect only the images that survived depth_ranges
-    keys = sorted(depth_ranges.keys())           # e.g. [1,2,5,7,…] (1-based)
+    keys = sorted(depth_ranges.keys())  # 0-based indices
 
     # 2) build an (M×3) array of world-space centers C_i = -(Rᵀ·t)
     centers = np.stack([
@@ -319,10 +359,10 @@ def process_scene(args):
     # 4) collect unique zero-based index pairs
     candidate_pairs = set()
     for src_idx, neighs in enumerate(nnidx):
-        src = keys[src_idx] - 1          # convert to 0-based
+        src = keys[src_idx]  # Already 0-based
         for n in neighs:
             if n == src_idx: continue   # skip self
-            dst = keys[n] - 1
+            dst = keys[n]
             a, b = min(src, dst), max(src, dst)
             candidate_pairs.add((a, b))
 
@@ -331,7 +371,7 @@ def process_scene(args):
     shared_cnt = [calc_shared(p, imgs) for p in all_pairs]
 
     top_pairs=[]
-    valid = [i-1 for i in depth_ranges.keys()]
+    valid = list(depth_ranges.keys())  # 0-based
     neighbor_bins={i:[] for i in valid}
     for (pair,s) in sorted(zip(all_pairs,shared_cnt),
                            key=lambda x:x[1],reverse=True):
@@ -358,52 +398,78 @@ def process_scene(args):
     # ---------- neighbour list for each image ----------
     view_sel=[]
     for i in range(N):
+        if i not in depth_ranges:
+            view_sel.append([])
+            continue
+            
         top=np.argsort(score[i])[::-1]
         view_sel.append([(k,score[i,k]) for k in top
-                         if score[i,k]>0][:args.top_k])
+                         if score[i,k]>0 and k in depth_ranges][:args.top_k])
 
     # ---------- Write camera files ----------
     for i in range(N):
-        if (i+1) not in depth_ranges: continue
+        if i not in depth_ranges:  # Skip images without valid depth ranges
+            continue
+            
         cam_path=os.path.join(cam_dir,f"{i:08d}_cam.txt")
         with open(cam_path,"w") as f:
             f.write("extrinsic\n")
             for r in range(4):
-                f.write(" ".join(map(str,extr[i+1][r]))+"\n")
-            # now special-case SPHERE
+                f.write(" ".join(map(str,extr[i][r]))+"\n")
+            
             f.write("\nintrinsic\n")
-            # look up the original COLMAP Camera entry
-            cam = cams[imgs[i+1].camera_id]
+            # Look up the original COLMAP Camera entry using 0-based indexing
+            img = imgs[i]
+            cam = cams[img.camera_id]
+            
             if cam.model == "SPHERE":
-                # SPHERE wants: model name + f, cx, cy
+                # SPHERE format: model name + f, cx, cy
+                # Focal length is garbage, estimate from image dimensions
                 f.write("SPHERE\n")
-                # cam.params is [f, cx, cy]
-                f.write(f"{cam.params[0]} {cam.params[1]} {cam.params[2]}\n")
+                if len(cam.params) >= 3:
+                    # Estimate focal length from image center assuming spherical mapping
+                    _, cx, cy = cam.params[:3]  # ignore garbage focal length
+                    estimated_f = max(cx, cy)  # simple heuristic based on image center
+                    f.write(f"{estimated_f} {cx} {cy}\n")
+                else:
+                    raise ValueError(f"SPHERE camera {cam.id} has insufficient parameters: {cam.params}")
             else:
-                # all other models: write full 3×3 K
+                # All other models: write full 3×3 K matrix
                 K = Kdict[cam.id]
                 for r in range(3):
                     f.write(" ".join(map(str, K[r])) + "\n")
-            d0,dint,Nd,dmax=depth_ranges[i+1]
+            
+            d0,dint,Nd,dmax=depth_ranges[i]
             f.write(f"\n{d0} {dint} {Nd} {dmax}\n")
 
     # ---------- Write pair.txt ----------
     with open(os.path.join(args.save_folder,"pair.txt"),"w") as f:
-        f.write(f"{N}\n")
-        for i,nbrs in enumerate(view_sel):
-            f.write(f"{i}\n{len(nbrs)} ")
-            for j,s in nbrs:
-                f.write(f"{j} {int(s)} ")
+        valid_images = sorted(depth_ranges.keys())
+        f.write(f"{len(valid_images)}\n")
+        
+        for idx, i in enumerate(valid_images):
+            # Find neighbors for image i
+            neighbors = [(j, int(score_val)) for j, score_val in view_sel[i] 
+                        if j in valid_images and score_val > 0]
+            
+            f.write(f"{idx}\n{len(neighbors)} ")
+            for j, s in neighbors:
+                # Convert j to the position in valid_images list
+                j_idx = valid_images.index(j)
+                f.write(f"{j_idx} {s} ")
             f.write("\n")
 
     # ---------- Copy/convert images ----------
     for i in range(N):
-        src=os.path.join(imgs_dir,imgs[i+1].name)
-        dst=os.path.join(out_img,f"{i:08d}.jpg")
+        if i not in depth_ranges:  # Skip images without depth ranges
+            continue
+        img = imgs[i]  # Use 0-based indexing
+        src = os.path.join(imgs_dir, img.name)
+        dst = os.path.join(out_img, f"{i:08d}.jpg")
         if not src.lower().endswith(".jpg"):
-            cv2.imwrite(dst,cv2.imread(src))
+            cv2.imwrite(dst, cv2.imread(src))
         else:
-            shutil.copyfile(src,dst)
+            shutil.copyfile(src, dst)
 
 # ───────────────────────────────────────────────────────────────────────────────
 # 8.  CLI

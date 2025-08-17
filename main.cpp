@@ -2,7 +2,9 @@
 #include "ACMMP.h"
 #include "FusionGPU.h"
 #include "SphericalLUT_MultiRes.h"  // Add multi-resolution LUT support
-
+#include <chrono>
+#include <omp.h>
+#include <atomic>   // Add this for atomic operations
 void GenerateSampleList(const std::string &dense_folder, std::vector<Problem> &problems)
 {
     std::string cluster_list_path = dense_folder + std::string("/pair.txt");
@@ -167,6 +169,258 @@ int ComputeMultiScaleSettings(const std::string &dense_folder, std::vector<Probl
     return max_num_downscale;
 }
 
+// void ProcessProblem(const std::string &dense_folder, const std::vector<Problem> &problems, 
+//                    const int idx, bool geom_consistency, bool planar_prior, 
+//                    bool hierarchy, bool multi_geometrty=false)
+// {
+//     const Problem problem = problems[idx];
+//     std::cout << "Processing image " << std::setw(8) << std::setfill('0') 
+//               << problem.ref_image_id << "..." << std::endl;
+//     cudaSetDevice(0);
+    
+//     std::stringstream result_path;
+//     result_path << dense_folder << "/ACMMP" << "/2333_" << std::setw(8) 
+//                 << std::setfill('0') << problem.ref_image_id;
+//     std::string result_folder = result_path.str();
+//     mkdir(result_folder.c_str(), 0777);
+
+//     ACMMP acmmp;
+//     if (geom_consistency) {
+//         acmmp.SetGeomConsistencyParams(multi_geometrty);
+//     }
+//     if (hierarchy) {
+//         acmmp.SetHierarchyParams();
+//     }
+
+//     acmmp.InuputInitialization(dense_folder, problems, idx);
+//     acmmp.CudaSpaceInitialization(dense_folder, problem);
+//     acmmp.RunPatchMatch();
+
+//     const int width = acmmp.GetReferenceImageWidth();
+//     const int height = acmmp.GetReferenceImageHeight();
+
+//     cv::Mat_<float> depths = cv::Mat::zeros(height, width, CV_32FC1);
+//     cv::Mat_<cv::Vec3f> normals = cv::Mat::zeros(height, width, CV_32FC3);
+//     cv::Mat_<float> costs = cv::Mat::zeros(height, width, CV_32FC1);
+
+//     for (int col = 0; col < width; ++col) {
+//         for (int row = 0; row < height; ++row) {
+//             int center = row * width + col;
+//             float4 plane_hypothesis = acmmp.GetPlaneHypothesis(center);
+//             depths(row, col) = plane_hypothesis.w;
+//             normals(row, col) = cv::Vec3f(plane_hypothesis.x, plane_hypothesis.y, plane_hypothesis.z);
+//             costs(row, col) = acmmp.GetCost(center);
+//         }
+//     }
+// // ── Planar prior: timed + tile-parallel rasterization (no thinning) ──────────
+// if (planar_prior) {
+//     using clock = std::chrono::steady_clock;
+//     auto ms = [](clock::time_point a, clock::time_point b) {
+//         return std::chrono::duration_cast<std::chrono::milliseconds>(b - a).count();
+//     };
+
+//     // Tune tile size for your CPU cache; 64 or 128 are good starts.
+//     constexpr int TILE = 128;
+
+//     auto T_block_start = clock::now();
+//     std::cout << "Run Planar Prior Assisted PatchMatch MVS (fast) ..." << std::endl;
+
+//     auto T0 = clock::now();
+//     acmmp.SetPlanarPriorParams();
+//     auto T1 = clock::now();
+//     std::cout << "  [timing] SetPlanarPriorParams: " << ms(T0, T1) << " ms\n";
+
+//     const cv::Rect imageRC(0, 0, width, height);
+
+//     // 1) Support points + Delaunay (unchanged)
+//     T0 = clock::now();
+//     std::vector<cv::Point> support2DPoints;
+//     acmmp.GetSupportPoints(support2DPoints);
+//     auto Tsp = clock::now();
+
+//     const auto& triangles = acmmp.DelaunayTriangulation(imageRC, support2DPoints);
+//     auto Tdl = clock::now();
+
+//     std::cout << "  [timing] GetSupportPoints (" << support2DPoints.size() << " pts): "
+//               << ms(T0, Tsp) << " ms\n";
+//     std::cout << "  [timing] DelaunayTriangulation (" << triangles.size() << " tris): "
+//               << ms(Tsp, Tdl) << " ms\n";
+
+//     // 2) Plane params per triangle (serial, thread-safe)
+//     auto Tpp0 = clock::now();
+//     std::vector<float4>  planeParams_tri(triangles.size());
+//     std::vector<uint8_t> tri_valid(triangles.size(), 0);
+//     size_t valid_tris = 0;
+//     for (size_t i = 0; i < triangles.size(); ++i) {
+//         const auto& tr = triangles[i];
+//         if (!(imageRC.contains(tr.pt1) && imageRC.contains(tr.pt2) && imageRC.contains(tr.pt3)))
+//             continue;
+//         planeParams_tri[i] = acmmp.GetPriorPlaneParams(tr, depths);
+//         tri_valid[i] = 1;
+//         ++valid_tris;
+//     }
+//     auto Tpp1 = clock::now();
+//     std::cout << "  [timing] PlaneParams (" << valid_tris << " valid tris): "
+//               << ms(Tpp0, Tpp1) << " ms\n";
+
+//     // 3) Build triangle -> tile map (serial, cheap)
+//     auto Tmap0 = clock::now();
+//     const int nx = (width  + TILE - 1) / TILE;
+//     const int ny = (height + TILE - 1) / TILE;
+//     const int num_tiles = nx * ny;
+
+//     auto clampi = [](int v, int lo, int hi_excl) { return std::max(lo, std::min(v, hi_excl)); };
+
+//     std::vector<std::vector<int>> tile_tris(num_tiles);
+//     tile_tris.shrink_to_fit();
+//     for (int i = 0; i < (int)triangles.size(); ++i) {
+//         if (!tri_valid[i]) continue;
+//         const auto& tr = triangles[i];
+//         int minx = std::min({tr.pt1.x, tr.pt2.x, tr.pt3.x});
+//         int maxx = std::max({tr.pt1.x, tr.pt2.x, tr.pt3.x});
+//         int miny = std::min({tr.pt1.y, tr.pt2.y, tr.pt3.y});
+//         int maxy = std::max({tr.pt1.y, tr.pt2.y, tr.pt3.y});
+//         // Clip to image (exclusive upper bound for tile indexing)
+//         minx = clampi(minx, 0, width);
+//         maxx = clampi(maxx, 0, width  - 1);
+//         miny = clampi(miny, 0, height);
+//         maxy = clampi(maxy, 0, height - 1);
+//         if (minx > maxx || miny > maxy) continue;
+
+//         int tx0 = minx / TILE;
+//         int tx1 = maxx / TILE;
+//         int ty0 = miny / TILE;
+//         int ty1 = maxy / TILE;
+
+//         for (int ty = ty0; ty <= ty1; ++ty) {
+//             for (int tx = tx0; tx <= tx1; ++tx) {
+//                 tile_tris[ty * nx + tx].push_back(i);
+//             }
+//         }
+//     }
+//     auto Tmap1 = clock::now();
+//     std::cout << "  [timing] Tile map build (" << nx << "x" << ny << " tiles): "
+//               << ms(Tmap0, Tmap1) << " ms\n";
+
+//     // 4) Parallel rasterization per tile ROI (no overlap between threads)
+//     auto Trast0 = clock::now();
+//     cv::Mat mask_tri_i(height, width, CV_32SC1, cv::Scalar(0));  // id+1, 0=bg
+
+//     cv::parallel_for_(cv::Range(0, num_tiles), [&](const cv::Range& r) {
+//         for (int tid = r.start; tid < r.end; ++tid) {
+//             const int ty = tid / nx;
+//             const int tx = tid % nx;
+//             const int x0 = tx * TILE;
+//             const int y0 = ty * TILE;
+//             const int x1 = std::min(x0 + TILE, width);
+//             const int y1 = std::min(y0 + TILE, height);
+//             const cv::Rect tileR(x0, y0, x1 - x0, y1 - y0);
+
+//             cv::Mat tileView = mask_tri_i(tileR);  // disjoint memory per tile
+
+//             // Draw all intersecting triangles into this ROI
+//             const auto& lst = tile_tris[tid];
+//             for (int idx : lst) {
+//                 if (!tri_valid[idx]) continue;
+//                 const auto& tr = triangles[(size_t)idx];
+
+//                 // Shift points to tile-local coordinates
+//                 cv::Point pts_local[3] = {
+//                     tr.pt1 - tileR.tl(),
+//                     tr.pt2 - tileR.tl(),
+//                     tr.pt3 - tileR.tl()
+//                 };
+//                 // Safe: OpenCV clips polygon to ROI. Exclusive tile bounds avoid races.
+//                 cv::fillConvexPoly(tileView, pts_local, 3, int(idx + 1), cv::LINE_8, 0);
+//             }
+//         }
+//     });
+//     auto Trast1 = clock::now();
+//     std::cout << "  [timing] Rasterize (tile-parallel): " << ms(Trast0, Trast1) << " ms\n";
+
+//     // Labeled coverage stats
+//     auto Tcnt0 = clock::now();
+//     cv::Mat1b nzmask;
+//     cv::compare(mask_tri_i, 0, nzmask, cv::CMP_NE);
+//     int labeled_px = cv::countNonZero(nzmask);
+//     auto Tcnt1 = clock::now();
+//     std::cout << "  [stats ] Labeled pixels: " << labeled_px << " ("
+//               << std::fixed << std::setprecision(2)
+//               << (100.0 * double(labeled_px) / double(width * height)) << "%), "
+//               << "counted in " << ms(Tcnt0, Tcnt1) << " ms\n";
+
+//     // 5) Depth-from-plane (serial; do NOT call ACMMP from multiple threads)
+//     auto Td0 = clock::now();
+//     cv::Mat priordepths(height, width, CV_32FC1, cv::Scalar(0.0f));
+//     const float dmin = acmmp.GetMinDepth();
+//     const float dmax = acmmp.GetMaxDepth();
+//     for (int y = 0; y < height; ++y) {
+//         const int*  lab = mask_tri_i.ptr<int>(y);
+//         float*      out = priordepths.ptr<float>(y);
+//         for (int x = 0; x < width; ++x) {
+//             const int id = lab[x];
+//             if (id <= 0) continue;
+//             const size_t tix = size_t(id - 1);
+//             if (!tri_valid[tix]) continue;
+//             const float4& n4 = planeParams_tri[tix];
+//             const float d = acmmp.GetDepthFromPlaneParam(n4, x, y);
+//             if (d >= dmin && d <= dmax) out[x] = d;
+//         }
+//     }
+//     auto Td1 = clock::now();
+//     const double depth_ms = ms(Td0, Td1);
+//     const double mpix = labeled_px / 1e6;
+//     const double mpix_per_s = (depth_ms > 0.0) ? (mpix / (depth_ms / 1000.0)) : 0.0;
+//     std::cout << "  [timing] Depth-from-plane fill: " << depth_ms << " ms  ("
+//               << std::fixed << std::setprecision(2) << mpix_per_s << " MPix/s)\n";
+
+//     // 6) CUDA prior init + PatchMatch (sync for real timings)
+//     auto Tc0 = clock::now();
+//     cv::Mat mask_tri_f; mask_tri_i.convertTo(mask_tri_f, CV_32F);
+//     acmmp.CudaPlanarPriorInitialization(planeParams_tri, mask_tri_f);
+//     cudaDeviceSynchronize();
+//     auto Tc1 = clock::now();
+//     std::cout << "  [timing] CudaPlanarPriorInitialization: " << ms(Tc0, Tc1) << " ms\n";
+
+//     auto Tp0 = clock::now();
+//     acmmp.RunPatchMatch();
+//     cudaDeviceSynchronize();
+//     auto Tp1 = clock::now();
+//     std::cout << "  [timing] RunPatchMatch (prior-assisted): " << ms(Tp0, Tp1) << " ms\n";
+
+//     // 7) Extract outputs
+//     auto Te0 = clock::now();
+//     for (int col = 0; col < width; ++col) {
+//         for (int row = 0; row < height; ++row) {
+//             const int center = row * width + col;
+//             const float4 ph = acmmp.GetPlaneHypothesis(center);
+//             depths(row, col)  = ph.w;
+//             normals(row, col) = cv::Vec3f(ph.x, ph.y, ph.z);
+//             costs(row, col)   = acmmp.GetCost(center);
+//         }
+//     }
+//     auto Te1 = clock::now();
+//     std::cout << "  [timing] Extract outputs: " << ms(Te0, Te1) << " ms\n";
+
+//     auto T_block_end = clock::now();
+//     std::cout << "  [timing] Planar-prior TOTAL: " << ms(T_block_start, T_block_end) << " ms\n";
+// }
+
+
+//     std::string suffix = "/depths.dmb";
+//     if (geom_consistency) {
+//         suffix = "/depths_geom.dmb";
+//     }
+//     std::string depth_path = result_folder + suffix;
+//     std::string normal_path = result_folder + "/normals.dmb";
+//     std::string cost_path = result_folder + "/costs.dmb";
+//     writeDepthDmb(depth_path, depths);
+//     writeNormalDmb(normal_path, normals);
+//     writeDepthDmb(cost_path, costs);
+//     std::cout << "Processing image " << std::setw(8) << std::setfill('0') 
+//               << problem.ref_image_id << " done!" << std::endl;
+// }
+
 void ProcessProblem(const std::string &dense_folder, const std::vector<Problem> &problems, 
                    const int idx, bool geom_consistency, bool planar_prior, 
                    bool hierarchy, bool multi_geometrty=false)
@@ -211,95 +465,227 @@ void ProcessProblem(const std::string &dense_folder, const std::vector<Problem> 
         }
     }
 
-    if (planar_prior) {
-        std::cout << "Run Planar Prior Assisted PatchMatch MVS ..." << std::endl;
-        acmmp.SetPlanarPriorParams();
+// ── Planar prior: timed + tile-parallel rasterization (no thinning) ──────────
+if (planar_prior) {
+    using clock = std::chrono::steady_clock;
+    auto ms = [](clock::time_point a, clock::time_point b) {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(b - a).count();
+    };
 
-        const cv::Rect imageRC(0, 0, width, height);
-        std::vector<cv::Point> support2DPoints;
+    // Tune tile size for your CPU cache; 64 or 128 are good starts.
+    constexpr int TILE = 128;
 
-        acmmp.GetSupportPoints(support2DPoints);
-        const auto triangles = acmmp.DelaunayTriangulation(imageRC, support2DPoints);
-        cv::Mat refImage = acmmp.GetReferenceImage().clone();
-        std::vector<cv::Mat> mbgr(3);
-        mbgr[0] = refImage.clone();
-        mbgr[1] = refImage.clone();
-        mbgr[2] = refImage.clone();
-        cv::Mat srcImage;
-        cv::merge(mbgr, srcImage);
-        for (const auto triangle : triangles) {
-            if (imageRC.contains(triangle.pt1) && imageRC.contains(triangle.pt2) && 
-                imageRC.contains(triangle.pt3)) {
-                cv::line(srcImage, triangle.pt1, triangle.pt2, cv::Scalar(0, 0, 255));
-                cv::line(srcImage, triangle.pt1, triangle.pt3, cv::Scalar(0, 0, 255));
-                cv::line(srcImage, triangle.pt2, triangle.pt3, cv::Scalar(0, 0, 255));
-            }
+    auto T_block_start = clock::now();
+    std::cout << "Run Planar Prior Assisted PatchMatch MVS (fast) ..." << std::endl;
+
+    auto T0 = clock::now();
+    acmmp.SetPlanarPriorParams();
+    auto T1 = clock::now();
+    std::cout << "  [timing] SetPlanarPriorParams: " << ms(T0, T1) << " ms\n";
+
+    const cv::Rect imageRC(0, 0, width, height);
+
+    // 1) Support points + Delaunay (unchanged)
+    T0 = clock::now();
+    std::vector<cv::Point> support2DPoints;
+    acmmp.GetSupportPoints(support2DPoints);
+    auto Tsp = clock::now();
+
+    const auto& triangles = acmmp.DelaunayTriangulation(imageRC, support2DPoints);
+    auto Tdl = clock::now();
+
+    std::cout << "  [timing] GetSupportPoints (" << support2DPoints.size() << " pts): "
+              << ms(T0, Tsp) << " ms\n";
+    std::cout << "  [timing] DelaunayTriangulation (" << triangles.size() << " tris): "
+              << ms(Tsp, Tdl) << " ms\n";
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // 2) OPTIMIZED Plane params per triangle (parallel with atomic counting)
+    // ═══════════════════════════════════════════════════════════════════════════
+    auto Tpp0 = clock::now();
+    std::vector<float4>  planeParams_tri(triangles.size());
+    std::vector<uint8_t> tri_valid(triangles.size(), 0);
+    
+    // Use atomic counter for thread-safe valid triangle counting
+    std::atomic<size_t> valid_tris_atomic{0};
+    
+    // Get optimal number of threads and chunk size
+    const int num_threads = omp_get_max_threads();
+    const size_t chunk_size = std::max(size_t(1), triangles.size() / (num_threads * 4));
+    
+    // Parallel processing with dynamic scheduling for better load balancing
+    #pragma omp parallel for schedule(dynamic, chunk_size)
+    for (size_t i = 0; i < triangles.size(); ++i) {
+        const auto& tr = triangles[i];
+        
+        // Quick bounds check first (cheapest operation)
+        if (!(imageRC.contains(tr.pt1) && imageRC.contains(tr.pt2) && imageRC.contains(tr.pt3))) {
+            tri_valid[i] = 0;
+            planeParams_tri[i] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            continue;
         }
-        std::string triangulation_path = result_folder + "/triangulation.png";
-        cv::imwrite(triangulation_path, srcImage);
-
-        cv::Mat_<float> mask_tri = cv::Mat::zeros(height, width, CV_32FC1);
-        std::vector<float4> planeParams_tri;
-        planeParams_tri.clear();
-
-        uint32_t idx = 0;
-        for (const auto triangle : triangles) {
-            if (imageRC.contains(triangle.pt1) && imageRC.contains(triangle.pt2) && 
-                imageRC.contains(triangle.pt3)) {
-                float L01 = sqrt(pow(triangle.pt1.x - triangle.pt2.x, 2) + 
-                                pow(triangle.pt1.y - triangle.pt2.y, 2));
-                float L02 = sqrt(pow(triangle.pt1.x - triangle.pt3.x, 2) + 
-                                pow(triangle.pt1.y - triangle.pt3.y, 2));
-                float L12 = sqrt(pow(triangle.pt2.x - triangle.pt3.x, 2) + 
-                                pow(triangle.pt2.y - triangle.pt3.y, 2));
-
-                float max_edge_length = std::max(L01, std::max(L02, L12));
-                float step = 1.0 / max_edge_length;
-
-                for (float p = 0; p < 1.0; p += step) {
-                    for (float q = 0; q < 1.0 - p; q += step) {
-                        int x = p * triangle.pt1.x + q * triangle.pt2.x + 
-                               (1.0 - p - q) * triangle.pt3.x;
-                        int y = p * triangle.pt1.y + q * triangle.pt2.y + 
-                               (1.0 - p - q) * triangle.pt3.y;
-                        mask_tri(y, x) = idx + 1.0;
-                    }
-                }
-
-                float4 n4 = acmmp.GetPriorPlaneParams(triangle, depths);
-                planeParams_tri.push_back(n4);
-                idx++;
-            }
+        
+        // Compute plane parameters using optimized function
+        planeParams_tri[i] = acmmp.GetPriorPlaneParams(tr, depths);
+        
+        // Check if plane computation was successful
+        bool is_valid = (planeParams_tri[i].x != 0.0f || planeParams_tri[i].y != 0.0f || 
+                        planeParams_tri[i].z != 0.0f);
+        tri_valid[i] = is_valid ? 1 : 0;
+        
+        // Thread-safe increment of valid triangle counter
+        if (is_valid) {
+            valid_tris_atomic.fetch_add(1, std::memory_order_relaxed);
         }
+    }
+    
+    size_t valid_tris = valid_tris_atomic.load();
+    auto Tpp1 = clock::now();
+    std::cout << "  [timing] PlaneParams (" << valid_tris << " valid tris): "
+              << ms(Tpp0, Tpp1) << " ms [OPTIMIZED]\n";
 
-        cv::Mat_<float> priordepths = cv::Mat::zeros(height, width, CV_32FC1);
-        for (int i = 0; i < width; ++i) {
-            for (int j = 0; j < height; ++j) {
-                if (mask_tri(j, i) > 0) {
-                    float d = acmmp.GetDepthFromPlaneParam(planeParams_tri[mask_tri(j, i) - 1], i, j);
-                    if (d <= acmmp.GetMaxDepth() && d >= acmmp.GetMinDepth()) {
-                        priordepths(j, i) = d;
-                    }
-                    else {
-                        mask_tri(j, i) = 0;
-                    }
-                }
-            }
-        }
+    // 3) Build triangle -> tile map (serial, cheap)
+    auto Tmap0 = clock::now();
+    const int nx = (width  + TILE - 1) / TILE;
+    const int ny = (height + TILE - 1) / TILE;
+    const int num_tiles = nx * ny;
 
-        acmmp.CudaPlanarPriorInitialization(planeParams_tri, mask_tri);
-        acmmp.RunPatchMatch();
+    auto clampi = [](int v, int lo, int hi_excl) { return std::max(lo, std::min(v, hi_excl)); };
 
-        for (int col = 0; col < width; ++col) {
-            for (int row = 0; row < height; ++row) {
-                int center = row * width + col;
-                float4 plane_hypothesis = acmmp.GetPlaneHypothesis(center);
-                depths(row, col) = plane_hypothesis.w;
-                normals(row, col) = cv::Vec3f(plane_hypothesis.x, plane_hypothesis.y, plane_hypothesis.z);
-                costs(row, col) = acmmp.GetCost(center);
+    std::vector<std::vector<int>> tile_tris(num_tiles);
+    tile_tris.shrink_to_fit();
+    for (int i = 0; i < (int)triangles.size(); ++i) {
+        if (!tri_valid[i]) continue;
+        const auto& tr = triangles[i];
+        int minx = std::min({tr.pt1.x, tr.pt2.x, tr.pt3.x});
+        int maxx = std::max({tr.pt1.x, tr.pt2.x, tr.pt3.x});
+        int miny = std::min({tr.pt1.y, tr.pt2.y, tr.pt3.y});
+        int maxy = std::max({tr.pt1.y, tr.pt2.y, tr.pt3.y});
+        // Clip to image (exclusive upper bound for tile indexing)
+        minx = clampi(minx, 0, width);
+        maxx = clampi(maxx, 0, width  - 1);
+        miny = clampi(miny, 0, height);
+        maxy = clampi(maxy, 0, height - 1);
+        if (minx > maxx || miny > maxy) continue;
+
+        int tx0 = minx / TILE;
+        int tx1 = maxx / TILE;
+        int ty0 = miny / TILE;
+        int ty1 = maxy / TILE;
+
+        for (int ty = ty0; ty <= ty1; ++ty) {
+            for (int tx = tx0; tx <= tx1; ++tx) {
+                tile_tris[ty * nx + tx].push_back(i);
             }
         }
     }
+    auto Tmap1 = clock::now();
+    std::cout << "  [timing] Tile map build (" << nx << "x" << ny << " tiles): "
+              << ms(Tmap0, Tmap1) << " ms\n";
+
+    // 4) Parallel rasterization per tile ROI (no overlap between threads)
+    auto Trast0 = clock::now();
+    cv::Mat mask_tri_i(height, width, CV_32SC1, cv::Scalar(0));  // id+1, 0=bg
+
+    cv::parallel_for_(cv::Range(0, num_tiles), [&](const cv::Range& r) {
+        for (int tid = r.start; tid < r.end; ++tid) {
+            const int ty = tid / nx;
+            const int tx = tid % nx;
+            const int x0 = tx * TILE;
+            const int y0 = ty * TILE;
+            const int x1 = std::min(x0 + TILE, width);
+            const int y1 = std::min(y0 + TILE, height);
+            const cv::Rect tileR(x0, y0, x1 - x0, y1 - y0);
+
+            cv::Mat tileView = mask_tri_i(tileR);  // disjoint memory per tile
+
+            // Draw all intersecting triangles into this ROI
+            const auto& lst = tile_tris[tid];
+            for (int idx : lst) {
+                if (!tri_valid[idx]) continue;
+                const auto& tr = triangles[(size_t)idx];
+
+                // Shift points to tile-local coordinates
+                cv::Point pts_local[3] = {
+                    tr.pt1 - tileR.tl(),
+                    tr.pt2 - tileR.tl(),
+                    tr.pt3 - tileR.tl()
+                };
+                // Safe: OpenCV clips polygon to ROI. Exclusive tile bounds avoid races.
+                cv::fillConvexPoly(tileView, pts_local, 3, int(idx + 1), cv::LINE_8, 0);
+            }
+        }
+    });
+    auto Trast1 = clock::now();
+    std::cout << "  [timing] Rasterize (tile-parallel): " << ms(Trast0, Trast1) << " ms\n";
+
+    // Labeled coverage stats
+    auto Tcnt0 = clock::now();
+    cv::Mat1b nzmask;
+    cv::compare(mask_tri_i, 0, nzmask, cv::CMP_NE);
+    int labeled_px = cv::countNonZero(nzmask);
+    auto Tcnt1 = clock::now();
+    std::cout << "  [stats ] Labeled pixels: " << labeled_px << " ("
+              << std::fixed << std::setprecision(2)
+              << (100.0 * double(labeled_px) / double(width * height)) << "%), "
+              << "counted in " << ms(Tcnt0, Tcnt1) << " ms\n";
+
+    // 5) Depth-from-plane (serial; do NOT call ACMMP from multiple threads)
+    auto Td0 = clock::now();
+    cv::Mat priordepths(height, width, CV_32FC1, cv::Scalar(0.0f));
+    const float dmin = acmmp.GetMinDepth();
+    const float dmax = acmmp.GetMaxDepth();
+    for (int y = 0; y < height; ++y) {
+        const int*  lab = mask_tri_i.ptr<int>(y);
+        float*      out = priordepths.ptr<float>(y);
+        for (int x = 0; x < width; ++x) {
+            const int id = lab[x];
+            if (id <= 0) continue;
+            const size_t tix = size_t(id - 1);
+            if (!tri_valid[tix]) continue;
+            const float4& n4 = planeParams_tri[tix];
+            const float d = acmmp.GetDepthFromPlaneParam(n4, x, y);
+            if (d >= dmin && d <= dmax) out[x] = d;
+        }
+    }
+    auto Td1 = clock::now();
+    const double depth_ms = ms(Td0, Td1);
+    const double mpix = labeled_px / 1e6;
+    const double mpix_per_s = (depth_ms > 0.0) ? (mpix / (depth_ms / 1000.0)) : 0.0;
+    std::cout << "  [timing] Depth-from-plane fill: " << depth_ms << " ms  ("
+              << std::fixed << std::setprecision(2) << mpix_per_s << " MPix/s)\n";
+
+    // 6) CUDA prior init + PatchMatch (sync for real timings)
+    auto Tc0 = clock::now();
+    cv::Mat mask_tri_f; mask_tri_i.convertTo(mask_tri_f, CV_32F);
+    acmmp.CudaPlanarPriorInitialization(planeParams_tri, mask_tri_f);
+    cudaDeviceSynchronize();
+    auto Tc1 = clock::now();
+    std::cout << "  [timing] CudaPlanarPriorInitialization: " << ms(Tc0, Tc1) << " ms\n";
+
+    auto Tp0 = clock::now();
+    acmmp.RunPatchMatch();
+    cudaDeviceSynchronize();
+    auto Tp1 = clock::now();
+    std::cout << "  [timing] RunPatchMatch (prior-assisted): " << ms(Tp0, Tp1) << " ms\n";
+
+    // 7) Extract outputs
+    auto Te0 = clock::now();
+    for (int col = 0; col < width; ++col) {
+        for (int row = 0; row < height; ++row) {
+            const int center = row * width + col;
+            const float4 ph = acmmp.GetPlaneHypothesis(center);
+            depths(row, col)  = ph.w;
+            normals(row, col) = cv::Vec3f(ph.x, ph.y, ph.z);
+            costs(row, col)   = acmmp.GetCost(center);
+        }
+    }
+    auto Te1 = clock::now();
+    std::cout << "  [timing] Extract outputs: " << ms(Te0, Te1) << " ms\n";
+
+    auto T_block_end = clock::now();
+    std::cout << "  [timing] Planar-prior TOTAL: " << ms(T_block_start, T_block_end) << " ms\n";
+}
 
     std::string suffix = "/depths.dmb";
     if (geom_consistency) {
@@ -314,6 +700,7 @@ void ProcessProblem(const std::string &dense_folder, const std::vector<Problem> 
     std::cout << "Processing image " << std::setw(8) << std::setfill('0') 
               << problem.ref_image_id << " done!" << std::endl;
 }
+
 void JointBilateralUpsampling(const std::string &dense_folder, const Problem &problem, int acmmp_size)
 {
     std::stringstream result_path;
