@@ -425,56 +425,57 @@ public:
     }
     
     // Parallel preload for a chunk of images
-    void preloadChunkParallel(const std::vector<int>& image_ids) {
-        std::vector<std::future<std::shared_ptr<ImageData>>> futures;
-        std::mutex results_mutex;
-        
-        std::cout << "  Preloading " << image_ids.size() << " images in parallel..." << std::endl;
-        auto start_time = std::chrono::high_resolution_clock::now();
-        
-        // Launch parallel loading tasks
-        for (int image_id : image_ids) {
-            {
-                std::lock_guard<std::mutex> lock(cache_mutex);
-                if (cache.find(image_id) != cache.end()) {
-                    // Already cached, skip
-                    continue;
-                }
-            }
-            
-            // Submit loading task to thread pool
-            auto future = thread_pool->enqueue([this, image_id]() {
-                return loadImageDataSync(image_id);
-            });
-            futures.push_back(std::move(future));
-        }
-        
-        // Collect results and store in cache
-        size_t loaded_count = 0;
-        for (size_t i = 0; i < futures.size(); ++i) {
-            int image_id = image_ids[i];
-            auto data = futures[i].get();
-            
-            if (data && data->valid) {
-                std::lock_guard<std::mutex> lock(cache_mutex);
-                cache[image_id] = data;
-                updateLRU(image_id);
-                loaded_count++;
-            }
-        }
-        
+void preloadChunkParallel(const std::vector<int>& image_ids) {
+    std::vector<std::future<std::shared_ptr<ImageData>>> futures;
+    std::vector<int> images_to_load; // NEW: Track which images we're actually loading
+    std::mutex results_mutex;
+    
+    std::cout << "  Preloading " << image_ids.size() << " images in parallel..." << std::endl;
+    auto start_time = std::chrono::high_resolution_clock::now();
+    
+    // Launch parallel loading tasks
+    for (int image_id : image_ids) {
         {
             std::lock_guard<std::mutex> lock(cache_mutex);
-            trimCache();
+            if (cache.find(image_id) != cache.end()) {
+                // Already cached, skip
+                continue;
+            }
         }
         
-        auto end_time = std::chrono::high_resolution_clock::now();
-        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
-        
-        std::cout << "  Loaded " << loaded_count << "/" << image_ids.size() 
-                  << " images in " << duration.count() << " ms" << std::endl;
+        // Submit loading task to thread pool
+        auto future = thread_pool->enqueue([this, image_id]() {
+            return loadImageDataSync(image_id);
+        });
+        futures.push_back(std::move(future));
+        images_to_load.push_back(image_id); // NEW: Keep track of correspondence
     }
     
+    // Collect results and store in cache
+    size_t loaded_count = 0;
+    for (size_t i = 0; i < futures.size(); ++i) {
+        int image_id = images_to_load[i]; // FIXED: Use correct correspondence
+        auto data = futures[i].get();
+        
+        if (data && data->valid) {
+            std::lock_guard<std::mutex> lock(cache_mutex);
+            cache[image_id] = data;
+            updateLRU(image_id);
+            loaded_count++;
+        }
+    }
+    
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        trimCache();
+    }
+    
+    auto end_time = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
+    
+    std::cout << "  Loaded " << loaded_count << "/" << images_to_load.size() 
+              << " new images in " << duration.count() << " ms" << std::endl;
+}    
     bool getData(int image_id, Camera& cam, cv::Mat_<float>& depth, 
                 cv::Mat_<cv::Vec3f>& normal, cv::Mat& image) {
         std::lock_guard<std::mutex> lock(cache_mutex);
