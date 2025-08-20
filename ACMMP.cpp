@@ -1,4 +1,5 @@
 #include "ACMMP.h"
+#include <cmath>
 
 #include <cstdarg>
 
@@ -245,45 +246,41 @@ void RescaleImageAndCamera(cv::Mat_<cv::Vec3b> &src, cv::Mat_<cv::Vec3b> &dst, c
         camera.K[4] *= scale_y;  camera.K[5] *= scale_y;
     }
 }
-float3 Get3DPointonWorld(int x,
-                         int y,
-                         float depth,
-                         const Camera camera) {
-    // 1) Camera‐space point
-    float3 point_cam;
-    if (camera.model == SPHERE) {
-        // --- FIX 2: Corrected spherical math using cx, cy ---
-        // This generalizes your original code to use the principal point.
-        float lon = (static_cast<float>(x) - camera.params[1]) / static_cast<float>(camera.width) * 2.0f * M_PI;
-        float lat = -(static_cast<float>(y) - camera.params[2]) / static_cast<float>(camera.height) * M_PI;
-        
-        point_cam = make_float3(
-            std::cos(lat) * std::sin(lon) * depth,
-                           -std::sin(lat) * depth,
-            std::cos(lat) * std::cos(lon) * depth
-        );
 
-    } else { // pin-hole
-        point_cam = make_float3(
-          depth * (static_cast<float>(x) - camera.K[2]) / camera.K[0],
-          depth * (static_cast<float>(y) - camera.K[5]) / camera.K[4],
-          depth
-        );
+float3 Get3DPointonWorld(const int x, const int y, const float depth, const Camera camera)
+{
+    // 1) Camera-frame 3D from pixel
+    float3 Xc;
+    if (camera.model == SPHERE) {
+        // ERP -> unit ray (lon, lat), then scale by 'depth' (Euclidean along the ray)
+        const float PI  = 3.14159265358979323846f;
+        const float lon = ( (float)x - camera.params[1] ) / (float)camera.width  * (2.0f * PI);
+        const float lat = -( (float)y - camera.params[2] ) / (float)camera.height * PI;
+
+        const float cos_lat = std::cos(lat);
+        Xc.x =  cos_lat * std::sin(lon) * depth;
+        Xc.y = -std::sin(lat) * depth;
+        Xc.z =  cos_lat * std::cos(lon) * depth;
+    } else { // PINHOLE
+        // Standard pinhole back-projection with depth = Z
+        Xc.x = depth * ( (float)x - camera.K[2] ) / camera.K[0];
+        Xc.y = depth * ( (float)y - camera.K[5] ) / camera.K[4];
+        Xc.z = depth;
     }
 
-    // 2 & 3) World transformation (This part was correct)
-    float3 tmp;
-    tmp.x = camera.R[0]*point_cam.x + camera.R[3]*point_cam.y + camera.R[6]*point_cam.z;
-    tmp.y = camera.R[1]*point_cam.x + camera.R[4]*point_cam.y + camera.R[7]*point_cam.z;
-    tmp.z = camera.R[2]*point_cam.x + camera.R[5]*point_cam.y + camera.R[8]*point_cam.z;
-    
-    float3 C;
-    C.x = -(camera.R[0]*camera.t[0] + camera.R[3]*camera.t[1] + camera.R[6]*camera.t[2]);
-    C.y = -(camera.R[1]*camera.t[0] + camera.R[4]*camera.t[1] + camera.R[7]*camera.t[2]);
-    C.z = -(camera.R[2]*camera.t[0] + camera.R[5]*camera.t[1] + camera.R[8]*camera.t[2]);
+    // 2) cam->world: Xw = R^T * Xc + C, with C = -R^T * t
+    const float Cx = -(camera.R[0]*camera.t[0] + camera.R[1]*camera.t[1] + camera.R[2]*camera.t[2]);
+    const float Cy = -(camera.R[3]*camera.t[0] + camera.R[4]*camera.t[1] + camera.R[5]*camera.t[2]);
+    const float Cz = -(camera.R[6]*camera.t[0] + camera.R[7]*camera.t[1] + camera.R[8]*camera.t[2]);
 
-    return make_float3(tmp.x + C.x, tmp.y + C.y, tmp.z + C.z);
-}   
+    float3 Xw;
+    Xw.x = camera.R[0]*Xc.x + camera.R[3]*Xc.y + camera.R[6]*Xc.z + Cx; // R^T * Xc + C
+    Xw.y = camera.R[1]*Xc.x + camera.R[4]*Xc.y + camera.R[7]*Xc.z + Cy;
+    Xw.z = camera.R[2]*Xc.x + camera.R[5]*Xc.y + camera.R[8]*Xc.z + Cz;
+
+    return Xw;
+}
+
 
 float3 Get3DPointonRefCam(const int x, const int y, const float depth, const Camera camera)
  {
@@ -699,7 +696,7 @@ void ACMMP::CudaSpaceInitialization(const std::string &dense_folder, const Probl
         struct cudaTextureDesc texDesc;
         memset(&texDesc, 0, sizeof(cudaTextureDesc));
         texDesc.addressMode[0] = cudaAddressModeWrap;
-        texDesc.addressMode[1] = cudaAddressModeWrap;
+        texDesc.addressMode[1] = cudaAddressModeClamp;
         texDesc.filterMode = cudaFilterModeLinear;
         texDesc.readMode  = cudaReadModeElementType;
         texDesc.normalizedCoords = 0;
@@ -741,7 +738,7 @@ void ACMMP::CudaSpaceInitialization(const std::string &dense_folder, const Probl
             struct cudaTextureDesc texDesc;
             memset(&texDesc, 0, sizeof(cudaTextureDesc));
             texDesc.addressMode[0] = cudaAddressModeWrap;
-            texDesc.addressMode[1] = cudaAddressModeWrap;
+            texDesc.addressMode[1] = cudaAddressModeClamp;
             texDesc.filterMode = cudaFilterModeLinear;
             texDesc.readMode  = cudaReadModeElementType;
             texDesc.normalizedCoords = 0;
@@ -977,18 +974,26 @@ float4 ACMMP::GetPriorPlaneParams(const Triangle triangle, const cv::Mat_<float>
     A.at<float>(2, 3) = 1.0;
     cv::SVD::solveZ(A, B);
     float4 n4 = make_float4(B.at<float>(0, 0), B.at<float>(1, 0), B.at<float>(2, 0), B.at<float>(3, 0));
-    float norm2 = sqrt(pow(n4.x, 2) + pow(n4.y, 2) + pow(n4.z, 2));
-    if (n4.w < 0) {
-        norm2 *= -1;
-    }
-    n4.x /= norm2;
-    n4.y /= norm2;
-    n4.z /= norm2;
-    n4.w /= norm2;
+    float3 n = make_float3(n4.x, n4.y, n4.z);
+    float  nn = std::sqrt(n.x*n.x + n.y*n.y + n.z*n.z);
+    if (nn > 1e-12f) { n.x/=nn; n.y/=nn; n.z/=nn; n4.w/=nn; }
+    n4.x = n.x; n4.y = n.y; n4.z = n.z;
 
-    return n4;
-}
+    // Ensure positive depth along the triangle centroid ray
+    const int cx = (triangle.pt1.x + triangle.pt2.x + triangle.pt3.x) / 3;
+    const int cy = (triangle.pt1.y + triangle.pt2.y + triangle.pt3.y) / 3;
 
+    float lon = (float(cx) - cameras[0].params[1]) / float(cameras[0].width)  * 2.0f * M_PI;
+    float lat = -(float(cy) - cameras[0].params[2]) / float(cameras[0].height) * M_PI;
+    float3 dir = make_float3(std::cos(lat)*std::sin(lon),
+                            -std::sin(lat),
+                            std::cos(lat)*std::cos(lon));
+    const float denom = n4.x*dir.x + n4.y*dir.y + n4.z*dir.z;
+    if (-n4.w / denom < 0.0f) { n4.x = -n4.x; n4.y = -n4.y; n4.z = -n4.z; n4.w = -n4.w; }
+
+    return n4;}
+
+    
 float ACMMP::GetDepthFromPlaneParam(const float4 plane_hypothesis, const int x, const int y)
 {
     if (cameras[0].model == SPHERE) {
@@ -1033,7 +1038,7 @@ float ACMMP::GetDepthFromPlaneParam(const float4 plane_hypothesis, const int x, 
         struct cudaTextureDesc texDesc;
         memset(&texDesc, 0, sizeof(cudaTextureDesc));
         texDesc.addressMode[0]   = cudaAddressModeWrap;
-        texDesc.addressMode[1]   = cudaAddressModeWrap;
+        texDesc.addressMode[1]   = cudaAddressModeClamp;
         texDesc.filterMode       = cudaFilterModeLinear;
         texDesc.readMode         = cudaReadModeElementType;
         texDesc.normalizedCoords = 0;

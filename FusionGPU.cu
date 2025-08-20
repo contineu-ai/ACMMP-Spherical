@@ -920,7 +920,7 @@ __global__ void ChunkBatchKernel(
         dot_product = fmaxf(-1.0f, fminf(1.0f, dot_product));
         float angle = acosf(dot_product);
         
-        if (reproj_error < 1.0 && relative_depth_diff < 0.005f && angle < 0.05f) {
+        if (reproj_error < 4.0 && relative_depth_diff < 0.015f && angle < 0.12f) {
             point_sum.x += PointX_src.x;
             point_sum.y += PointX_src.y;
             point_sum.z += PointX_src.z;
