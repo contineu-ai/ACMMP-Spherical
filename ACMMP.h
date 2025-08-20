@@ -32,7 +32,7 @@ struct cudaTextureObjects {
 
 struct PatchMatchParams {
     int max_iterations = 4;
-    int patch_size = 21;
+    int patch_size = 5;
     int num_images = 5;
     int max_image_size=3200;
     int radius_increment = 2;

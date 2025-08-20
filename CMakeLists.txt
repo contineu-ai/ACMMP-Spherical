@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.8)
 project(ACMMP LANGUAGES CXX CUDA)
 
 # ─── CUDA Architecture Settings ─────────────────────────────────────
-set(CMAKE_CUDA_ARCHITECTURES 52 86 89)
+set(CMAKE_CUDA_ARCHITECTURES  86 89)
 
 # ─── C++ Standard ───────────────────────────────────────────────────
 set(CMAKE_CXX_STANDARD 11)
