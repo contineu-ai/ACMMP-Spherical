@@ -59,7 +59,7 @@ class ACMMP {
 public:
     ACMMP();
     ~ACMMP();
-
+    void SetStream(cudaStream_t s) { stream_ = s; }
     void InuputInitialization(const std::string &dense_folder, const std::vector<Problem> &problem, const int idx);
     void Colmap2MVS(const std::string &dense_folder, std::vector<Problem> &problems);
     void CudaSpaceInitialization(const std::string &dense_folder, const Problem &problem);
@@ -81,6 +81,7 @@ public:
     float GetMaxDepth();
     void CudaPlanarPriorInitialization(const std::vector<float4> &PlaneParams, const cv::Mat_<float> &masks);
 private:
+    cudaStream_t stream_ = 0; // default stream
     int num_images;
     std::vector<cv::Mat> images;
     std::vector<cv::Mat> depths;

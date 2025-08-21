@@ -34,11 +34,13 @@ set(CUDA_SOURCES
     ACMMP.cu
     FusionGPU.cu
     SphericalLUT_MultiRes.cu
+    BatchACMMP.cu
 )
 
 set(CXX_SOURCES
     main.cpp
     ACMMP.cpp
+    
 )
 
 set(HEADERS
@@ -47,6 +49,7 @@ set(HEADERS
     ACMMP_device.cuh
     FusionGPU.h
     SphericalLUT_MultiRes.h
+    BatchACMMP.h
 )
 
 # ─── Create Executable ──────────────────────────────────────────────
