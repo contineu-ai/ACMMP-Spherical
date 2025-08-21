@@ -7,12 +7,12 @@
 
 // ---------- ProblemGPUResources impl ----------
 ProblemGPUResources::ProblemGPUResources() {
-    // zero-init arrays
     for (int i = 0; i < MAX_IMAGES; ++i) {
         cuArray[i] = nullptr;
         cuDepthArray[i] = nullptr;
     }
 }
+
 ProblemGPUResources::~ProblemGPUResources() { cleanup(); }
 
 void ProblemGPUResources::cleanup() {
@@ -38,8 +38,6 @@ void ProblemGPUResources::cleanup() {
 
     if (planes_host_pinned) { CUDA_CHECK(cudaFreeHost(planes_host_pinned)); planes_host_pinned = nullptr; }
     if (costs_host_pinned)  { CUDA_CHECK(cudaFreeHost(costs_host_pinned));  costs_host_pinned  = nullptr; }
-
-    // We don't destroy the stream here; BatchACMMP owns it.
 }
 
 // ---------- BatchACMMP impl ----------
@@ -48,16 +46,16 @@ BatchACMMP::BatchACMMP(const std::string& dense_folder_,
                        const std::vector<Problem>& problems,
                        bool geom_consistency_,
                        bool planar_prior_,
-                       bool hierarchy_)
+                       bool hierarchy_,
+                       bool multi_geometry_)
     : dense_folder(dense_folder_), all_problems(problems),
       geom_consistency(geom_consistency_), planar_prior(planar_prior_),
-      hierarchy(hierarchy_), multi_geometry(false)
+      hierarchy(hierarchy_), multi_geometry(multi_geometry_)
 {
     // Device props
     cudaDeviceProp prop{};
     CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
 
-    // concurrent kernels?
     int concurrentKernels = 0;
     CUDA_CHECK(cudaDeviceGetAttribute(&concurrentKernels, cudaDevAttrConcurrentKernels, 0));
 
@@ -65,13 +63,10 @@ BatchACMMP::BatchACMMP(const std::string& dense_folder_,
     memory_per_problem   = problems.empty() ? (size_t)500 * 1024 * 1024
                                             : estimateMemoryPerProblem(problems[0]);
 
-    // Reserve 20% headroom
     const size_t usable = size_t(double(available_gpu_memory) * 0.8);
     size_t by_mem = std::max<size_t>(1, usable / std::max<size_t>(memory_per_problem, 1));
-
-    // A practical cap: streams ~ SM count/2 if kernels are heavy, otherwise 8-12 is typical.
     size_t by_sm = (prop.multiProcessorCount > 0) ? std::max<size_t>(1, prop.multiProcessorCount / 2) : 8;
-    size_t cap   = concurrentKernels ? 16 : 1; // if device can't overlap, force 1
+    size_t cap   = concurrentKernels ? 16 : 1;
 
     max_concurrent_problems = std::min<size_t>(std::min(by_mem, by_sm), cap);
     if (max_concurrent_problems == 0) max_concurrent_problems = 1;
@@ -82,8 +77,9 @@ BatchACMMP::BatchACMMP(const std::string& dense_folder_,
               << std::endl;
 
     initializeResourcePool();
+    initializeIOThreads();
 
-    // Launch exactly one worker per stream (more just burns CPU)
+    // Launch worker threads
     worker_threads.reserve(max_concurrent_problems);
     for (size_t i = 0; i < max_concurrent_problems; ++i) {
         worker_threads.emplace_back(&BatchACMMP::workerFunction, this);
@@ -91,27 +87,117 @@ BatchACMMP::BatchACMMP(const std::string& dense_folder_,
 }
 
 BatchACMMP::~BatchACMMP() {
-    // Stop accepting work
+    // Stop processing
     stopping_.store(true);
     queue_cv_.notify_all();
     resource_cv_.notify_all();
 
+    // Stop I/O
+    io_stopping_.store(true);
+    io_cv_.notify_all();
+
+    // Join all threads
     for (auto& t : worker_threads) {
         if (t.joinable()) t.join();
     }
+    for (auto& t : io_threads_) {
+        if (t.joinable()) t.join();
+    }
 
-    // Clean up resources (streams last)
+    // Clean up resources
     for (auto& res : resource_pool) res.reset();
-
     for (auto& s : streams) {
         if (s) CUDA_CHECK(cudaStreamDestroy(s));
     }
 }
 
-void BatchACMMP::setMaxConcurrentProblems(size_t max_problems) {
-    // No dynamic shrink/grow implemented for simplicity.
-    // You can wire this to rebuild the pool if needed.
-    (void)max_problems;
+void BatchACMMP::initializeIOThreads(size_t num_io_threads) {
+    io_threads_.reserve(num_io_threads);
+    for (size_t i = 0; i < num_io_threads; ++i) {
+        io_threads_.emplace_back(&BatchACMMP::ioWorkerFunction, this);
+    }
+}
+
+void BatchACMMP::ioWorkerFunction() {
+    while (!io_stopping_.load()) {
+        ProcessedResult result;
+        bool has_work = false;
+
+        // Wait for I/O work
+        {
+            std::unique_lock<std::mutex> lk(io_mutex_);
+            io_cv_.wait(lk, [&]{
+                return io_stopping_.load() || !io_queue_.empty();
+            });
+            if (io_stopping_.load() && io_queue_.empty()) break;
+            
+            if (!io_queue_.empty()) {
+                result = std::move(io_queue_.front());
+                io_queue_.pop();
+                has_work = true;
+            }
+        }
+
+        if (has_work) {
+            // Process result using callback or default file writing
+            const Problem& problem = all_problems[result.problem_idx];
+            
+            // Convert to OpenCV format
+            cv::Mat_<float> depths(result.height, result.width, 0.0f);
+            cv::Mat_<cv::Vec3f> normals(result.height, result.width, cv::Vec3f(0,0,0));
+            cv::Mat_<float> costs(result.height, result.width, 0.0f);
+
+            const int W = result.width, H = result.height;
+            for (int y = 0; y < H; ++y) {
+                float* drow = depths.ptr<float>(y);
+                cv::Vec3f* nrow = normals.ptr<cv::Vec3f>(y);
+                float* crow = costs.ptr<float>(y);
+                for (int x = 0; x < W; ++x) {
+                    const int i = y * W + x;
+                    const float4 ph = result.planes[i];
+                    drow[x] = ph.w;
+                    nrow[x] = cv::Vec3f(ph.x, ph.y, ph.z);
+                    crow[x] = result.costs[i];
+                }
+            }
+
+            // Use callback if provided, otherwise default file writing
+            if (result_callback_) {
+                result_callback_(result.problem_idx, depths, normals, costs);
+            } else {
+                // Default file writing
+                std::stringstream result_path;
+                result_path << dense_folder << "/ACMMP" << "/2333_" << std::setw(8) 
+                           << std::setfill('0') << problem.ref_image_id;
+                std::string result_folder = result_path.str();
+                
+                // Ensure directory exists
+                create_directories_recursive(result_folder);
+                
+                std::string suffix = geom_consistency ? "/depths_geom.dmb" : "/depths.dmb";
+                std::string depth_path = result_folder + suffix;
+                std::string normal_path = result_folder + "/normals.dmb";
+                std::string cost_path = result_folder + "/costs.dmb";
+                
+                writeDepthDmb(depth_path, depths);
+                writeNormalDmb(normal_path, normals);
+                writeDepthDmb(cost_path, costs);
+            }
+
+            int written = problems_written_.fetch_add(1) + 1;
+            if (written % 10 == 0) {
+                std::cout << "[I/O] Written " << written << "/" << problems_enqueued_.load() << " results\n";
+            }
+        }
+    }
+}
+
+void BatchACMMP::enqueueResult(ProcessedResult&& result) {
+    {
+        std::lock_guard<std::mutex> lk(io_mutex_);
+        io_queue_.push(std::move(result));
+    }
+    io_cv_.notify_one();
 }
 
 size_t BatchACMMP::estimateMemoryPerProblem(const Problem& problem) {
@@ -124,20 +210,14 @@ size_t BatchACMMP::estimateMemoryPerProblem(const Problem& problem) {
     const size_t W = cam.width, H = cam.height;
     const size_t N = 1 + problem.src_image_ids.size();
 
-    // Be a bit more explicit with channels; assume float textures, and a couple of aux buffers.
-    const size_t bytes_image   = W * H * sizeof(float);           // grayscale (adjust if RGBA)
+    const size_t bytes_image   = W * H * sizeof(float);
     const size_t bytes_plane4  = W * H * sizeof(float4);
     const size_t bytes_float   = W * H * sizeof(float);
 
-    size_t textures = N * bytes_image               // images
-                    + N * bytes_float;              // depths (if used)
+    size_t textures = N * bytes_image + N * bytes_float;
+    size_t working  = 2*bytes_plane4 + 2*bytes_float + bytes_float;
+    size_t misc     = W * H * (sizeof(curandState) + sizeof(unsigned int));
 
-    size_t working  = 2*bytes_plane4                // hypotheses + scaled
-                    + 2*bytes_float                 // cost + pre_cost
-                    + bytes_float;                  // depths
-    size_t misc     = W * H * (sizeof(curandState) + sizeof(unsigned int)); // RNG + selected_views
-
-    // Round up a little
     return (textures + working + misc) + (64 * 1024 * 1024);
 }
 
@@ -153,12 +233,11 @@ void BatchACMMP::initializeResourcePool() {
 
     int prio_low=0, prio_high=0;
     CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&prio_low, &prio_high));
-    // prio_high is numerically highest priority (smallest value).
+    
     for (size_t i = 0; i < max_concurrent_problems; ++i) {
         CUDA_CHECK(cudaStreamCreateWithPriority(&streams[i], cudaStreamNonBlocking, prio_high));
 
         std::unique_ptr<ProblemGPUResources> res(new ProblemGPUResources());
-
         res->stream_id = (int)i;
         res->stream    = streams[i];
 
@@ -213,7 +292,7 @@ void BatchACMMP::workerFunction() {
     while (!stopping_.load()) {
         int idx = -1;
 
-        // wait for work
+        // Wait for work
         {
             std::unique_lock<std::mutex> lk(queue_mutex_);
             queue_cv_.wait(lk, [&]{
@@ -225,14 +304,13 @@ void BatchACMMP::workerFunction() {
         }
 
         auto* res = acquireResources();
-        if (!res) break; // stopping
+        if (!res) break;
 
         processProblemOnStream(idx, res);
         releaseResources(res);
 
         int done = problems_completed_.fetch_add(1) + 1;
         if (done == problems_enqueued_.load()) {
-            // Wake up waiters
             queue_cv_.notify_all();
         }
     }
@@ -249,82 +327,53 @@ void BatchACMMP::processProblemOnStream(int problem_idx, ProblemGPUResources* re
     if (geom_consistency) acmmp.SetGeomConsistencyParams(multi_geometry);
     if (hierarchy)        acmmp.SetHierarchyParams();
 
-    // *** CRITICAL: make ACMMP use our stream (see tiny hook below) ***
     acmmp.SetStream(stream);
-
     acmmp.InuputInitialization(dense_folder, all_problems, problem_idx);
     acmmp.CudaSpaceInitialization(dense_folder, problem);
-    acmmp.RunPatchMatch();   // should enqueue work on 'stream'
+    acmmp.RunPatchMatch();
 
-    // Ensure device work for this problem is done before reading results
+    // Synchronize stream for this specific problem
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     const int width  = acmmp.GetReferenceImageWidth();
     const int height = acmmp.GetReferenceImageHeight();
 
-    std::vector<float4> planes(size_t(width) * size_t(height));
-    std::vector<float>  costs(size_t(width) * size_t(height));
+    // Create result and immediately enqueue for I/O
+    ProcessedResult result;
+    result.problem_idx = problem_idx;
+    result.width = width;
+    result.height = height;
+    result.planes.resize(size_t(width) * size_t(height));
+    result.costs.resize(size_t(width) * size_t(height));
 
-    // If your ACMMP has bulk getters, prefer those; otherwise fall back to per-pixel.
-    // (Consider adding acmmp.CopyOutputsToHost(planes.data(), costs.data()) for speed.)
+    // Extract results efficiently
     for (int y = 0; y < height; ++y) {
         for (int x = 0; x < width; ++x) {
             const int c = y * width + x;
-            planes[c] = acmmp.GetPlaneHypothesis(c);
-            costs[c]  = acmmp.GetCost(c);
+            result.planes[c] = acmmp.GetPlaneHypothesis(c);
+            result.costs[c]  = acmmp.GetCost(c);
         }
     }
 
-    {
-        std::lock_guard<std::mutex> lk(results_mutex_);
-        StoredResult& slot = results_[problem_idx];
-        slot.width  = width;
-        slot.height = height;
-        slot.planes = std::move(planes);
-        slot.costs  = std::move(costs);
-    }
+    // Immediately enqueue for I/O processing
+    enqueueResult(std::move(result));
 }
 
 void BatchACMMP::waitForCompletion() {
+    // Wait for processing to complete
     std::unique_lock<std::mutex> lk(queue_mutex_);
     queue_cv_.wait(lk, [&]{
         return problems_completed_.load() >= problems_enqueued_.load();
     });
-    // Stream sync for safety
+    
+    // Wait for I/O to complete
+    while (problems_written_.load() < problems_enqueued_.load()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    
+    // Final stream sync for safety
     for (auto& s : streams) CUDA_CHECK(cudaStreamSynchronize(s));
-}
-
-void BatchACMMP::extractResults(int problem_idx,
-                                cv::Mat_<float>& depths,
-                                cv::Mat_<cv::Vec3f>& normals,
-                                cv::Mat_<float>& costs) {
-    StoredResult res;
-    {
-        std::lock_guard<std::mutex> lk(results_mutex_);
-        auto it = results_.find(problem_idx);
-        if (it == results_.end()) {
-            depths.release(); normals.release(); costs.release();
-            std::cerr << "[BatchACMMP] No result for problem " << problem_idx << "\n";
-            return;
-        }
-        res = it->second; // copy metadata and vectors
-    }
-
-    depths  = cv::Mat_<float>(res.height, res.width, 0.0f);
-    normals = cv::Mat_<cv::Vec3f>(res.height, res.width, cv::Vec3f(0,0,0));
-    costs   = cv::Mat_<float>(res.height, res.width, 0.0f);
-
-    const int W = res.width, H = res.height;
-    for (int y = 0; y < H; ++y) {
-        float* drow = depths.ptr<float>(y);
-        cv::Vec3f* nrow = normals.ptr<cv::Vec3f>(y);
-        float* crow = costs.ptr<float>(y);
-        for (int x = 0; x < W; ++x) {
-            const int i = y * W + x;
-            const float4 ph = res.planes[i];
-            drow[x] = ph.w;
-            nrow[x] = cv::Vec3f(ph.x, ph.y, ph.z);
-            crow[x] = res.costs[i];
-        }
-    }
+    
+    std::cout << "[BatchACMMP] All " << problems_enqueued_.load() 
+              << " problems processed and written.\n";
 }

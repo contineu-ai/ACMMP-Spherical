@@ -5,6 +5,8 @@
 #include <chrono>
 #include <omp.h>
 #include <atomic>   // Add this for atomic operations
+#include <filesystem>
+
 #include "BatchACMMP.h"
 void GenerateSampleList(const std::string &dense_folder, std::vector<Problem> &problems)
 {
@@ -134,7 +136,7 @@ void InitializeLUTsForAllResolutions(const std::string &dense_folder,
 int ComputeMultiScaleSettings(const std::string &dense_folder, std::vector<Problem> &problems)
 {
     int max_num_downscale = -1;
-    int size_bound = 350;
+    int size_bound = 799;
     PatchMatchParams pmp;
     std::string image_folder = dense_folder + std::string("/images");
 
@@ -421,6 +423,18 @@ int ComputeMultiScaleSettings(const std::string &dense_folder, std::vector<Probl
 //     std::cout << "Processing image " << std::setw(8) << std::setfill('0') 
 //               << problem.ref_image_id << " done!" << std::endl;
 // }
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <cerrno>
+#include <cstring>
+
+static inline void ensure_dir(const std::string& path) {
+    if (::mkdir(path.c_str(), 0777) != 0) {
+        if (errno != EEXIST) {
+            std::cerr << "mkdir(" << path << ") failed: " << std::strerror(errno) << "\n";
+        }
+    }
+}
 
 void ProcessProblem(const std::string &dense_folder, const std::vector<Problem> &problems, 
                    const int idx, bool geom_consistency, bool planar_prior, 
@@ -730,62 +744,76 @@ void JointBilateralUpsampling(const std::string &dense_folder, const Problem &pr
     RunJBU(scaled_image_float, ref_depth, dense_folder, problem );
 }
 
+
+
 void ProcessProblemsInParallel(const std::string &dense_folder, 
-                               std::vector<Problem> &problems,
-                               bool geom_consistency,
-                               bool planar_prior,
-                               bool hierarchy,
-                               bool multi_geometry = false) {
+                                        std::vector<Problem> &problems,
+                                        bool geom_consistency,
+                                        bool planar_prior,
+                                        bool hierarchy,
+                                        bool multi_geometry = false) {
     
     std::cout << "\n========================================" << std::endl;
-    std::cout << "Starting Parallel GPU Processing" << std::endl;
+    std::cout << "Starting Optimized Parallel GPU Processing" << std::endl;
+    std::cout << "Mode: geom=" << geom_consistency << " planar=" << planar_prior 
+              << " hierarchy=" << hierarchy << " multi_geo=" << multi_geometry << std::endl;
     std::cout << "========================================" << std::endl;
     
     auto start_time = std::chrono::high_resolution_clock::now();
     
-    // Create batch processor
+    // Create batch processor with streaming I/O
     BatchACMMP batch_processor(dense_folder, problems, 
-                               geom_consistency, planar_prior, hierarchy);
+                               geom_consistency, planar_prior, hierarchy, multi_geometry);
     
-    // Process all problems in parallel
+    // Optional: Set custom result callback for specialized processing
+    batch_processor.setResultCallback([&](int problem_idx, 
+                                          const cv::Mat_<float>& depths,
+                                          const cv::Mat_<cv::Vec3f>& normals,
+                                          const cv::Mat_<float>& costs) {
+        const Problem& problem = problems[problem_idx];
+        
+        // Create output directory
+        std::stringstream result_path;
+        result_path << dense_folder << "/ACMMP" << "/2333_" << std::setw(8) 
+                    << std::setfill('0') << problem.ref_image_id;
+        std::string result_folder = result_path.str();
+        create_directories_recursive(result_folder);
+        
+        // Determine file suffix based on processing mode
+        std::string suffix = geom_consistency ? "/depths_geom.dmb" : "/depths.dmb";
+        std::string depth_path = result_folder + suffix;
+        std::string normal_path = result_folder + "/normals.dmb";
+        std::string cost_path = result_folder + "/costs.dmb";
+        
+        // Write files with error checking
+        try {
+            writeDepthDmb(depth_path, depths);
+            writeNormalDmb(normal_path, normals);
+            writeDepthDmb(cost_path, costs);
+            
+            std::cout << "[I/O] Completed writing results for image " 
+                      << std::setw(8) << std::setfill('0') << problem.ref_image_id << std::endl;
+        } catch (const std::exception& e) {
+            std::cerr << "[ERROR] Failed to write results for problem " << problem_idx 
+                      << ": " << e.what() << std::endl;
+        }
+    });
+    
+    // Process all problems (results are written immediately as they complete)
     batch_processor.processAllProblems();
     
-    // Wait for completion
+    // Wait for all processing and I/O to complete
     batch_processor.waitForCompletion();
     
     auto end_time = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::seconds>(end_time - start_time);
     
     std::cout << "\n========================================" << std::endl;
-    std::cout << "Parallel Processing Complete!" << std::endl;
+    std::cout << "Optimized Parallel Processing Complete!" << std::endl;
     std::cout << "Total time: " << duration.count() << " seconds" << std::endl;
+    std::cout << "Average time per problem: " 
+              << (duration.count() / (double)problems.size()) << " seconds" << std::endl;
     std::cout << "========================================\n" << std::endl;
-    
-    // Now extract and save results for each problem
-    #pragma omp parallel for
-    for (size_t i = 0; i < problems.size(); ++i) {
-        const Problem& problem = problems[i];
-        
-        std::stringstream result_path;
-        result_path << dense_folder << "/ACMMP" << "/2333_" << std::setw(8) 
-                    << std::setfill('0') << problem.ref_image_id;
-        std::string result_folder = result_path.str();
-        
-        cv::Mat_<float> depths;
-        cv::Mat_<cv::Vec3f> normals;
-        cv::Mat_<float> costs;
-        
-        batch_processor.extractResults(i, depths, normals, costs);
-        
-        std::string suffix = geom_consistency ? "/depths_geom.dmb" : "/depths.dmb";
-        std::string depth_path = result_folder + suffix;
-        std::string normal_path = result_folder + "/normals.dmb";
-        std::string cost_path = result_folder + "/costs.dmb";
-        
-        writeDepthDmb(depth_path, depths);
-        writeNormalDmb(normal_path, normals);
-        writeDepthDmb(cost_path, costs);
-    }
 }
 
 int main(int argc, char** argv)
