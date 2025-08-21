@@ -132,6 +132,7 @@ void BatchACMMP::ioWorkerFunction() {
             if (io_stopping_.load() && io_queue_.empty()) break;
             
             if (!io_queue_.empty()) {
+                // CRITICAL: Move the entire result to avoid shared references
                 result = std::move(io_queue_.front());
                 io_queue_.pop();
                 has_work = true;
@@ -139,59 +140,91 @@ void BatchACMMP::ioWorkerFunction() {
         }
 
         if (has_work) {
-            // Process result using callback or default file writing
-            const Problem& problem = all_problems[result.problem_idx];
-            
-            // Convert to OpenCV format
-            cv::Mat_<float> depths(result.height, result.width, 0.0f);
-            cv::Mat_<cv::Vec3f> normals(result.height, result.width, cv::Vec3f(0,0,0));
-            cv::Mat_<float> costs(result.height, result.width, 0.0f);
-
-            const int W = result.width, H = result.height;
-            for (int y = 0; y < H; ++y) {
-                float* drow = depths.ptr<float>(y);
-                cv::Vec3f* nrow = normals.ptr<cv::Vec3f>(y);
-                float* crow = costs.ptr<float>(y);
-                for (int x = 0; x < W; ++x) {
-                    const int i = y * W + x;
-                    const float4 ph = result.planes[i];
-                    drow[x] = ph.w;
-                    nrow[x] = cv::Vec3f(ph.x, ph.y, ph.z);
-                    crow[x] = result.costs[i];
+            try {
+                const Problem& problem = all_problems[result.problem_idx];
+                
+                // Ensure dimensions are valid
+                if (result.width <= 0 || result.height <= 0) {
+                    std::cerr << "[I/O] Invalid dimensions for problem " << result.problem_idx 
+                              << ": " << result.width << "x" << result.height << std::endl;
+                    continue;
                 }
-            }
-
-            // Use callback if provided, otherwise default file writing
-            if (result_callback_) {
-                result_callback_(result.problem_idx, depths, normals, costs);
-            } else {
-                // Default file writing
-                std::stringstream result_path;
-                result_path << dense_folder << "/ACMMP" << "/2333_" << std::setw(8) 
-                           << std::setfill('0') << problem.ref_image_id;
-                std::string result_folder = result_path.str();
                 
-                // Ensure directory exists
-                create_directories_recursive(result_folder);
+                const int W = result.width, H = result.height;
+                const size_t expected_size = size_t(W) * size_t(H);
                 
-                std::string suffix = geom_consistency ? "/depths_geom.dmb" : "/depths.dmb";
-                std::string depth_path = result_folder + suffix;
-                std::string normal_path = result_folder + "/normals.dmb";
-                std::string cost_path = result_folder + "/costs.dmb";
+                // Validate data sizes
+                if (result.planes.size() != expected_size || result.costs.size() != expected_size) {
+                    std::cerr << "[I/O] Data size mismatch for problem " << result.problem_idx 
+                              << ": expected " << expected_size 
+                              << ", got planes=" << result.planes.size() 
+                              << ", costs=" << result.costs.size() << std::endl;
+                    continue;
+                }
                 
-                writeDepthDmb(depth_path, depths);
-                writeNormalDmb(normal_path, normals);
-                writeDepthDmb(cost_path, costs);
-            }
-
-            int written = problems_written_.fetch_add(1) + 1;
-            if (written % 10 == 0) {
-                std::cout << "[I/O] Written " << written << "/" << problems_enqueued_.load() << " results\n";
+                // Create output matrices with proper initialization
+                cv::Mat_<float> depths(H, W);
+                cv::Mat_<cv::Vec3f> normals(H, W);
+                cv::Mat_<float> costs(H, W);
+                
+                // Safe parallel copy with bounds checking
+                #pragma omp parallel for schedule(static) collapse(2)
+                for (int y = 0; y < H; ++y) {
+                    for (int x = 0; x < W; ++x) {
+                        const int i = y * W + x;
+                        if (i < expected_size) {  // Extra safety check
+                            const float4& ph = result.planes[i];
+                            depths(y, x) = ph.w;
+                            normals(y, x) = cv::Vec3f(ph.x, ph.y, ph.z);
+                            costs(y, x) = result.costs[i];
+                        }
+                    }
+                }
+                
+                // Use callback if provided, otherwise default file writing
+                if (result_callback_) {
+                    result_callback_(result.problem_idx, depths, normals, costs);
+                } else {
+                    // Default file writing with error handling
+                    std::stringstream result_path;
+                    result_path << dense_folder << "/ACMMP" << "/2333_" << std::setw(8) 
+                               << std::setfill('0') << problem.ref_image_id;
+                    std::string result_folder = result_path.str();
+                    
+                    // Ensure directory exists
+                    create_directories_recursive(result_folder);
+                    
+                    std::string suffix = geom_consistency ? "/depths_geom.dmb" : "/depths.dmb";
+                    std::string depth_path = result_folder + suffix;
+                    std::string normal_path = result_folder + "/normals.dmb";
+                    std::string cost_path = result_folder + "/costs.dmb";
+                    
+                    // Write with error checking
+                    if (writeDepthDmb(depth_path, depths) != 0) {
+                        std::cerr << "[I/O] Failed to write depth for problem " << result.problem_idx << std::endl;
+                    }
+                    if (writeNormalDmb(normal_path, normals) != 0) {
+                        std::cerr << "[I/O] Failed to write normals for problem " << result.problem_idx << std::endl;
+                    }
+                    if (writeDepthDmb(cost_path, costs) != 0) {
+                        std::cerr << "[I/O] Failed to write costs for problem " << result.problem_idx << std::endl;
+                    }
+                }
+                
+                int written = problems_written_.fetch_add(1) + 1;
+                if (written % 10 == 0) {
+                    std::cout << "[I/O] Written " << written << "/" << problems_enqueued_.load() << " results\n";
+                }
+                
+            } catch (const std::exception& e) {
+                std::cerr << "[I/O] Exception processing result " << result.problem_idx 
+                          << ": " << e.what() << std::endl;
+            } catch (...) {
+                std::cerr << "[I/O] Unknown exception processing result " << result.problem_idx << std::endl;
             }
         }
     }
 }
-
 void BatchACMMP::enqueueResult(ProcessedResult&& result) {
     {
         std::lock_guard<std::mutex> lk(io_mutex_);
@@ -252,19 +285,33 @@ ProblemGPUResources* BatchACMMP::acquireResources() {
         return !available_resources.empty() || stopping_.load();
     });
     if (stopping_.load()) return nullptr;
+    
     auto* r = available_resources.front();
     available_resources.pop();
+    
+    // CRITICAL: Ensure previous operations on this resource are complete
+    if (r && r->stream) {
+        CUDA_CHECK(cudaStreamSynchronize(r->stream));
+    }
+    
     return r;
 }
 
 void BatchACMMP::releaseResources(ProblemGPUResources* r) {
     if (!r) return;
+    
+    // Ensure all operations on this stream are complete
+    if (r->stream) {
+        CUDA_CHECK(cudaStreamSynchronize(r->stream));
+    }
+    
     {
         std::lock_guard<std::mutex> lk(resource_mutex_);
         available_resources.push(r);
     }
     resource_cv_.notify_one();
 }
+
 
 void BatchACMMP::processAllProblems() {
     {
@@ -323,39 +370,60 @@ void BatchACMMP::processProblemOnStream(int problem_idx, ProblemGPUResources* re
     std::cout << "[S" << resources->stream_id << "] Problem " << problem_idx
               << " (ref " << problem.ref_image_id << ")\n";
 
-    ACMMP acmmp;
-    if (geom_consistency) acmmp.SetGeomConsistencyParams(multi_geometry);
-    if (hierarchy)        acmmp.SetHierarchyParams();
+    // Use heap allocation to control ACMMP lifetime
+    std::unique_ptr<ACMMP> acmmp(new ACMMP());
+    
+    if (geom_consistency) acmmp->SetGeomConsistencyParams(multi_geometry);
+    if (hierarchy)        acmmp->SetHierarchyParams();
 
-    acmmp.SetStream(stream);
-    acmmp.InuputInitialization(dense_folder, all_problems, problem_idx);
-    acmmp.CudaSpaceInitialization(dense_folder, problem);
-    acmmp.RunPatchMatch();
+    acmmp->SetStream(stream);
+    acmmp->InuputInitialization(dense_folder, all_problems, problem_idx);
+    acmmp->CudaSpaceInitialization(dense_folder, problem);
+    acmmp->RunPatchMatch();
 
-    // Synchronize stream for this specific problem
+    // CRITICAL: Full synchronization before accessing results
     CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaDeviceSynchronize()); // Extra safety
+    
+    const int width  = acmmp->GetReferenceImageWidth();
+    const int height = acmmp->GetReferenceImageHeight();
 
-    const int width  = acmmp.GetReferenceImageWidth();
-    const int height = acmmp.GetReferenceImageHeight();
-
-    // Create result and immediately enqueue for I/O
+    // Create result with pre-allocated memory
     ProcessedResult result;
     result.problem_idx = problem_idx;
     result.width = width;
     result.height = height;
-    result.planes.resize(size_t(width) * size_t(height));
-    result.costs.resize(size_t(width) * size_t(height));
+    
+    const size_t total_pixels = size_t(width) * size_t(height);
+    result.planes.resize(total_pixels);
+    result.costs.resize(total_pixels);
 
-    // Extract results efficiently
+    // CRITICAL: Copy all data while ACMMP is still alive
+    // Use temporary buffers to ensure complete copy
+    std::vector<float4> temp_planes(total_pixels);
+    std::vector<float> temp_costs(total_pixels);
+    
+    // Batch copy for better performance
+    #pragma omp parallel for schedule(static)
     for (int y = 0; y < height; ++y) {
         for (int x = 0; x < width; ++x) {
             const int c = y * width + x;
-            result.planes[c] = acmmp.GetPlaneHypothesis(c);
-            result.costs[c]  = acmmp.GetCost(c);
+            temp_planes[c] = acmmp->GetPlaneHypothesis(c);
+            temp_costs[c] = acmmp->GetCost(c);
         }
     }
-
-    // Immediately enqueue for I/O processing
+    
+    // Now safe to move data to result
+    result.planes = std::move(temp_planes);
+    result.costs = std::move(temp_costs);
+    
+    // Ensure all GPU operations are complete before destroying ACMMP
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    
+    // Explicitly destroy ACMMP before enqueueing result
+    acmmp.reset();
+    
+    // Now safe to enqueue result for I/O
     enqueueResult(std::move(result));
 }
 
