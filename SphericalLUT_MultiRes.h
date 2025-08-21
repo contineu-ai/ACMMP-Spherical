@@ -1,3 +1,4 @@
+// SphericalLUT_MultiRes.h - Enhanced version
 #ifndef SPHERICAL_LUT_MULTIRESO_H
 #define SPHERICAL_LUT_MULTIRESO_H
 
@@ -19,23 +20,26 @@ struct ResolutionKey {
         if (cx != other.cx) return cx < other.cx;
         return cy < other.cy;
     }
-    
-    bool operator==(const ResolutionKey& other) const {
-        return width == other.width && height == other.height &&
-               std::abs(cx - other.cx) < 0.01f && std::abs(cy - other.cy) < 0.01f;
-    }
 };
 
-// Single resolution LUT
+// Enhanced LUT with both forward and inverse projections
 struct SphericalLUT {
     // Forward projection tables (pixel to direction)
     float3* d_dir_vectors;      // Direction vectors for each pixel
-    float* d_sin_lat;           // Precomputed sin(latitude) for each pixel
-    float* d_cos_lat;           // Precomputed cos(latitude) for each pixel
-    float* d_sin_lon;           // Precomputed sin(longitude) for each pixel
-    float* d_cos_lon;           // Precomputed cos(longitude) for each pixel
-    float* d_lon_values;        // Longitude values for each pixel
-    float* d_lat_values;        // Latitude values for each pixel
+    float* d_sin_lat;           // Precomputed sin(latitude)
+    float* d_cos_lat;           // Precomputed cos(latitude)
+    float* d_sin_lon;           // Precomputed sin(longitude)
+    float* d_cos_lon;           // Precomputed cos(longitude)
+    
+    // NEW: Inverse projection tables (direction to pixel)
+    float* d_inv_x_table;       // Precomputed x pixel coordinates
+    float* d_inv_y_table;       // Precomputed y pixel coordinates
+    int inv_table_size;         // Size of inverse table (typically 360x180)
+    int inv_width;              // Width of inverse table
+    int inv_height;             // Height of inverse table
+    
+    // NEW: Optimized depth computation tables
+    float* d_depth_multipliers; // For plane hypothesis depth computation
     
     // Camera parameters
     int width;
@@ -47,44 +51,26 @@ struct SphericalLUT {
     size_t memory_size;
 };
 
-// Multi-resolution LUT manager
 class SphericalLUTManager {
 private:
     std::map<ResolutionKey, SphericalLUT*> lut_map;
     std::vector<SphericalLUT*> device_luts;
-    
-    // Device array of LUT pointers for kernel access
     SphericalLUT** d_lut_array;
     int* d_lut_count;
-    
-    // Maximum number of resolutions to support
-    static const int MAX_RESOLUTIONS = 10;
+    static const int MAX_RESOLUTIONS = 20;
     
 public:
     SphericalLUTManager();
     ~SphericalLUTManager();
     
-    // Initialize or get LUT for specific resolution
     SphericalLUT* GetOrCreateLUT(int width, int height, float cx, float cy);
-    
-    // Find closest LUT if exact match not found
     SphericalLUT* FindClosestLUT(int width, int height, float cx, float cy);
-    
-    // Initialize LUTs for all expected resolutions
     void InitializeMultiScaleLUTs(int base_width, int base_height, 
-                                  float base_cx, float base_cy, 
-                                  int num_scales);
+                                  float base_cx, float base_cy, int num_scales);
     
-    // Get device LUT array for kernel access
     SphericalLUT** GetDeviceLUTArray() { return d_lut_array; }
-    
-    // Get specific LUT by index
     SphericalLUT* GetLUTByIndex(int idx);
-    
-    // Clean up all LUTs
     void FreeAllLUTs();
-    
-    // Get memory usage
     size_t GetTotalMemoryUsage() const;
     
 private:
@@ -93,13 +79,8 @@ private:
     void UpdateDeviceArray();
 };
 
-// Global LUT manager instance
 extern SphericalLUTManager* g_lut_manager;
-
-// Initialize global LUT manager
 void InitializeLUTManager();
-
-// Free global LUT manager
 void FreeLUTManager();
 
-#endif // SPHERICAL_LUT_MULTIRESO_H
+#endif
