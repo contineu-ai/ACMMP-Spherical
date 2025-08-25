@@ -1,10 +1,9 @@
-#ifndef _MAIN_H_
-#define _MAIN_H_
+#ifndef MAIN_H_
+#define MAIN_H_
 
 #include "opencv2/calib3d/calib3d.hpp"
 #include "opencv2/imgproc/imgproc.hpp"
 #include "opencv2/core/core.hpp"
-#include "opencv2/highgui/highgui.hpp"
 #include "opencv2/highgui/highgui.hpp"
 #include "opencv2/opencv.hpp"
 
@@ -16,6 +15,7 @@
 #include <curand_kernel.h>
 #include <vector_types.h>
 
+// Standard C++ includes
 #include <vector>
 #include <string>
 #include <iostream>
@@ -24,9 +24,14 @@
 #include <algorithm>
 #include <map>
 #include <memory>
-#include "iomanip"
+#include <iomanip>
+#include <set>
+#include <chrono>
+#include <cstring>
+#include <cerrno>
 
-#include <sys/stat.h> // mkdir
+// System includes
+#include <sys/stat.h>  // mkdir
 #include <sys/types.h> // mkdir
 
 #define MAX_IMAGES 256
@@ -38,22 +43,19 @@ enum CameraModel {
 };
 
 struct Camera {
-  // Use the enum instead of std::string
-  CameraModel model;
-  
-  // Use a fixed-size C-style array for parameters. 
-  // Make it large enough for any model. Pinhole uses 9 (K), Sphere uses 3 (f, cx, cy).
-  // Let's keep K as it is and add sphere_params explicitly.
-  float params[4];       // For SPHERE: [f, cx, cy, unused]
-
-  float R[9];
-  float t[3];
-  float K[9];
-  int   width, height;
-  float depth_min, depth_max;
+    // Use the enum instead of std::string
+    CameraModel model;
+    
+    // Use a fixed-size C-style array for parameters.
+    // Make it large enough for any model. Pinhole uses 9 (K), Sphere uses 3 (f, cx, cy).
+    // Let's keep K as it is and add sphere_params explicitly.
+    float params[4]; // For SPHERE: [f, cx, cy, unused]
+    float R[9];
+    float t[3];
+    float K[9];
+    int width, height;
+    float depth_min, depth_max;
 };
-
-
 
 struct Problem {
     int ref_image_id;
@@ -65,13 +67,73 @@ struct Problem {
 
 struct Triangle {
     cv::Point pt1, pt2, pt3;
-    Triangle (const cv::Point _pt1, const cv::Point _pt2, const cv::Point _pt3) : pt1(_pt1) , pt2(_pt2), pt3(_pt3) {}
+    
+    // Constructor that takes Point objects directly
+    Triangle(const cv::Point& pt1, const cv::Point& pt2, const cv::Point& pt3) 
+        : pt1(pt1), pt2(pt2), pt3(pt3) {}
+    
+    // Constructor that takes Point pointers (for backward compatibility if needed)
+    Triangle(const cv::Point* pt1, const cv::Point* pt2, const cv::Point* pt3) 
+        : pt1(*pt1), pt2(*pt2), pt3(*pt3) {}
 };
-
 struct PointList {
     float3 coord;
     float3 normal;
     float3 color;
 };
 
-#endif // _MAIN_H_
+
+
+// Function declarations
+void makeDir(const std::string& path);
+void printUsage(const char* program_name);
+
+void GenerateSampleList(const std::string& dense_folder, std::vector<Problem>& problems);
+void InitializeLUTsForAllResolutions(const std::string& dense_folder, 
+                                     const std::vector<Problem>& problems,
+                                     int max_num_downscale);
+int ComputeMultiScaleSettings(const std::string& dense_folder, std::vector<Problem>& problems);
+
+void ProcessProblem(const std::string& dense_folder, 
+                   const std::vector<Problem>& problems, 
+                   const int idx, 
+                   bool geom_consistency, 
+                   bool planar_prior, 
+                   bool hierarchy, 
+                   bool multi_geometry = false);
+
+void ProcessProblemsInParallel(const std::string& dense_folder, 
+                               std::vector<Problem>& problems,
+                               bool geom_consistency,
+                               bool planar_prior,
+                               bool hierarchy,
+                               bool multi_geometry = false);
+
+void ProcessProblemsSequential(const std::string& dense_folder,
+                              const std::vector<Problem>& problems,
+                              bool geom_consistency,
+                              bool planar_prior,
+                              bool hierarchy,
+                              bool multi_geometry = false);
+
+void ProcessProblemsWithMode(const std::string& dense_folder,
+                            std::vector<Problem>& problems,
+                            bool geom_consistency,
+                            bool planar_prior,
+                            bool hierarchy,
+                            bool multi_geometry = false,
+                            bool use_batching = true);
+
+void JointBilateralUpsampling(const std::string& dense_folder, 
+                             const Problem& problem, 
+                             int acmmp_size);
+
+
+
+
+extern void InitializeLUTManager();
+extern void FreeLUTManager();
+
+
+
+#endif // MAIN_H_

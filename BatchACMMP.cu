@@ -48,10 +48,11 @@ BatchACMMP::BatchACMMP(const std::string& dense_folder_,
                        const std::vector<Problem>& problems,
                        bool geom_consistency_,
                        bool planar_prior_,
-                       bool hierarchy_)
+                       bool hierarchy_,
+                       bool multi_geometry_)  // Add parameter here
     : dense_folder(dense_folder_), all_problems(problems),
       geom_consistency(geom_consistency_), planar_prior(planar_prior_),
-      hierarchy(hierarchy_), multi_geometry(false)
+      hierarchy(hierarchy_), multi_geometry(multi_geometry_)  // Initialize member variable
 {
     // Device props
     cudaDeviceProp prop{};
@@ -176,7 +177,7 @@ ProblemGPUResources* BatchACMMP::acquireResources() {
     auto* r = available_resources.front();
     available_resources.pop();
     return r;
-}
+}   
 
 void BatchACMMP::releaseResources(ProblemGPUResources* r) {
     if (!r) return;

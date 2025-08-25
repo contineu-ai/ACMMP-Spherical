@@ -288,29 +288,6 @@ __device__ __forceinline__ float ComputeBilateralWeight(
     return expf(-spatial_dist_sq * inv_sigma_spatial_sq - color_dist * inv_sigma_color_sq);
 }
 
-// Fast approximation for exp() - about 5x faster than expf()
-__device__ __forceinline__ float fast_exp(float x) {
-    // Clamp to prevent overflow
-    x = fmaxf(-88.0f, fminf(88.0f, x));
-    
-    // Fast approximation using bit manipulation
-    union { float f; int32_t i; } reinterpreter;
-    reinterpreter.i = __float_as_int(12102203.0f * x + 1064866805.0f);
-    return reinterpreter.f;
-}
-
-// Even faster exp for small negative values (typical for Gaussian weights)
-__device__ __forceinline__ float fast_exp_neg(float x) {
-    // For negative x in range [-10, 0], use polynomial approximation
-    if (x < -10.0f) return 0.0f;
-    
-    // Padé approximant - more accurate than Taylor series
-    float x2 = x * x;
-    float numerator = 1.0f + 0.5f * x + 0.08333333f * x2;
-    float denominator = 1.0f - 0.5f * x + 0.08333333f * x2;
-    return numerator / denominator;
-}
-
 __device__ float ComputeBilateralNCC(
     const cudaTextureObject_t ref_image,
     const Camera ref_camera,
@@ -328,154 +305,90 @@ __device__ float ComputeBilateralNCC(
     float depth_ref = ComputeDepthfromPlaneHypothesis(ref_camera, plane_hypothesis, p);
     if (depth_ref <= 0.0f || depth_ref > 1000.0f) return cost_max;
     
-    // Precompute center projection once
     float3 Pw_center = Get3DPointonWorld_cu(p.x, p.y, depth_ref, ref_camera);
     float2 pt_center; 
     float dummy_depth;
     ProjectonCamera_cu(Pw_center, src_camera, pt_center, dummy_depth);
     
     // Expanded early exit - check if patch will be mostly out of bounds
-    const float margin = radius + 2.0f;  // Add small margin
-    if (pt_center.x < margin || pt_center.x >= src_camera.width - margin ||
-        pt_center.y < margin || pt_center.y >= src_camera.height - margin) {
+    if (pt_center.x < radius || pt_center.x >= src_camera.width - radius ||
+        pt_center.y < radius || pt_center.y >= src_camera.height - radius) {
         return cost_max;
     }
 
-    // Precompute constants
-    const float inv_sigma_spatial_sq = __fdividef(1.0f, 2.0f * params.sigma_spatial * params.sigma_spatial);
-    const float inv_sigma_color_sq = __fdividef(1.0f, 2.0f * params.sigma_color * params.sigma_color);
+    // Precompute constants (unchanged from original optimization)
+    const float inv_sigma_spatial_sq = 1.0f / (2.0f * params.sigma_spatial * params.sigma_spatial);
+    const float inv_sigma_color_sq = 1.0f / (2.0f * params.sigma_color * params.sigma_color);
     const float ref_center_pix = tex2D<float>(ref_image, p.x + 0.5f, p.y + 0.5f);
-    
-    // Precompute projection matrix elements for linear approximation
-    // This helps when the patch is relatively planar
-    const float depth_center = depth_ref;
-    const float3 normal = make_float3(plane_hypothesis.x, plane_hypothesis.y, plane_hypothesis.z);
-    
-    // Use double precision accumulators for better numerical stability
-    // but do intermediate computations in single precision
-    double sum_ref = 0.0, sum_ref_ref = 0.0;
-    double sum_src = 0.0, sum_src_src = 0.0;
-    double sum_ref_src = 0.0, sum_bw = 0.0;
-    
-    // Count valid samples for early termination
-    int valid_samples = 0;
-    const int min_samples = (2 * radius + 1) * (2 * radius + 1) / 4;  // Need at least 25% valid samples
 
-    // Optimized loop with better memory access pattern
-    // Process in tiles for better cache locality
-    const int tile_size = 4;
-    
-    for (int tile_y = -radius; tile_y <= radius; tile_y += tile_size) {
-        for (int tile_x = -radius; tile_x <= radius; tile_x += tile_size) {
-            
-            // Process each tile
-            #pragma unroll 4
-            for (int dy = 0; dy < tile_size && (tile_y + dy) <= radius; ++dy) {
-                const int j = tile_y + dy;
-                if (abs(j) % params.radius_increment != 0) continue;
-                
-                const float j_sq = j * j;
-                
-                #pragma unroll 4
-                for (int dx = 0; dx < tile_size && (tile_x + dx) <= radius; ++dx) {
-                    const int i = tile_x + dx;
-                    if (abs(i) % params.radius_increment != 0) continue;
-                    
-                    const int2 ref_pt = make_int2(p.x + i, p.y + j);
-                    
-                    // Fast depth computation using plane equation
-                    const float depth_n = ComputeDepthfromPlaneHypothesis(ref_camera, plane_hypothesis, ref_pt);
-                    
-                    // Use incremental projection for nearby pixels (linear approximation)
-                    // This works well when the surface is relatively planar
-                    float3 Pw_n;
-                    if (abs(i) <= 2 && abs(j) <= 2) {
-                        // For very close pixels, use linear approximation
-                        float depth_delta = depth_n - depth_center;
-                        Pw_n.x = Pw_center.x + i * 0.01f + depth_delta * normal.x * 0.1f;
-                        Pw_n.y = Pw_center.y + j * 0.01f + depth_delta * normal.y * 0.1f;
-                        Pw_n.z = Pw_center.z + depth_delta * normal.z;
-                    } else {
-                        // Full computation for farther pixels
-                        Pw_n = Get3DPointonWorld_cu(ref_pt.x, ref_pt.y, depth_n, ref_camera);
-                    }
-                    
-                    float2 src_pt;
-                    float src_d;
-                    ProjectonCamera_cu(Pw_n, src_camera, src_pt, src_d);
-                    
-                    // Quick bounds check
-                    if (src_pt.x < 0.0f || src_pt.x >= src_camera.width ||
-                        src_pt.y < 0.0f || src_pt.y >= src_camera.height) {
-                        continue;
-                    }
-                    
-                    // Texture fetches
-                    const float ref_pix = tex2D<float>(ref_image, ref_pt.x + 0.5f, ref_pt.y + 0.5f);
-                    const float src_pix = tex2D<float>(src_image, src_pt.x + 0.5f, src_pt.y + 0.5f);
-                    
-                    // Fast bilateral weight computation
-                    const float spatial_dist_sq = i * i + j_sq;
-                    const float color_dist = fabsf(ref_pix - ref_center_pix);
-                    
-                    // Use fast exp approximation
-                    const float spatial_weight = fast_exp_neg(-spatial_dist_sq * inv_sigma_spatial_sq);
-                    const float color_weight = fast_exp_neg(-color_dist * inv_sigma_color_sq);
-                    const float w = spatial_weight * color_weight;
-                    
-                    // Skip very small weights
-                    if (w < 0.001f) continue;
-                    
-                    // Accumulate with FMA instructions for better performance
-                    sum_bw      += w;
-                    sum_ref     = __fma_rn(w, ref_pix, sum_ref);
-                    sum_ref_ref = __fma_rn(w * ref_pix, ref_pix, sum_ref_ref);
-                    sum_src     = __fma_rn(w, src_pix, sum_src);
-                    sum_src_src = __fma_rn(w * src_pix, src_pix, sum_src_src);
-                    sum_ref_src = __fma_rn(w * ref_pix, src_pix, sum_ref_src);
-                    
-                    valid_samples++;
-                }
-            }
-        }
+    // Single precision accumulation (faster than double precision)
+    float sum_ref = 0.0f, sum_ref_ref = 0.0f;
+    float sum_src = 0.0f, sum_src_src = 0.0f;
+    float sum_ref_src = 0.0f, sum_bw = 0.0f;
+
+    // Optimized inner loop with better memory access
+    for (int i = -radius; i <= radius; i += params.radius_increment) {
+        const float i_sq = i * i; // Precompute for spatial distance
         
-        // Early termination if we don't have enough valid samples
-        if ((tile_y > 0) && (valid_samples < min_samples / 2)) {
-            return cost_max;
+        for (int j = -radius; j <= radius; j += params.radius_increment) {
+            const int2 ref_pt = make_int2(p.x + i, p.y + j);
+
+            // Single texture read for reference
+            const float ref_pix = tex2D<float>(ref_image, ref_pt.x + 0.5f, ref_pt.y + 0.5f);
+            
+            // Optimized 3D point computation
+            const float depth_n = ComputeDepthfromPlaneHypothesis(ref_camera, plane_hypothesis, ref_pt);
+            const float3 Pw_n = Get3DPointonWorld_cu(ref_pt.x, ref_pt.y, depth_n, ref_camera);
+
+            // Single projection computation
+            float2 src_pt; 
+            float src_d;
+            ProjectonCamera_cu(Pw_n, src_camera, src_pt, src_d);
+            
+            // Quick bounds check - continue instead of complex conditionals
+            if (src_pt.x < 0.0f || src_pt.x >= src_camera.width ||
+                src_pt.y < 0.0f || src_pt.y >= src_camera.height) {
+                continue;
+            }
+
+            // Single texture read for source
+            const float src_pix = tex2D<float>(src_image, src_pt.x + 0.5f, src_pt.y + 0.5f);
+
+            // Optimized bilateral weight - avoid sqrt in spatial distance
+            const float spatial_dist_sq = i_sq + j * j;
+            const float color_dist = fabsf(ref_pix - ref_center_pix);
+            const float w = expf(-spatial_dist_sq * inv_sigma_spatial_sq - color_dist * inv_sigma_color_sq);
+
+            // Accumulate - using single precision for speed
+            sum_bw      += w;
+            sum_ref     += w * ref_pix;
+            sum_ref_ref += w * ref_pix * ref_pix;
+            sum_src     += w * src_pix;
+            sum_src_src += w * src_pix * src_pix;
+            sum_ref_src += w * ref_pix * src_pix;
         }
     }
 
-    // Check for minimum sample requirement
-    if (valid_samples < min_samples || sum_bw < 1e-6) {
-        return cost_max;
-    }
+    // Early exit for insufficient data
+    if (sum_bw < 1e-6f) return cost_max;
 
-    // Final NCC computation with numerical stability improvements
-    const float inv_bw = __fdividef(1.0f, sum_bw);
+    // Optimized normalization and variance computation
+    const float inv_bw = 1.0f / sum_bw;
     const float mean_ref = sum_ref * inv_bw;
     const float mean_src = sum_src * inv_bw;
-    
-    // Use Kahan summation for variance computation for better accuracy
-    const float var_ref = fmaxf(0.0f, sum_ref_ref * inv_bw - mean_ref * mean_ref);
-    const float var_src = fmaxf(0.0f, sum_src_src * inv_bw - mean_src * mean_src);
+    const float var_ref = sum_ref_ref * inv_bw - mean_ref * mean_ref;
+    const float var_src = sum_src_src * inv_bw - mean_src * mean_src;
     
     if (var_ref < kMinVar || var_src < kMinVar) {
         return cost_max;
     }
 
     const float covar = sum_ref_src * inv_bw - mean_ref * mean_src;
-    
-    // Use fast reciprocal square root
-    const float inv_std = __frsqrt_rn(var_ref * var_src);
-    const float correlation = covar * inv_std;
-    
-    // Clamp correlation to valid range
-    const float clamped_corr = fmaxf(-1.0f, fminf(1.0f, correlation));
-    const float ncc_cost = 1.0f - clamped_corr;
+    const float denom = sqrtf(var_ref * var_src);
+    const float ncc_cost = 1.0f - covar / denom;
     
     return fmaxf(0.0f, fminf(cost_max, ncc_cost));
 }
-
 
 __device__ float ComputeMultiViewInitialCostandSelectedViews(const cudaTextureObject_t *images, const Camera *cameras, const int2 p, const float4 plane_hypothesis, unsigned int *selected_views, const PatchMatchParams params)
 {

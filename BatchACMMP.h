@@ -79,11 +79,12 @@ struct ProblemGPUResources {
 
 class BatchACMMP {
 public:
-    BatchACMMP(const std::string& dense_folder, 
+    BatchACMMP(const std::string& dense_folder_, 
                const std::vector<Problem>& problems,
-               bool geom_consistency = false,
-               bool planar_prior = false,
-               bool hierarchy = false);
+               bool geom_consistency_,
+               bool planar_prior_,
+               bool hierarchy_,
+               bool multi_geometry_ = false);
     ~BatchACMMP();
 
     void setMaxConcurrentProblems(size_t max_problems);
