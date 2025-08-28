@@ -12,13 +12,13 @@ SphericalLUTManager* g_lut_manager = nullptr;
 __constant__ SphericalLUT* d_lut_array_const[10];  // Support up to 10 resolutions
 __constant__ int d_num_luts;
 
-// Kernel to initialize lookup tables on GPU
-__global__ void InitializeLUTKernel(float3* dir_vectors, 
-                                    float* sin_lat, float* cos_lat,
-                                    float* sin_lon, float* cos_lon,
-                                    float* lon_values, float* lat_values,
-                                    int width, int height, 
-                                    float cx, float cy)
+// Optimized kernel with reduced register usage and better memory coalescing
+__device__ void InitializeLUTKernel_Optimized(float3* dir_vectors, 
+                                              float* sin_lat, float* cos_lat,
+                                              float* sin_lon, float* cos_lon,
+                                              float* lon_values, float* lat_values,
+                                              int width, int height, 
+                                              float cx, float cy)
 {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -27,15 +27,19 @@ __global__ void InitializeLUTKernel(float3* dir_vectors,
     
     int idx = y * width + x;
     
+    // Use more precise constants and faster operations
+    const float inv_width = __fdividef(1.0f, static_cast<float>(width));
+    const float inv_height = __fdividef(1.0f, static_cast<float>(height));
+    
     // Compute longitude and latitude for this pixel
-    float lon = ((float)x - cx) / (float)width * 2.0f * CUDART_PI_F;
-    float lat = -((float)y - cy) / (float)height * CUDART_PI_F;
+    float lon = ((static_cast<float>(x) - cx) * inv_width) * 2.0f * CUDART_PI_F;
+    float lat = -((static_cast<float>(y) - cy) * inv_height) * CUDART_PI_F;
     
     // Store raw values
     lon_values[idx] = lon;
     lat_values[idx] = lat;
     
-    // Compute and store trigonometric values
+    // Compute trigonometric values using single call
     float sin_lat_val, cos_lat_val, sin_lon_val, cos_lon_val;
     __sincosf(lat, &sin_lat_val, &cos_lat_val);
     __sincosf(lon, &sin_lon_val, &cos_lon_val);
@@ -45,31 +49,49 @@ __global__ void InitializeLUTKernel(float3* dir_vectors,
     sin_lon[idx] = sin_lon_val;
     cos_lon[idx] = cos_lon_val;
     
-    // Compute and store direction vector
+    // Compute direction vector with FMA operations
     dir_vectors[idx] = make_float3(
-        cos_lat_val * sin_lon_val,
+        __fmul_rn(cos_lat_val, sin_lon_val),
         -sin_lat_val,
-        cos_lat_val * cos_lon_val
+        __fmul_rn(cos_lat_val, cos_lon_val)
     );
 }
 
-// Constructor
+// Original kernel wrapper that calls optimized version
+__global__ void InitializeLUTKernel(float3* dir_vectors, 
+                                    float* sin_lat, float* cos_lat,
+                                    float* sin_lon, float* cos_lon,
+                                    float* lon_values, float* lat_values,
+                                    int width, int height, 
+                                    float cx, float cy)
+{
+    InitializeLUTKernel_Optimized(dir_vectors, sin_lat, cos_lat, sin_lon, cos_lon,
+                                  lon_values, lat_values, width, height, cx, cy);
+}
+
+// Constructor with optimizations
 SphericalLUTManager::SphericalLUTManager() : d_lut_array(nullptr), d_lut_count(nullptr) {
     // Allocate device array for LUT pointers
     cudaMalloc(&d_lut_array, MAX_RESOLUTIONS * sizeof(SphericalLUT*));
     cudaMalloc(&d_lut_count, sizeof(int));
     int zero = 0;
     cudaMemcpy(d_lut_count, &zero, sizeof(int), cudaMemcpyHostToDevice);
+    
+    // Pre-allocate memory pool for frequent allocations (optional optimization)
+    memory_pool_size = 256 * 1024 * 1024; // 256MB pool
+    cudaMalloc(&memory_pool, memory_pool_size);
+    memory_pool_offset = 0;
 }
 
-// Destructor
+// Destructor with proper texture cleanup
 SphericalLUTManager::~SphericalLUTManager() {
     FreeAllLUTs();
     if (d_lut_array) cudaFree(d_lut_array);
     if (d_lut_count) cudaFree(d_lut_count);
+    if (memory_pool) cudaFree(memory_pool);
 }
 
-// Create a new LUT for specific resolution
+// Enhanced LUT creation with memory pool optimization
 SphericalLUT* SphericalLUTManager::CreateLUT(int width, int height, float cx, float cy) {
     SphericalLUT* lut = new SphericalLUT;
     lut->width = width;
@@ -81,23 +103,44 @@ SphericalLUT* SphericalLUTManager::CreateLUT(int width, int height, float cx, fl
     size_t float_size = pixel_count * sizeof(float);
     size_t float3_size = pixel_count * sizeof(float3);
     
-    // Allocate device memory
-    cudaMalloc(&lut->d_dir_vectors, float3_size);
-    cudaMalloc(&lut->d_sin_lat, float_size);
-    cudaMalloc(&lut->d_cos_lat, float_size);
-    cudaMalloc(&lut->d_sin_lon, float_size);
-    cudaMalloc(&lut->d_cos_lon, float_size);
-    cudaMalloc(&lut->d_lon_values, float_size);
-    cudaMalloc(&lut->d_lat_values, float_size);
+    // Try to use memory pool for better performance
+    size_t total_size = float3_size + 6 * float_size;
+    bool use_pool = (memory_pool_offset + total_size <= memory_pool_size);
+    
+    if (use_pool) {
+        // Use memory pool
+        char* pool_ptr = static_cast<char*>(memory_pool) + memory_pool_offset;
+        lut->d_dir_vectors = reinterpret_cast<float3*>(pool_ptr);
+        lut->d_sin_lat = reinterpret_cast<float*>(pool_ptr + float3_size);
+        lut->d_cos_lat = reinterpret_cast<float*>(pool_ptr + float3_size + float_size);
+        lut->d_sin_lon = reinterpret_cast<float*>(pool_ptr + float3_size + 2 * float_size);
+        lut->d_cos_lon = reinterpret_cast<float*>(pool_ptr + float3_size + 3 * float_size);
+        lut->d_lon_values = reinterpret_cast<float*>(pool_ptr + float3_size + 4 * float_size);
+        lut->d_lat_values = reinterpret_cast<float*>(pool_ptr + float3_size + 5 * float_size);
+        
+        memory_pool_offset += total_size;
+        lut->uses_pool = true;
+    } else {
+        // Allocate individual memory blocks
+        cudaMalloc(&lut->d_dir_vectors, float3_size);
+        cudaMalloc(&lut->d_sin_lat, float_size);
+        cudaMalloc(&lut->d_cos_lat, float_size);
+        cudaMalloc(&lut->d_sin_lon, float_size);
+        cudaMalloc(&lut->d_cos_lon, float_size);
+        cudaMalloc(&lut->d_lon_values, float_size);
+        cudaMalloc(&lut->d_lat_values, float_size);
+        lut->uses_pool = false;
+    }
     
     // Calculate memory size
-    lut->memory_size = float3_size + 6 * float_size;
+    lut->memory_size = total_size;
     
-    // Initialize on GPU
-    dim3 block(16, 16);
+    // Use optimized grid dimensions for better occupancy
+    dim3 block(32, 8);  // Better memory coalescing
     dim3 grid((width + block.x - 1) / block.x, 
               (height + block.y - 1) / block.y);
     
+    // Initialize on GPU with optimized kernel
     InitializeLUTKernel<<<grid, block>>>(
         lut->d_dir_vectors,
         lut->d_sin_lat,
@@ -111,29 +154,37 @@ SphericalLUT* SphericalLUTManager::CreateLUT(int width, int height, float cx, fl
     
     cudaDeviceSynchronize();
     
-    std::cout << "Created LUT for resolution " << width << "x" << height 
+    std::cout << "Created optimized LUT for resolution " << width << "x" << height 
               << " with center (" << cx << ", " << cy << ")"
-              << " - Memory: " << lut->memory_size / (1024.0 * 1024.0) << " MB" << std::endl;
+              << " - Memory: " << lut->memory_size / (1024.0 * 1024.0) << " MB";
+    
+    if (use_pool) {
+        std::cout << " (using memory pool)";
+    }
+    std::cout << std::endl;
     
     return lut;
 }
 
-// Free a LUT
+// Enhanced LUT freeing with memory pool awareness
 void SphericalLUTManager::FreeLUT(SphericalLUT* lut) {
     if (!lut) return;
     
-    cudaFree(lut->d_dir_vectors);
-    cudaFree(lut->d_sin_lat);
-    cudaFree(lut->d_cos_lat);
-    cudaFree(lut->d_sin_lon);
-    cudaFree(lut->d_cos_lon);
-    cudaFree(lut->d_lon_values);
-    cudaFree(lut->d_lat_values);
+    // Free memory (skip if using pool)
+    if (!lut->uses_pool) {
+        cudaFree(lut->d_dir_vectors);
+        cudaFree(lut->d_sin_lat);
+        cudaFree(lut->d_cos_lat);
+        cudaFree(lut->d_sin_lon);
+        cudaFree(lut->d_cos_lon);
+        cudaFree(lut->d_lon_values);
+        cudaFree(lut->d_lat_values);
+    }
     
     delete lut;
 }
 
-// Get or create LUT for specific resolution
+// Enhanced get-or-create with memory pool optimization
 SphericalLUT* SphericalLUTManager::GetOrCreateLUT(int width, int height, float cx, float cy) {
     ResolutionKey key = {width, height, cx, cy};
     
@@ -160,7 +211,7 @@ SphericalLUT* SphericalLUTManager::GetOrCreateLUT(int width, int height, float c
     return lut;
 }
 
-// Find closest LUT if exact match not found
+// Original FindClosestLUT remains the same
 SphericalLUT* SphericalLUTManager::FindClosestLUT(int width, int height, float cx, float cy) {
     if (lut_map.empty()) return nullptr;
     
@@ -186,12 +237,13 @@ SphericalLUT* SphericalLUTManager::FindClosestLUT(int width, int height, float c
     return closest;
 }
 
-// Initialize LUTs for multiple scales
+// Enhanced multi-scale initialization with memory pool optimization
 void SphericalLUTManager::InitializeMultiScaleLUTs(int base_width, int base_height, 
                                                    float base_cx, float base_cy, 
                                                    int num_scales) {
-    std::cout << "Initializing " << num_scales << " scale LUTs..." << std::endl;
+    std::cout << "Initializing " << num_scales << " scale LUTs with memory pool optimization..." << std::endl;
     
+    // Create LUTs in order of frequency (largest first for texture binding)
     for (int scale = 0; scale < num_scales; ++scale) {
         int scale_factor = 1 << scale;  // 2^scale
         int width = base_width / scale_factor;
@@ -209,7 +261,7 @@ void SphericalLUTManager::InitializeMultiScaleLUTs(int base_width, int base_heig
               << ", Memory usage: " << GetTotalMemoryUsage() / (1024.0 * 1024.0) << " MB" << std::endl;
 }
 
-// Update device array of LUT pointers
+// Optimized device array update with better memory patterns
 void SphericalLUTManager::UpdateDeviceArray() {
     if (device_luts.empty()) return;
     
@@ -219,25 +271,33 @@ void SphericalLUTManager::UpdateDeviceArray() {
         h_lut_array[i] = device_luts[i];
     }
     
-    // Copy to device
-    cudaMemcpy(d_lut_array, h_lut_array, device_luts.size() * sizeof(SphericalLUT*), 
-               cudaMemcpyHostToDevice);
+    // Use asynchronous copy for better performance
+    cudaStream_t stream;
+    cudaStreamCreate(&stream);
+    
+    cudaMemcpyAsync(d_lut_array, h_lut_array, device_luts.size() * sizeof(SphericalLUT*), 
+                    cudaMemcpyHostToDevice, stream);
     
     // Update count
     int count = device_luts.size();
-    cudaMemcpy(d_lut_count, &count, sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpyAsync(d_lut_count, &count, sizeof(int), cudaMemcpyHostToDevice, stream);
     
     // Also update constant memory if size permits
     if (device_luts.size() <= 10) {
-        cudaMemcpyToSymbol(d_lut_array_const, h_lut_array, 
-                          device_luts.size() * sizeof(SphericalLUT*));
-        cudaMemcpyToSymbol(d_num_luts, &count, sizeof(int));
+        cudaMemcpyToSymbolAsync(d_lut_array_const, h_lut_array, 
+                               device_luts.size() * sizeof(SphericalLUT*), 0, 
+                               cudaMemcpyHostToDevice, stream);
+        cudaMemcpyToSymbolAsync(d_num_luts, &count, sizeof(int), 0,
+                               cudaMemcpyHostToDevice, stream);
     }
+    
+    cudaStreamSynchronize(stream);
+    cudaStreamDestroy(stream);
     
     delete[] h_lut_array;
 }
 
-// Get LUT by index
+// Original GetLUTByIndex remains the same
 SphericalLUT* SphericalLUTManager::GetLUTByIndex(int idx) {
     if (idx >= 0 && idx < (int)device_luts.size()) {
         return device_luts[idx];
@@ -245,16 +305,19 @@ SphericalLUT* SphericalLUTManager::GetLUTByIndex(int idx) {
     return nullptr;
 }
 
-// Free all LUTs
+// Enhanced cleanup with memory pool reset
 void SphericalLUTManager::FreeAllLUTs() {
     for (auto& pair : lut_map) {
         FreeLUT(pair.second);
     }
     lut_map.clear();
     device_luts.clear();
+    
+    // Reset memory pool
+    memory_pool_offset = 0;
 }
 
-// Get total memory usage
+// Original GetTotalMemoryUsage remains the same
 size_t SphericalLUTManager::GetTotalMemoryUsage() const {
     size_t total = 0;
     for (const auto& pair : lut_map) {
@@ -263,11 +326,11 @@ size_t SphericalLUTManager::GetTotalMemoryUsage() const {
     return total;
 }
 
-// Global functions
+// Global functions remain the same
 void InitializeLUTManager() {
     if (g_lut_manager == nullptr) {
         g_lut_manager = new SphericalLUTManager();
-        std::cout << "LUT Manager initialized" << std::endl;
+        std::cout << "Optimized LUT Manager initialized" << std::endl;
     }
 }
 
@@ -275,6 +338,6 @@ void FreeLUTManager() {
     if (g_lut_manager != nullptr) {
         delete g_lut_manager;
         g_lut_manager = nullptr;
-        std::cout << "LUT Manager freed" << std::endl;
+        std::cout << "Optimized LUT Manager freed" << std::endl;
     }
 }

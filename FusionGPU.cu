@@ -133,6 +133,7 @@ private:
     bool buffers_allocated;
 
 public:
+
     PersistentGPUBuffers() : buffers_allocated(false) {
         // Initialize all pointers to nullptr
         depth_textures_buffer = nullptr;
@@ -860,7 +861,7 @@ __global__ void ChunkBatchKernel(
         ref_color.x * 255.0f   // B
     };
     int num_consistent = 1;
-    
+    float confidence_sum = 1.0f; // Start with reference confidence
     // Check source images for this problem
     int src_start = src_offsets[problem_id];
     int src_count = src_counts[problem_id];
@@ -919,22 +920,56 @@ __global__ void ChunkBatchKernel(
         float dot_product = ref_normal.x * src_normal.x + ref_normal.y * src_normal.y + ref_normal.z * src_normal.z;
         dot_product = fmaxf(-1.0f, fminf(1.0f, dot_product));
         float angle = acosf(dot_product);
-        
-        if (reproj_error < 4.0 && relative_depth_diff < 0.015f && angle < 0.12f) {
-            point_sum.x += PointX_src.x;
-            point_sum.y += PointX_src.y;
-            point_sum.z += PointX_src.z;
+
+        float adaptive_reproj_threshold = GetAdaptiveReprojectionThreshold(ref_cam, c, r, 2.0f);
+        float adaptive_reproj_threshold_src = GetAdaptiveReprojectionThreshold(src_cam, src_c, src_r, 2.0f);
+        float combined_threshold = fmaxf(adaptive_reproj_threshold, adaptive_reproj_threshold_src);        
+
+        float adaptive_depth_threshold = fmaxf(
+            GetAdaptiveDepthThreshold(src_depth, src_cam),
+            GetAdaptiveDepthThreshold(ref_depth, ref_cam)
+        );
+
+        if (reproj_error < combined_threshold && 
+            relative_depth_diff < adaptive_depth_threshold && 
+            angle < 0.12f) {
+            // point_sum.x += PointX_src.x;
+            // point_sum.y += PointX_src.y;
+            // point_sum.z += PointX_src.z;
             
-            normal_sum.x += src_normal.x;
-            normal_sum.y += src_normal.y;
-            normal_sum.z += src_normal.z;
+            // normal_sum.x += src_normal.x;
+            // normal_sum.y += src_normal.y;
+            // normal_sum.z += src_normal.z;
             
-            float4 src_color = tex2D<float4>(image_textures[src_tex_idx], src_c + 0.5f, src_r + 0.5f);
-            color_sum[0] += src_color.z * 255.0f;
-            color_sum[1] += src_color.y * 255.0f;
-            color_sum[2] += src_color.x * 255.0f;
+            // float4 src_color = tex2D<float4>(image_textures[src_tex_idx], src_c + 0.5f, src_r + 0.5f);
+            // color_sum[0] += src_color.z * 255.0f;
+            // color_sum[1] += src_color.y * 255.0f;
+            // color_sum[2] += src_color.x * 255.0f;
             
-            num_consistent++;
+            // num_consistent++;
+
+            float confidence = CalculateGeometricConfidence(
+    ref_cam, src_cam, PointX, c, r, src_c, src_r,
+    reproj_error, relative_depth_diff, angle
+);
+
+    point_sum.x += PointX_src.x * confidence;
+    point_sum.y += PointX_src.y * confidence;
+    point_sum.z += PointX_src.z * confidence;
+
+    normal_sum.x += src_normal.x * confidence;
+    normal_sum.y += src_normal.y * confidence;
+    normal_sum.z += src_normal.z * confidence;
+    float4 src_color = tex2D<float4>(image_textures[src_tex_idx], src_c + 0.5f, src_r + 0.5f);
+    color_sum[0] += src_color.z * 255.0f * confidence;
+    color_sum[1] += src_color.y * 255.0f * confidence;
+    color_sum[2] += src_color.x * 255.0f * confidence;
+
+    confidence_sum += confidence;
+    num_consistent++;
+
+    // Then when computing final point:
+
         }
     }
     
@@ -942,15 +977,15 @@ __global__ void ChunkBatchKernel(
         PointList final_point;
         
         final_point.coord = make_float3(
-            point_sum.x / num_consistent,
-            point_sum.y / num_consistent,
-            point_sum.z / num_consistent
+            point_sum.x / confidence_sum,
+            point_sum.y / confidence_sum,
+            point_sum.z / confidence_sum
         );
         
         float3 avg_normal = make_float3(
-            normal_sum.x / num_consistent,
-            normal_sum.y / num_consistent,
-            normal_sum.z / num_consistent
+            normal_sum.x / confidence_sum,
+            normal_sum.y / confidence_sum,
+            normal_sum.z / confidence_sum
         );
         float normal_length = hypotf(hypotf(avg_normal.x, avg_normal.y), avg_normal.z);
         if (normal_length > 0.0f) {
@@ -961,9 +996,9 @@ __global__ void ChunkBatchKernel(
         final_point.normal = avg_normal;
         
         final_point.color = make_float3(
-            color_sum[0] / num_consistent,
-            color_sum[1] / num_consistent,
-            color_sum[2] / num_consistent
+            color_sum[0] / confidence_sum,
+            color_sum[1] / confidence_sum,
+            color_sum[2] / confidence_sum
         );
         
         output_points[global_idx] = final_point;
@@ -1263,7 +1298,7 @@ void RunFusionCuda(const std::string &dense_folder,
     std::cout << "[Optimized Fusion] Total time: " << total_duration.count() << " seconds" << std::endl;
     
     // Write output
-    std::string output_path = dense_folder + "/ACMMP/ACMM_model_optimized.ply";
+    std::string output_path = dense_folder + "/ACMMP/ACMM_model_optimized_2.ply";
     StoreColorPlyFileBinaryPointCloud(output_path, all_points);
     
     std::cout << "[Optimized Fusion] Complete! Output written to: " << output_path << std::endl;

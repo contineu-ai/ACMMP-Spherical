@@ -60,6 +60,7 @@ CAMERA_MODELS = {
     CameraModel(9,  "RADIAL_FISHEYE",        5),
     CameraModel(10, "THIN_PRISM_FISHEYE",   12),
     CameraModel(model_id=11, model_name="SPHERE",num_params=3),
+    CameraModel(model_id=12, model_name="SPHERICAL",num_params=3),
 }
 CAMERA_MODEL_IDS = {cm.model_id: cm for cm in CAMERA_MODELS}
 
@@ -311,6 +312,9 @@ def process_scene(args):
     
     Kdict={}
     for cid,cam in cams.items():
+        if cam.model == "SPHERICAL":
+            cam = cam._replace(model="SPHERE")
+            cams[cid] = cam
         if cam.model == "SPHERE":
             # For spherical cameras, focal length is garbage, estimate from image center
             _, cx, cy = cam.params[:3]  # ignore focal length (garbage)
