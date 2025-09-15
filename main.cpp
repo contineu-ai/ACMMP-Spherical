@@ -554,59 +554,72 @@ void ProcessProblemsInParallel(const std::string &dense_folder,
                                bool multi_geometry) {
     
     std::cout << "\n========================================" << std::endl;
-    std::cout << "Starting Parallel GPU Processing" << std::endl;
-    std::cout << "Multi-geometry: " << (multi_geometry ? "ENABLED" : "DISABLED") << std::endl;
+    std::cout << "Starting Parallel GPU + Disk Processing" << std::endl;
+    std::cout << "Mode: " << (geom_consistency ? "GEOM" : "PLANAR") 
+              << (hierarchy ? "+HIERARCHY" : "") 
+              << (multi_geometry ? "+MULTI_GEOM" : "") << std::endl;
     std::cout << "========================================" << std::endl;
     
     auto start_time = std::chrono::high_resolution_clock::now();
     
-    // Create batch processor
-    BatchACMMP batch_processor(dense_folder, problems,
-                            geom_consistency, planar_prior, hierarchy, multi_geometry);
+    // Ensure output directory exists
+    std::string output_dir = dense_folder + "/ACMMP";
+    makeDir(output_dir);
     
-    // Process all problems in parallel
-    batch_processor.processAllProblems();
-    
-    // Wait for completion
-    batch_processor.waitForCompletion();
-    
-    auto end_time = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::seconds>(end_time - start_time);
-    
-    std::cout << "\n========================================" << std::endl;
-    std::cout << "Parallel Processing Complete!" << std::endl;
-    std::cout << "Total time: " << duration.count() << " seconds" << std::endl;
-    std::cout << "========================================\n" << std::endl;
-    
-    makeDir(dense_folder + "/ACMMP");
-   
-    // Now extract and save results for each problem
-    #pragma omp parallel for
-    for (size_t i = 0; i < problems.size(); ++i) {
-        const Problem& problem = problems[i];
+    // Create batch processor with scope management
+    {
+        BatchACMMP batch_processor(dense_folder, problems,
+                                  geom_consistency, planar_prior, hierarchy, 
+                                  multi_geometry);
         
-        std::stringstream result_path;
-        result_path << dense_folder << "/ACMMP" << "/2333_" << std::setw(8) 
-                    << std::setfill('0') << problem.ref_image_id;
-        std::string result_folder = result_path.str();
-        makeDir(result_folder);
+        // Start processing
+        batch_processor.processAllProblems();
         
-        cv::Mat_<float> depths;
-        cv::Mat_<cv::Vec3f> normals;
-        cv::Mat_<float> costs;
+        // Simple polling-based wait - more reliable than complex synchronization
+        bool done = false;
+        auto last_report = std::chrono::steady_clock::now();
         
-        batch_processor.extractResults(i, depths, normals, costs);
+        while (!done) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            
+            size_t gpu_completed = batch_processor.getCompletedGPUProblems();
+            size_t disk_completed = batch_processor.getCompletedDiskWrites();
+            size_t total = problems.size();
+            
+            // Report progress every 5 seconds
+            auto now = std::chrono::steady_clock::now();
+            if (std::chrono::duration_cast<std::chrono::seconds>(now - last_report).count() >= 5) {
+                std::cout << "[Progress] GPU: " << gpu_completed << "/" << total 
+                          << ", Disk: " << disk_completed << "/" << total
+                          << ", Active GPU: " << batch_processor.getActiveGPUProblems()
+                          << ", Pending Disk: " << batch_processor.getPendingDiskWrites() << std::endl;
+                last_report = now;
+            }
+            
+            // Check if everything is complete
+            if (disk_completed >= total && 
+                batch_processor.getActiveGPUProblems() == 0 &&
+                batch_processor.getPendingDiskWrites() == 0) {
+                done = true;
+            }
+        }
         
-        std::string suffix = geom_consistency ? "/depths_geom.dmb" : "/depths.dmb";
-        std::string depth_path = result_folder + suffix;
-        std::string normal_path = result_folder + "/normals.dmb";
-        std::string cost_path = result_folder + "/costs.dmb";
+        std::cout << "[BatchACMMP] All processing complete!" << std::endl;
         
-        writeDepthDmb(depth_path, depths);
-        writeNormalDmb(normal_path, normals);
-        writeDepthDmb(cost_path, costs);
+        auto end_time = std::chrono::high_resolution_clock::now();
+        auto total_duration = std::chrono::duration_cast<std::chrono::seconds>(end_time - start_time);
+        
+        std::cout << "\n========================================" << std::endl;
+        std::cout << "Parallel Processing Complete!" << std::endl;
+        std::cout << "Total time: " << total_duration.count() << " seconds" << std::endl;
+        std::cout << "Peak RAM usage: " << batch_processor.getPeakMemoryUsage() << " MB" << std::endl;
+        std::cout << "GPU throughput: " << (problems.size() * 60.0 / total_duration.count()) << " problems/minute" << std::endl;
+        std::cout << "========================================\n" << std::endl;
+        
+        // batch_processor destructor will handle cleanup when going out of scope
     }
 }
+
 
 int main(int argc, char** argv)
 {

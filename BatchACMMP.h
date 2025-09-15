@@ -1,11 +1,10 @@
-#ifndef BATCH_ACMMP_H
-#define BATCH_ACMMP_H
+// BatchACMMP.h - Fixed compilation issues
+#ifndef BATCHACMMP_H
+#define BATCHACMMP_H
 
-#include "main.h"
 #include "ACMMP.h"
-#include <cuda_runtime.h>
-
 #include <vector>
+#include <string>
 #include <memory>
 #include <thread>
 #include <mutex>
@@ -13,68 +12,59 @@
 #include <queue>
 #include <atomic>
 #include <unordered_map>
-#include <iomanip>
-#include <string>
-#include <sstream>
-#include <cassert>
+#include <functional>
+#include <cuda_runtime.h>
 
-// ---- small CUDA helper ----
-#ifndef CUDA_CHECK
+// CUDA error checking macro
 #define CUDA_CHECK(call) do { \
-  cudaError_t err__ = (call); \
-  if (err__ != cudaSuccess) { \
-    fprintf(stderr, "[CUDA] %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(err__)); \
-    abort(); \
-  } \
+    cudaError_t error = call; \
+    if (error != cudaSuccess) { \
+        std::cerr << "CUDA error at " << __FILE__ << ":" << __LINE__ << " - " << cudaGetErrorString(error) << std::endl; \
+        exit(1); \
+    } \
 } while(0)
-#endif
-
-struct StoredResult {
-    int width = 0, height = 0;
-    std::vector<float4> planes;  // per-pixel: (nx, ny, nz, depth)
-    std::vector<float>  costs;   // per-pixel
-};
 
 // Forward declarations
-class ACMMP;
 struct Problem;
-struct PatchMatchParams;
+struct ProblemGPUResources;
 
-struct ProblemGPUResources {
-    ProblemGPUResources();   // zero-init everything
-    ~ProblemGPUResources();  // calls cleanup()
-
-    int    problem_id = -1;
-    int    stream_id  = -1;
-    cudaStream_t stream = nullptr;
-
-    // Problem-specific (optional) device buffers if you wire ACMMP to reuse:
-    Camera*              cameras_cuda            = nullptr;
-    cudaArray*           cuArray[MAX_IMAGES];
-    cudaArray*           cuDepthArray[MAX_IMAGES];
-    cudaTextureObject_t* texture_objects_cuda    = nullptr;
-    cudaTextureObject_t* texture_depths_cuda     = nullptr;
-    float4*              plane_hypotheses_cuda   = nullptr;
-    float4*              scaled_plane_hypotheses_cuda = nullptr;
-    float*               costs_cuda              = nullptr;
-    float*               pre_costs_cuda          = nullptr;
-    curandState*         rand_states_cuda        = nullptr;
-    unsigned int*        selected_views_cuda     = nullptr;
-    float*               depths_cuda             = nullptr;
-    float4*              prior_planes_cuda       = nullptr;
-    unsigned int*        plane_masks_cuda        = nullptr;
-
-    // Optional pinned host buffers for faster D2H copies (if ACMMP exposes device pointers)
-    float4* planes_host_pinned = nullptr;
-    float*  costs_host_pinned  = nullptr;
-    size_t  host_pitch_elems   = 0;
-
-    // metadata
-    int width  = 0;
-    int height = 0;
-    int num_images = 0;
-
-    void cleanup();
+// Structure to hold completed results for disk writing
+struct CompletedResult {
+    int problem_idx;
+    Problem problem;
+    cv::Mat_<float> depths;
+    cv::Mat_<cv::Vec3f> normals;
+    cv::Mat_<float> costs;
+    bool geom_consistency;
+    
+    CompletedResult() = default;
+    CompletedResult(int idx, const Problem& prob, 
+                   cv::Mat_<float> d, cv::Mat_<cv::Vec3f> n, cv::Mat_<float> c, bool geom)
+        : problem_idx(idx), problem(prob), depths(std::move(d)), 
+          normals(std::move(n)), costs(std::move(c)), geom_consistency(geom) {}
+    
+    // Move constructor
+    CompletedResult(CompletedResult&& other) noexcept
+        : problem_idx(other.problem_idx), problem(std::move(other.problem)),
+          depths(std::move(other.depths)), normals(std::move(other.normals)),
+          costs(std::move(other.costs)), geom_consistency(other.geom_consistency) {}
+    
+    // Move assignment
+    CompletedResult& operator=(CompletedResult&& other) noexcept {
+        if (this != &other) {
+            problem_idx = other.problem_idx;
+            problem = std::move(other.problem);
+            depths = std::move(other.depths);
+            normals = std::move(other.normals);
+            costs = std::move(other.costs);
+            geom_consistency = other.geom_consistency;
+        }
+        return *this;
+    }
+    
+    // Delete copy constructor and assignment to force move semantics
+    CompletedResult(const CompletedResult&) = delete;
+    CompletedResult& operator=(const CompletedResult&) = delete;
 };
 
 class BatchACMMP {
@@ -84,49 +74,35 @@ public:
                bool geom_consistency_,
                bool planar_prior_,
                bool hierarchy_,
-               bool multi_geometry_ = false);
+               bool multi_geometry_);
+    
     ~BatchACMMP();
 
-    void setMaxConcurrentProblems(size_t max_problems);
-    void processBatch(const std::vector<int>& problem_indices);
     void processAllProblems();
+    void processBatch(const std::vector<int>& idxs);
+    void waitForGPUCompletion();
+    void waitForDiskCompletion();
     void waitForCompletion();
+    
+    // Memory and progress monitoring
+    size_t getPeakMemoryUsage() const;
+    size_t getCurrentMemoryUsage() const;
+    size_t getActiveGPUProblems() const;
+    size_t getPendingDiskWrites() const;
+    size_t getCompletedDiskWrites() const;
 
-    // Extract cached results
-    void extractResults(int problem_idx, cv::Mat_<float>& depths, 
-                        cv::Mat_<cv::Vec3f>& normals,
-                        cv::Mat_<float>& costs);
+    size_t getCompletedGPUProblems() const {
+        return gpu_completed_.load();
+    }
+    
+    // Improved completion check without deadlock risk
+    bool isComplete() const {
+        return disk_completed_.load() >= problems_enqueued_.load() &&
+               active_gpu_problems_.load() == 0;
+    }
 
 private:
-    // config
-    size_t max_concurrent_problems = 1;
-
-    // CUDA streams
-    std::vector<cudaStream_t> streams;
-
-    // Results cache
-    std::unordered_map<int, StoredResult> results_;
-    std::mutex results_mutex_;
-
-    // Resource pool
-    std::vector<std::unique_ptr<ProblemGPUResources>> resource_pool;
-    std::queue<ProblemGPUResources*> available_resources;
-    std::mutex resource_mutex_;
-    std::condition_variable resource_cv_;
-
-    // Work queue
-    std::queue<int> problem_queue_;
-    std::mutex queue_mutex_;
-    std::condition_variable queue_cv_;
-
-    // Progress
-    std::atomic<int> problems_enqueued_{0};
-    std::atomic<int> problems_completed_{0};
-
-    std::atomic<bool> stopping_{false};
-
-    // Shared params (stored for completeness)
-    PatchMatchParams params;
+    // Configuration
     std::string dense_folder;
     std::vector<Problem> all_problems;
     bool geom_consistency;
@@ -134,21 +110,94 @@ private:
     bool hierarchy;
     bool multi_geometry;
 
-    // Workers
-    std::vector<std::thread> worker_threads;
-
-    // mem estimates
-    size_t available_gpu_memory = 0;
-    size_t memory_per_problem   = 0;
-
-    // private helpers
+    // GPU processing resources
+    size_t max_concurrent_problems;
+    size_t num_disk_writers;
+    std::vector<cudaStream_t> streams;
+    std::vector<std::unique_ptr<ProblemGPUResources>> resource_pool;
+    
+    // GPU resource management
+    std::queue<ProblemGPUResources*> available_resources;
+    std::mutex resource_mutex_;
+    std::condition_variable resource_cv_;
+    
+    // GPU work queue
+    std::queue<int> gpu_work_queue_;
+    std::mutex gpu_queue_mutex_;
+    std::condition_variable gpu_queue_cv_;
+    
+    // Disk I/O queue
+    std::queue<CompletedResult> disk_write_queue_;
+    mutable std::mutex disk_queue_mutex_; // Make mutable for const methods
+    std::condition_variable disk_queue_cv_;
+    
+    // Thread management
+    std::vector<std::thread> gpu_worker_threads;
+    std::vector<std::thread> disk_writer_threads;
+    std::atomic<bool> stopping_gpu_{false};
+    std::atomic<bool> stopping_disk_{false};
+    
+    // Progress tracking
+    std::atomic<int> problems_enqueued_{0};
+    std::atomic<int> gpu_completed_{0};
+    std::atomic<int> disk_completed_{0};
+    
+    // Memory monitoring
+    mutable std::mutex memory_mutex_;
+    size_t peak_memory_usage_ = 0;
+    std::atomic<size_t> active_gpu_problems_{0};
+    
+    // Memory estimation
+    size_t available_gpu_memory;
+    size_t memory_per_problem;
+    
+    // Internal methods
+    void initializeResourcePool();
+    void initializeDiskWriters();
+    ProblemGPUResources* acquireResources();
+    void releaseResources(ProblemGPUResources* r);
+    
+    void gpuWorkerFunction();
+    void diskWriterFunction();
+    void processProblemOnStream(int problem_idx, ProblemGPUResources* resources);
+    void writeProblemToDisk(CompletedResult&& result);
+    
     size_t estimateMemoryPerProblem(const Problem& problem);
     size_t getAvailableGPUMemory();
-    void   initializeResourcePool();
-    ProblemGPUResources* acquireResources();
-    void   releaseResources(ProblemGPUResources* resources);
-    void   workerFunction();
-    void   processProblemOnStream(int problem_idx, ProblemGPUResources* resources);
+    size_t getSystemRAM();
+    size_t getProcessMemoryUsage() const;
 };
 
-#endif // BATCH_ACMMP_H
+// GPU resource management struct
+struct ProblemGPUResources {
+    static constexpr int MAX_IMAGES_PER_PROBLEM = 32;
+    
+    int stream_id = -1;
+    cudaStream_t stream = nullptr;
+    
+    cudaArray* cuArray[MAX_IMAGES_PER_PROBLEM];
+    cudaArray* cuDepthArray[MAX_IMAGES_PER_PROBLEM];
+    
+    void* cameras_cuda = nullptr;
+    void* texture_objects_cuda = nullptr;
+    void* texture_depths_cuda = nullptr;
+    void* plane_hypotheses_cuda = nullptr;
+    void* scaled_plane_hypotheses_cuda = nullptr;
+    void* costs_cuda = nullptr;
+    void* pre_costs_cuda = nullptr;
+    void* rand_states_cuda = nullptr;
+    void* selected_views_cuda = nullptr;
+    void* depths_cuda = nullptr;
+    void* prior_planes_cuda = nullptr;
+    void* plane_masks_cuda = nullptr;
+    
+    void* planes_host_pinned = nullptr;
+    void* costs_host_pinned = nullptr;
+    
+    ProblemGPUResources();
+    ~ProblemGPUResources();
+    void cleanup();
+};
+
+#endif // BATCHACMMP_H
+
