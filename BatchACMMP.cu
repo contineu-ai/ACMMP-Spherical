@@ -28,21 +28,105 @@ void checkCudaLimits() {
 
 // ProblemGPUResources implementation
 ProblemGPUResources::ProblemGPUResources() {
-    for (int i = 0; i < MAX_IMAGES_PER_PROBLEM; ++i) {
+    for (int i = 0; i < MAX_IMAGES; ++i) {
         cuArray[i] = nullptr;
         cuDepthArray[i] = nullptr;
     }
 }
 
+void ProblemGPUResources::allocate(int max_width, int max_height, int max_images) {
+    // This function is called once per resource object when the pool is initialized.
+    
+    // Allocate arrays for images and depths using the maximum possible dimensions.
+    for (int i = 0; i < max_images; ++i) {
+        cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc(32, 0, 0, 0, cudaChannelFormatKindFloat);
+        CUDA_CHECK(cudaMallocArray(&cuArray[i], &channelDesc, max_width, max_height));
+        CUDA_CHECK(cudaMallocArray(&cuDepthArray[i], &channelDesc, max_width, max_height));
+    }
+
+    // Allocate all other required device memory buffers.
+    CUDA_CHECK(cudaMalloc(&cameras_cuda, sizeof(Camera) * max_images));
+    CUDA_CHECK(cudaMalloc(&texture_objects_cuda, sizeof(cudaTextureObjects)));
+    CUDA_CHECK(cudaMalloc(&texture_depths_cuda, sizeof(cudaTextureObjects)));
+    CUDA_CHECK(cudaMalloc(&plane_hypotheses_cuda, sizeof(float4) * max_width * max_height));
+    CUDA_CHECK(cudaMalloc(&scaled_plane_hypotheses_cuda, sizeof(float4) * max_width * max_height));
+    CUDA_CHECK(cudaMalloc(&costs_cuda, sizeof(float) * max_width * max_height));
+    CUDA_CHECK(cudaMalloc(&pre_costs_cuda, sizeof(float) * max_width * max_height));
+    CUDA_CHECK(cudaMalloc(&rand_states_cuda, sizeof(curandState) * max_width * max_height));
+    CUDA_CHECK(cudaMalloc(&selected_views_cuda, sizeof(unsigned int) * max_width * max_height));
+    CUDA_CHECK(cudaMalloc(&depths_cuda, sizeof(float) * max_width * max_height));
+    CUDA_CHECK(cudaMalloc(&prior_planes_cuda, sizeof(float4) * max_width * max_height));
+    CUDA_CHECK(cudaMalloc(&plane_masks_cuda, sizeof(unsigned int) * max_width * max_height));
+
+    // Allocate pinned host memory for high-speed asynchronous transfers.
+    CUDA_CHECK(cudaMallocHost(&planes_host_pinned, sizeof(float4) * max_width * max_height));
+    CUDA_CHECK(cudaMallocHost(&costs_host_pinned, sizeof(float) * max_width * max_height));
+}
+
+void BatchACMMP::initializeResourcePool() {
+    // Determine the maximum resource dimensions needed for any problem in the batch.
+    // This ensures all our pooled resources are large enough.
+    int max_width = 0, max_height = 0, max_images = 0;
+    for (const auto& p : all_problems) {
+        // A robust way to get dimensions would be to read the camera file for each problem.
+        // For simplicity, we use a fixed upper bound, but reading the files is better.
+        // This is a placeholder; you should replace it with actual dimension fetching logic
+        // if your image sizes vary significantly.
+        std::stringstream cam_path;
+        cam_path << dense_folder << "/cams/" << std::setw(8) << std::setfill('0') << p.ref_image_id << "_cam.txt";
+        Camera cam = ReadCamera(cam_path.str());
+        
+        max_width = std::max(max_width, (int)cam.width);
+        max_height = std::max(max_height, (int)cam.height);
+        max_images = std::max(max_images, (int)(1 + p.src_image_ids.size()));
+    }
+    // Clamp max_images to the maximum supported by the static array.
+    max_images = std::min(max_images, MAX_IMAGES);
+    
+    std::cout << "[BatchACMMP] Allocating resources for max dimensions: " 
+              << max_width << "x" << max_height << " with up to " << max_images << " images." << std::endl;
+
+    streams.resize(max_concurrent_problems);
+    resource_pool.resize(max_concurrent_problems);
+
+    int prio_low=0, prio_high=0;
+    CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&prio_low, &prio_high));
+    
+    for (size_t i = 0; i < max_concurrent_problems; ++i) {
+        CUDA_CHECK(cudaStreamCreateWithPriority(&streams[i], cudaStreamNonBlocking, prio_high));
+
+        std::unique_ptr<ProblemGPUResources> res(new ProblemGPUResources());
+        res->stream_id = (int)i;
+        res->stream = streams[i];
+
+        // Allocate the GPU memory for this resource object.
+        res->allocate(max_width, max_height, max_images);
+
+        available_resources.push(res.get());
+        resource_pool[i] = std::move(res);
+    }
+    
+    // Launch GPU worker threads.
+    gpu_worker_threads.reserve(max_concurrent_problems);
+    for (size_t i = 0; i < max_concurrent_problems; ++i) {
+        gpu_worker_threads.emplace_back(&BatchACMMP::gpuWorkerFunction, this);
+    }
+    
+    std::cout << "[BatchACMMP] Created " << max_concurrent_problems << " GPU worker threads" << std::endl;
+}
+
+
 ProblemGPUResources::~ProblemGPUResources() { 
     cleanup(); 
 }
+
+// In BatchACMMP.cu, replace the entire cleanup function with this one.
 
 void ProblemGPUResources::cleanup() {
     // Don't synchronize the stream here - it's owned by BatchACMMP
     // Just clean up the resources allocated by this object
     
-    for (int i = 0; i < MAX_IMAGES_PER_PROBLEM; ++i) {
+    for (int i = 0; i < MAX_IMAGES; ++i) {
         if (cuArray[i]) { 
             cudaFreeArray(cuArray[i]); 
             cuArray[i] = nullptr; 
@@ -53,6 +137,7 @@ void ProblemGPUResources::cleanup() {
         }
     }
 
+    // C++11 COMPATIBLE FIX: Define the lambda to take void*&
     auto safeFree = [](void*& ptr, const char* name) {
         if (ptr) {
             cudaError_t err = cudaFree(ptr);
@@ -63,18 +148,19 @@ void ProblemGPUResources::cleanup() {
         }
     };
 
-    safeFree(cameras_cuda, "cameras_cuda");
-    safeFree(texture_objects_cuda, "texture_objects_cuda");
-    safeFree(texture_depths_cuda, "texture_depths_cuda");
-    safeFree(plane_hypotheses_cuda, "plane_hypotheses_cuda");
-    safeFree(scaled_plane_hypotheses_cuda, "scaled_plane_hypotheses_cuda");
-    safeFree(costs_cuda, "costs_cuda");
-    safeFree(pre_costs_cuda, "pre_costs_cuda");
-    safeFree(rand_states_cuda, "rand_states_cuda");
-    safeFree(selected_views_cuda, "selected_views_cuda");
-    safeFree(depths_cuda, "depths_cuda");
-    safeFree(prior_planes_cuda, "prior_planes_cuda");
-    safeFree(plane_masks_cuda, "plane_masks_cuda");
+    // C++11 COMPATIBLE FIX: Add a (void*&) cast to every call
+    safeFree((void*&)cameras_cuda, "cameras_cuda");
+    safeFree((void*&)texture_objects_cuda, "texture_objects_cuda");
+    safeFree((void*&)texture_depths_cuda, "texture_depths_cuda");
+    safeFree((void*&)plane_hypotheses_cuda, "plane_hypotheses_cuda");
+    safeFree((void*&)scaled_plane_hypotheses_cuda, "scaled_plane_hypotheses_cuda");
+    safeFree((void*&)costs_cuda, "costs_cuda");
+    safeFree((void*&)pre_costs_cuda, "pre_costs_cuda");
+    safeFree((void*&)rand_states_cuda, "rand_states_cuda");
+    safeFree((void*&)selected_views_cuda, "selected_views_cuda");
+    safeFree((void*&)depths_cuda, "depths_cuda");
+    safeFree((void*&)prior_planes_cuda, "prior_planes_cuda");
+    safeFree((void*&)plane_masks_cuda, "plane_masks_cuda");
 
     if (planes_host_pinned) { 
         cudaFreeHost(planes_host_pinned); 
@@ -88,7 +174,6 @@ void ProblemGPUResources::cleanup() {
     // Clear the stream reference (don't destroy it - BatchACMMP owns it)
     stream = nullptr;
 }
-
 
 // BatchACMMP implementation
 BatchACMMP::BatchACMMP(const std::string& dense_folder_, 
@@ -162,34 +247,22 @@ BatchACMMP::~BatchACMMP() {
         }
     }
     
-    // Step 4: Synchronize streams BEFORE cleaning up resources
-    for (auto& s : streams) {
-        if (s) {
-            cudaError_t err = cudaStreamSynchronize(s);
-            if (err != cudaSuccess && err != cudaErrorCudartUnloading) {
-                // Ignore errors during shutdown
-            }
-        }
-    }
-    
-    // Step 5: Clean up GPU resources (they may reference streams)
+    // Step 4: Clean up GPU resources FIRST (they may reference streams)
     for (auto& res : resource_pool) {
-        if (res) {
-            res->cleanup();  // This won't try to sync the stream now
+        if (res && res->stream) {
+            cudaStreamSynchronize(res->stream);  // sync per stream
+            res->cleanup();
         }
     }
-    
-    // Step 6: NOW destroy the streams after resources are cleaned up
+
+    // Step 5: NOW destroy the streams
     for (auto& s : streams) {
         if (s) {
-            cudaError_t err = cudaStreamDestroy(s);
-            if (err != cudaSuccess && err != cudaErrorCudartUnloading) {
-                // Ignore errors during shutdown
-            }
+            cudaStreamDestroy(s);
             s = nullptr;
         }
     }
-    
+        
     // Step 7: Final device synchronization
     cudaError_t err = cudaDeviceSynchronize();
     if (err != cudaSuccess && err != cudaErrorCudartUnloading) {
@@ -251,32 +324,33 @@ size_t BatchACMMP::getProcessMemoryUsage() const {
     return 0;
 }
 
-void BatchACMMP::initializeResourcePool() {
-    streams.resize(max_concurrent_problems);
-    resource_pool.resize(max_concurrent_problems);
 
-    int prio_low=0, prio_high=0;
-    CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&prio_low, &prio_high));
-    
-    for (size_t i = 0; i < max_concurrent_problems; ++i) {
-        CUDA_CHECK(cudaStreamCreateWithPriority(&streams[i], cudaStreamNonBlocking, prio_high));
+// void BatchACMMP::initializeResourcePool() {
+//     streams.resize(max_concurrent_problems);
+//     resource_pool.resize(max_concurrent_problems);
 
-        std::unique_ptr<ProblemGPUResources> res(new ProblemGPUResources());
-        res->stream_id = (int)i;
-        res->stream = streams[i];
+//     int prio_low=0, prio_high=0;
+//     CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&prio_low, &prio_high));
+    
+//     for (size_t i = 0; i < max_concurrent_problems; ++i) {
+//         CUDA_CHECK(cudaStreamCreateWithPriority(&streams[i], cudaStreamNonBlocking, prio_high));
 
-        available_resources.push(res.get());
-        resource_pool[i] = std::move(res);
-    }
+//         std::unique_ptr<ProblemGPUResources> res(new ProblemGPUResources());
+//         res->stream_id = (int)i;
+//         res->stream = streams[i];
+
+//         available_resources.push(res.get());
+//         resource_pool[i] = std::move(res);
+//     }
     
-    // Launch GPU worker threads
-    gpu_worker_threads.reserve(max_concurrent_problems);
-    for (size_t i = 0; i < max_concurrent_problems; ++i) {
-        gpu_worker_threads.emplace_back(&BatchACMMP::gpuWorkerFunction, this);
-    }
+//     // Launch GPU worker threads
+//     gpu_worker_threads.reserve(max_concurrent_problems);
+//     for (size_t i = 0; i < max_concurrent_problems; ++i) {
+//         gpu_worker_threads.emplace_back(&BatchACMMP::gpuWorkerFunction, this);
+//     }
     
-    std::cout << "[BatchACMMP] Created " << max_concurrent_problems << " GPU worker threads" << std::endl;
-}
+//     std::cout << "[BatchACMMP] Created " << max_concurrent_problems << " GPU worker threads" << std::endl;
+// }
 
 void BatchACMMP::initializeDiskWriters() {
     // Launch disk writer threads
@@ -398,55 +472,83 @@ void BatchACMMP::processProblemOnStream(int problem_idx, ProblemGPUResources* re
     const Problem& problem = all_problems[problem_idx];
     cudaStream_t stream = resources->stream;
     
+    // Set the device explicitly for this thread.
+    cudaSetDevice(0);
+    
     active_gpu_problems_.fetch_add(1);
     
     try {
-        // Process with ACMMP
-        ACMMP acmmp;
-        if (geom_consistency) acmmp.SetGeomConsistencyParams(multi_geometry);
-        if (hierarchy) acmmp.SetHierarchyParams();
-
-        acmmp.SetStream(stream);
-        acmmp.InuputInitialization(dense_folder, all_problems, problem_idx);
-        acmmp.CudaSpaceInitialization(dense_folder, problem);
-        acmmp.RunPatchMatch();
-
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-
-        // Extract results
-        const int width = acmmp.GetReferenceImageWidth();
-        const int height = acmmp.GetReferenceImageHeight();
-
-        cv::Mat_<float> depths = cv::Mat::zeros(height, width, CV_32FC1);
-        cv::Mat_<cv::Vec3f> normals = cv::Mat::zeros(height, width, CV_32FC3);
-        cv::Mat_<float> costs = cv::Mat::zeros(height, width, CV_32FC1);
-
-        for (int y = 0; y < height; ++y) {
-            float* drow = depths.ptr<float>(y);
-            cv::Vec3f* nrow = normals.ptr<cv::Vec3f>(y);
-            float* crow = costs.ptr<float>(y);
-            
-            for (int x = 0; x < width; ++x) {
-                const int c = y * width + x;
-                const float4 plane_hypothesis = acmmp.GetPlaneHypothesis(c);
-                drow[x] = plane_hypothesis.w;
-                nrow[x] = cv::Vec3f(plane_hypothesis.x, plane_hypothesis.y, plane_hypothesis.z);
-                crow[x] = acmmp.GetCost(c);
-            }
+        cudaStreamSynchronize(stream);
+        // Ensure the stream is valid before creating ACMMP.
+        cudaError_t stream_check = cudaStreamQuery(stream);
+        if (stream_check == cudaErrorInvalidResourceHandle) {
+            std::cerr << "Invalid stream for problem " << problem_idx << ", creating new stream" << std::endl;
+            cudaStreamCreate(&stream);
+            resources->stream = stream;
         }
-
-        // Queue for disk writing (move semantics to avoid copying)
+        
+        // Process in an isolated scope to manage ACMMP's lifetime.
         {
-            std::lock_guard<std::mutex> lk(disk_queue_mutex_);
-            disk_write_queue_.emplace(problem_idx, problem, 
-                                     std::move(depths), std::move(normals), 
-                                     std::move(costs), geom_consistency);
-        }
-        disk_queue_cv_.notify_one();
+            ACMMP acmmp;
+            if (geom_consistency) acmmp.SetGeomConsistencyParams(multi_geometry);
+            if (hierarchy) acmmp.SetHierarchyParams();
 
+            // Set the stream for the ACMMP object to use for async operations.
+            acmmp.SetStream(stream);
+            
+            // Initialize host-side data (reading images from disk).
+            acmmp.InuputInitialization(dense_folder, all_problems, problem_idx);
+            
+            // Initialize CUDA space by copying data to the pre-allocated GPU buffers.
+            acmmp.CudaSpaceInitialization(dense_folder, problem, resources);
+            
+            // Ensure everything is set up before running.
+            cudaError_t pre_run_check = cudaGetLastError();
+            if (pre_run_check != cudaSuccess) {
+                std::cerr << "Pre-run error: " << cudaGetErrorString(pre_run_check) << std::endl;
+                throw std::runtime_error("CUDA setup failed");
+            }
+            
+            // Run the main algorithm, using the provided GPU resources.
+            acmmp.RunPatchMatch(resources);
+            
+            // Synchronize the stream to ensure results are ready before extraction.
+            cudaStreamSynchronize(stream);
+            
+            // Extract results...
+            const int width = acmmp.GetReferenceImageWidth();
+            const int height = acmmp.GetReferenceImageHeight();
+
+            cv::Mat_<float> depths(height, width);
+            cv::Mat_<cv::Vec3f> normals(height, width);
+            cv::Mat_<float> costs(height, width);
+
+            for (int y = 0; y < height; ++y) {
+                for (int x = 0; x < width; ++x) {
+                    const int c = y * width + x;
+                    const float4 plane_hypothesis = acmmp.GetPlaneHypothesis(c);
+                    depths(y, x) = plane_hypothesis.w;
+                    normals(y, x) = cv::Vec3f(plane_hypothesis.x, plane_hypothesis.y, plane_hypothesis.z);
+                    costs(y, x) = acmmp.GetCost(c);
+                }
+            }
+
+            // Queue the results for asynchronous disk writing.
+            {
+                std::lock_guard<std::mutex> lk(disk_queue_mutex_);
+                disk_write_queue_.emplace(problem_idx, problem, 
+                                         std::move(depths), std::move(normals), 
+                                         std::move(costs), geom_consistency);
+            }
+            disk_queue_cv_.notify_one();
+        } // ACMMP destructor is called here, freeing only its HOST memory.
+        
+        // Final sync after ACMMP is destroyed.
+        cudaStreamSynchronize(stream);
+        
     } catch (const std::exception& e) {
-        std::cerr << "[S" << resources->stream_id << "] Exception in problem " << problem_idx 
-                  << ": " << e.what() << std::endl;
+        std::cerr << "[Problem " << problem_idx << "] Exception: " << e.what() << std::endl;
+        cudaGetLastError(); // Clear any pending errors.
         throw;
     }
     

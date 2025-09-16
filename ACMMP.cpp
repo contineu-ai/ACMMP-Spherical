@@ -1,4 +1,5 @@
 #include "ACMMP.h"
+#include "BatchACMMP.h"
 #include <cmath>
 
 #include <cstdarg>
@@ -40,7 +41,8 @@ void StringAppendV(std::string* dst, const char* format, va_list ap) {
   // Increase the buffer size to the size requested by vsnprintf,
   // plus one for the closing \0.
   const int variable_buffer_size = result + 1;
-  std::unique_ptr<char> variable_buffer(new char[variable_buffer_size]);
+//   std::unique_ptr<char> variable_buffer(new char[variable_buffer_size]);
+  std::unique_ptr<char[]> variable_buffer(new char[variable_buffer_size]);
 
   // Restore the va_list before we use it again.
   va_copy(backup_ap, ap);
@@ -101,47 +103,24 @@ ACMMP::ACMMP() {}
 
 ACMMP::~ACMMP()
 {
+    // Free only the host-side memory that was allocated by this ACMMP instance.
     delete[] plane_hypotheses_host;
     delete[] costs_host;
-
-    for (int i = 0; i < num_images; ++i) {
-        cudaDestroyTextureObject(texture_objects_host.images[i]);
-        cudaFreeArray(cuArray[i]);
-    }
-    cudaFree(texture_objects_cuda);
-    cudaFree(cameras_cuda);
-    cudaFree(plane_hypotheses_cuda);
-    cudaFree(costs_cuda);
-    // cudaFree(pre_costs_cuda);
-    cudaFree(rand_states_cuda);
-    cudaFree(selected_views_cuda);
-    cudaFree(depths_cuda);
-
-    if (params.geom_consistency) {
-        for (int i = 0; i < num_images; ++i) {
-            cudaDestroyTextureObject(texture_depths_host.images[i]);
-            cudaFreeArray(cuDepthArray[i]);
-        }
-        cudaFree(texture_depths_cuda);
-    }
-
+    
+    // Note: The original destructor had other host allocations to free.
+    // Ensure you free any other host memory allocated with 'new' here.
     if (params.hierarchy) {
-        delete[] scaled_plane_hypotheses_host;
+        delete[] scaled_plane_hypotheses_host; // Assuming these were created in this class
         delete[] pre_costs_host;
-
-        cudaFree(scaled_plane_hypotheses_cuda);
-        cudaFree(pre_costs_cuda);
     }
 
     if (params.planar_prior) {
         delete[] prior_planes_host;
         delete[] plane_masks_host;
-
-        cudaFree(prior_planes_cuda);
-        cudaFree(plane_masks_cuda);
     }
 
 }
+
 #include <string> // For std::stof
 
 Camera ReadCamera(const std::string &cam_path)
@@ -676,64 +655,63 @@ void ACMMP::InuputInitialization(const std::string &dense_folder, const std::vec
     }
 }
 
-void ACMMP::CudaSpaceInitialization(const std::string &dense_folder, const Problem &problem)
+
+void ACMMP::CudaSpaceInitialization(const std::string &dense_folder, const Problem &problem, ProblemGPUResources* res)
 {
+    // This function populates the pre-allocated buffers inside the 'res' object.
+    // It does NOT allocate any new GPU memory.
     num_images = (int)images.size();
+    cudaStream_t s = stream_ ? stream_ : 0;
 
     for (int i = 0; i < num_images; ++i) {
         int rows = images[i].rows;
         int cols = images[i].cols;
 
-        cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc(32, 0, 0, 0, cudaChannelFormatKindFloat);
-        cudaMallocArray(&cuArray[i], &channelDesc, cols, rows);
-        cudaMemcpy2DToArray (cuArray[i], 0, 0, images[i].ptr<float>(), images[i].step[0], cols*sizeof(float), rows, cudaMemcpyHostToDevice);
+        // Copy image data to the pre-allocated cudaArray.
+        CUDA_CHECK(cudaMemcpy2DToArrayAsync(res->cuArray[i], 0, 0, images[i].ptr<float>(), images[i].step[0], cols * sizeof(float), rows, cudaMemcpyHostToDevice, s));
 
         struct cudaResourceDesc resDesc;
         memset(&resDesc, 0, sizeof(cudaResourceDesc));
         resDesc.resType = cudaResourceTypeArray;
-        resDesc.res.array.array = cuArray[i];
+        resDesc.res.array.array = res->cuArray[i]; // Use the persistent array from the resource pool
 
         struct cudaTextureDesc texDesc;
         memset(&texDesc, 0, sizeof(cudaTextureDesc));
         texDesc.addressMode[0] = cudaAddressModeWrap;
         texDesc.addressMode[1] = cudaAddressModeClamp;
         texDesc.filterMode = cudaFilterModeLinear;
-        texDesc.readMode  = cudaReadModeElementType;
+        texDesc.readMode = cudaReadModeElementType;
         texDesc.normalizedCoords = 0;
 
-        cudaCreateTextureObject(&(texture_objects_host.images[i]), &resDesc, &texDesc, NULL);
+        // Destroy the old texture object handle if it exists from a previous run.
+        if (res->texture_objects_host.images[i] != 0) {
+            cudaDestroyTextureObject(res->texture_objects_host.images[i]);
+        }
+        // Create a new texture object and store its handle in the persistent resource struct.
+        CUDA_CHECK(cudaCreateTextureObject(&(res->texture_objects_host.images[i]), &resDesc, &texDesc, NULL));
     }
-    cudaMalloc((void**)&texture_objects_cuda, sizeof(cudaTextureObjects));
-    cudaMemcpy(texture_objects_cuda, &texture_objects_host, sizeof(cudaTextureObjects), cudaMemcpyHostToDevice);
+    
+    // Copy the host-side struct containing the new texture handles to the device-side struct.
+    CUDA_CHECK(cudaMemcpyAsync(res->texture_objects_cuda, &res->texture_objects_host, sizeof(cudaTextureObjects), cudaMemcpyHostToDevice, s));
 
-    cudaMalloc((void**)&cameras_cuda, sizeof(Camera) * (num_images));
-    cudaMemcpy(cameras_cuda, &cameras[0], sizeof(Camera) * (num_images), cudaMemcpyHostToDevice);
+    // Copy camera data to the pre-allocated device buffer.
+    CUDA_CHECK(cudaMemcpyAsync(res->cameras_cuda, &cameras[0], sizeof(Camera) * num_images, cudaMemcpyHostToDevice, s));
 
+    // Allocate host memory for results (this is owned by the temporary ACMMP object).
     plane_hypotheses_host = new float4[cameras[0].height * cameras[0].width];
-    cudaMalloc((void**)&plane_hypotheses_cuda, sizeof(float4) * (cameras[0].height * cameras[0].width));
-
     costs_host = new float[cameras[0].height * cameras[0].width];
-    cudaMalloc((void**)&costs_cuda, sizeof(float) * (cameras[0].height * cameras[0].width));
-    // cudaMalloc((void**)&pre_costs_cuda, sizeof(float) * (cameras[0].height * cameras[0].width));
-
-    cudaMalloc((void**)&rand_states_cuda, sizeof(curandState) * (cameras[0].height * cameras[0].width));
-    cudaMalloc((void**)&selected_views_cuda, sizeof(unsigned int) * (cameras[0].height * cameras[0].width));
-
-    cudaMalloc((void**)&depths_cuda, sizeof(float) * (cameras[0].height * cameras[0].width));
 
     if (params.geom_consistency) {
         for (int i = 0; i < num_images; ++i) {
             int rows = depths[i].rows;
             int cols = depths[i].cols;
 
-            cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc(32, 0, 0, 0, cudaChannelFormatKindFloat);
-            cudaMallocArray(&cuDepthArray[i], &channelDesc, cols, rows);
-            cudaMemcpy2DToArray (cuDepthArray[i], 0, 0, depths[i].ptr<float>(), depths[i].step[0], cols*sizeof(float), rows, cudaMemcpyHostToDevice);
+            CUDA_CHECK(cudaMemcpy2DToArrayAsync(res->cuDepthArray[i], 0, 0, depths[i].ptr<float>(), depths[i].step[0], cols*sizeof(float), rows, cudaMemcpyHostToDevice, s));
 
             struct cudaResourceDesc resDesc;
             memset(&resDesc, 0, sizeof(cudaResourceDesc));
             resDesc.resType = cudaResourceTypeArray;
-            resDesc.res.array.array = cuDepthArray[i];
+            resDesc.res.array.array = res->cuDepthArray[i];
 
             struct cudaTextureDesc texDesc;
             memset(&texDesc, 0, sizeof(cudaTextureDesc));
@@ -743,13 +721,16 @@ void ACMMP::CudaSpaceInitialization(const std::string &dense_folder, const Probl
             texDesc.readMode  = cudaReadModeElementType;
             texDesc.normalizedCoords = 0;
 
-            cudaCreateTextureObject(&(texture_depths_host.images[i]), &resDesc, &texDesc, NULL);
+            if (res->texture_depths_host.images[i] != 0) {
+                cudaDestroyTextureObject(res->texture_depths_host.images[i]);
+            }
+            CUDA_CHECK(cudaCreateTextureObject(&(res->texture_depths_host.images[i]), &resDesc, &texDesc, NULL));
         }
-        cudaMalloc((void**)&texture_depths_cuda, sizeof(cudaTextureObjects));
-        cudaMemcpy(texture_depths_cuda, &texture_depths_host, sizeof(cudaTextureObjects), cudaMemcpyHostToDevice);
+        CUDA_CHECK(cudaMemcpyAsync(res->texture_depths_cuda, &res->texture_depths_host, sizeof(cudaTextureObjects), cudaMemcpyHostToDevice, s));
 
         std::stringstream result_path;
         result_path << dense_folder << "/ACMMP" << "/2333_" << std::setw(8) << std::setfill('0') << problem.ref_image_id;
+
         std::string result_folder = result_path.str();
         std::string suffix = "/depths.dmb";
         if (params.multi_geometry) {
@@ -758,29 +739,31 @@ void ACMMP::CudaSpaceInitialization(const std::string &dense_folder, const Probl
         std::string depth_path = result_folder + suffix;
         std::string normal_path = result_folder + "/normals.dmb";
         std::string cost_path = result_folder + "/costs.dmb";
+        
         cv::Mat_<float> ref_depth;
         cv::Mat_<cv::Vec3f> ref_normal;
         cv::Mat_<float> ref_cost;
         readDepthDmb(depth_path, ref_depth);
-        depths.push_back(ref_depth);
         readNormalDmb(normal_path, ref_normal);
         readDepthDmb(cost_path, ref_cost);
+        
         int width = ref_depth.cols;
         int height = ref_depth.rows;
-        for (int col = 0; col < width; ++col) {
-            for (int row = 0; row < height; ++row) {
-                int center = row * width + col;
-                float4 plane_hypothesis;
-                plane_hypothesis.x = ref_normal(row, col)[0];
-                plane_hypothesis.y = ref_normal(row, col)[1];
-                plane_hypothesis.z = ref_normal(row, col)[2];
-                plane_hypothesis.w = ref_depth(row, col);
-                plane_hypotheses_host[center] = plane_hypothesis;
-                costs_host[center] = ref_cost(row, col);
+        std::vector<float4> initial_planes(width * height);
+        std::vector<float> initial_costs(width * height);
+        
+        for (int y = 0; y < height; ++y) {
+            for (int x = 0; x < width; ++x) {
+                int center = y * width + x;
+                initial_planes[center].x = ref_normal(y, x)[0];
+                initial_planes[center].y = ref_normal(y, x)[1];
+                initial_planes[center].z = ref_normal(y, x)[2];
+                initial_planes[center].w = ref_depth(y, x);
+                initial_costs[center] = ref_cost(y, x);
             }
         }
-        cudaMemcpy(plane_hypotheses_cuda, plane_hypotheses_host, sizeof(float4) * width * height, cudaMemcpyHostToDevice);
-        cudaMemcpy(costs_cuda, costs_host, sizeof(float) * width * height, cudaMemcpyHostToDevice);
+        CUDA_CHECK(cudaMemcpyAsync(res->plane_hypotheses_cuda, initial_planes.data(), sizeof(float4) * width * height, cudaMemcpyHostToDevice, s));
+        CUDA_CHECK(cudaMemcpyAsync(res->costs_cuda, initial_costs.data(), sizeof(float) * width * height, cudaMemcpyHostToDevice, s));
     }
 
     if (params.hierarchy) {
@@ -790,19 +773,21 @@ void ACMMP::CudaSpaceInitialization(const std::string &dense_folder, const Probl
         std::string depth_path = result_folder + "/depths.dmb";
         std::string normal_path = result_folder + "/normals.dmb";
         std::string cost_path = result_folder + "/costs.dmb";
+
         cv::Mat_<float> ref_depth;
         cv::Mat_<cv::Vec3f> ref_normal;
         cv::Mat_<float> ref_cost;
         readDepthDmb(depth_path, ref_depth);
-        depths.push_back(ref_depth);
         readNormalDmb(normal_path, ref_normal);
         readDepthDmb(cost_path, ref_cost);
+        
         int width = ref_normal.cols;
         int height = ref_normal.rows;
-        scaled_plane_hypotheses_host= new float4[height * width];
-        cudaMalloc((void**)&scaled_plane_hypotheses_cuda, sizeof(float4) * height * width);
+        
+        // Allocate HOST memory for hierarchy data (owned by this ACMMP object)
+        scaled_plane_hypotheses_host = new float4[height * width];
         pre_costs_host = new float[height * width];
-        cudaMalloc((void**)&pre_costs_cuda, sizeof(float) * cameras[0].height * cameras[0].width);
+
         if (width != images[0].cols || height != images[0].rows) {
             params.upsample = true;
             params.scaled_cols = width;
@@ -811,34 +796,31 @@ void ACMMP::CudaSpaceInitialization(const std::string &dense_folder, const Probl
         else {
             params.upsample = false;
         }
-        for (int col = 0; col < width; ++col) {
-            for (int row = 0; row < height; ++row) {
+
+        for (int row = 0; row < height; ++row) {
+            for (int col = 0; col < width; ++col) {
                 int center = row * width + col;
                 float4 plane_hypothesis;
                 plane_hypothesis.x = ref_normal(row, col)[0];
                 plane_hypothesis.y = ref_normal(row, col)[1];
                 plane_hypothesis.z = ref_normal(row, col)[2];
-                if (params.upsample) {
-                    plane_hypothesis.w = ref_cost(row, col);
-                }
-                else {
-                    plane_hypothesis.w = ref_depth(row, col);
-                }
+                plane_hypothesis.w = params.upsample ? ref_cost(row, col) : ref_depth(row, col);
                 scaled_plane_hypotheses_host[center] = plane_hypothesis;
             }
         }
 
-        for (int col = 0; col < cameras[0].width; ++col) {
-            for (int row = 0; row < cameras[0].height; ++row) {
+        // Prepare initial plane hypotheses for the current, higher resolution
+        std::vector<float4> initial_planes_for_current_res(cameras[0].width * cameras[0].height);
+        for (int row = 0; row < cameras[0].height; ++row) {
+            for (int col = 0; col < cameras[0].width; ++col) {
                 int center = row * cameras[0].width + col;
-                float4 plane_hypothesis;
-                plane_hypothesis.w = ref_depth(row, col);
-                plane_hypotheses_host[center] = plane_hypothesis;
+                initial_planes_for_current_res[center].w = ref_depth(row, col);
             }
         }
-
-        cudaMemcpy(scaled_plane_hypotheses_cuda, scaled_plane_hypotheses_host, sizeof(float4) * height * width, cudaMemcpyHostToDevice);
-        cudaMemcpy(plane_hypotheses_cuda, plane_hypotheses_host, sizeof(float4) * cameras[0].width * cameras[0].height, cudaMemcpyHostToDevice);
+        
+        // Copy data to the PRE-ALLOCATED device buffers in the resource pool
+        CUDA_CHECK(cudaMemcpyAsync(res->scaled_plane_hypotheses_cuda, scaled_plane_hypotheses_host, sizeof(float4) * height * width, cudaMemcpyHostToDevice, s));
+        CUDA_CHECK(cudaMemcpyAsync(res->plane_hypotheses_cuda, initial_planes_for_current_res.data(), sizeof(float4) * cameras[0].width * cameras[0].height, cudaMemcpyHostToDevice, s));
     }
 }
 
@@ -1074,7 +1056,7 @@ float ACMMP::GetDepthFromPlaneParam(const float4 plane_hypothesis, const int x, 
      cudaDeviceSynchronize();
  }
 
-void RunJBU(const cv::Mat_<float>  &scaled_image_float, const cv::Mat_<float> &src_depthmap, const std::string &dense_folder , const Problem &problem)
+void RunJBU(const cv::Mat_<float>  &scaled_image_float, const cv::Mat_<float> &src_depthmap, const std::string &dense_folder , const Problem &problem)           
 {
     uint32_t rows = scaled_image_float.rows;
     uint32_t cols = scaled_image_float.cols;
@@ -1096,8 +1078,10 @@ void RunJBU(const cv::Mat_<float>  &scaled_image_float, const cv::Mat_<float> &s
     jbu.jp_h.s_width = src_depthmap.cols;
     jbu.jp_h.Imagescale = Imagescale;
     JBUAddImageToTextureFloatGray(imgs, jbu.jt_h.imgs, jbu.cuArray, JBU_NUM);
+    const cudaStream_t s = 0;
 
     jbu.InitializeParameters(rows * cols);
+    jbu.SetStream(s);
     jbu.CudaRun();
 
     cv::Mat_<float> depthmap = cv::Mat::zeros( rows, cols, CV_32FC1 );

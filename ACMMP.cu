@@ -1,4 +1,5 @@
 #include "ACMMP.h"
+#include "BatchACMMP.h" 
 #include "ACMMP_device.cuh"  // Include the device functions header
 #include <math_constants.h>  // for CUDART_PI_F
 #include <memory>
@@ -1516,56 +1517,72 @@ __global__ void RedPixelFilter(const Camera *cameras, float4 *plane_hypotheses, 
     CheckerboardFilter(cameras, plane_hypotheses, costs, p);
 }
 
-void ACMMP::RunPatchMatch()
-{
-    const int width = cameras[0].width;
+void ACMMP::RunPatchMatch(ProblemGPUResources* res) {
+    // Create a local copy of the stream handle for safety.
+    cudaStream_t s = stream_ ? stream_ : 0;
+    
+    const int width  = cameras[0].width;
     const int height = cameras[0].height;
 
-    int BLOCK_W = 32;
-    int BLOCK_H = (BLOCK_W / 2);
+    const int BLOCK_W = 32;
+    const int BLOCK_H = 16; // BLOCK_W / 2 is common
 
-    dim3 grid_size_randinit;
-    grid_size_randinit.x = (width + 16 - 1) / 16;
-    grid_size_randinit.y= (height + 16 - 1) / 16;
-    grid_size_randinit.z = 1;
-    dim3 block_size_randinit;
-    block_size_randinit.x = 16;
-    block_size_randinit.y = 16;
-    block_size_randinit.z = 1;
+    dim3 grid_init((width + 15) / 16, (height + 15) / 16, 1);
+    dim3 blk_init(16, 16, 1);
 
-    dim3 grid_size_checkerboard;
-    grid_size_checkerboard.x = (width + BLOCK_W - 1) / BLOCK_W;
-    grid_size_checkerboard.y= ( (height / 2) + BLOCK_H - 1) / BLOCK_H;
-    grid_size_checkerboard.z = 1;
-    dim3 block_size_checkerboard;
-    block_size_checkerboard.x = BLOCK_W;
-    block_size_checkerboard.y = BLOCK_H;
-    block_size_checkerboard.z = 1;
+    dim3 grid_cb((width + BLOCK_W - 1) / BLOCK_W, ((height + 1) / 2 + BLOCK_H - 1) / BLOCK_H, 1);
+    dim3 blk_cb(BLOCK_W, BLOCK_H, 1);
 
-    int max_iterations = params.max_iterations;
+    const int max_iterations = params.max_iterations;
 
-    RandomInitialization<<<grid_size_randinit, block_size_randinit>>>(texture_objects_cuda, cameras_cuda, plane_hypotheses_cuda, scaled_plane_hypotheses_cuda, costs_cuda, pre_costs_cuda, rand_states_cuda, selected_views_cuda, prior_planes_cuda, plane_masks_cuda, params);
-    CUDA_SAFE_CALL(cudaDeviceSynchronize());
-
+    // Launch kernels using the pointers from the resource object 'res'.
+    RandomInitialization<<<grid_init, blk_init, 0, s>>>(
+        res->texture_objects_cuda, res->cameras_cuda, res->plane_hypotheses_cuda,
+        res->scaled_plane_hypotheses_cuda, res->costs_cuda, res->pre_costs_cuda,
+        res->rand_states_cuda, res->selected_views_cuda, res->prior_planes_cuda,
+        res->plane_masks_cuda, params);
+    CUDA_CHECK(cudaPeekAtLastError());
+    
     for (int i = 0; i < max_iterations; ++i) {
-        BlackPixelUpdate<<<grid_size_checkerboard, block_size_checkerboard>>>(texture_objects_cuda, texture_depths_cuda, cameras_cuda, plane_hypotheses_cuda, costs_cuda, pre_costs_cuda, rand_states_cuda, selected_views_cuda, prior_planes_cuda, plane_masks_cuda, params, i);
-        CUDA_SAFE_CALL(cudaDeviceSynchronize());
-        RedPixelUpdate<<<grid_size_checkerboard, block_size_checkerboard>>>(texture_objects_cuda, texture_depths_cuda, cameras_cuda, plane_hypotheses_cuda, costs_cuda, pre_costs_cuda,rand_states_cuda, selected_views_cuda, prior_planes_cuda, plane_masks_cuda, params, i);
-        CUDA_SAFE_CALL(cudaDeviceSynchronize());
-        // printf("iteration: %d\n", i);
+        BlackPixelUpdate<<<grid_cb, blk_cb, 0, s>>>(
+            res->texture_objects_cuda, res->texture_depths_cuda, res->cameras_cuda,
+            res->plane_hypotheses_cuda, res->costs_cuda, res->pre_costs_cuda,
+            res->rand_states_cuda, res->selected_views_cuda, res->prior_planes_cuda,
+            res->plane_masks_cuda, params, i);
+        CUDA_CHECK(cudaPeekAtLastError());
+
+        RedPixelUpdate<<<grid_cb, blk_cb, 0, s>>>(
+            res->texture_objects_cuda, res->texture_depths_cuda, res->cameras_cuda,
+            res->plane_hypotheses_cuda, res->costs_cuda, res->pre_costs_cuda,
+            res->rand_states_cuda, res->selected_views_cuda, res->prior_planes_cuda,
+            res->plane_masks_cuda, params, i);
+        CUDA_CHECK(cudaPeekAtLastError());
     }
 
-    GetDepthandNormal<<<grid_size_randinit, block_size_randinit>>>(cameras_cuda, plane_hypotheses_cuda, params);
-    CUDA_SAFE_CALL(cudaDeviceSynchronize());
+    GetDepthandNormal<<<grid_init, blk_init, 0, s>>>(res->cameras_cuda, res->plane_hypotheses_cuda, params);
+    CUDA_CHECK(cudaPeekAtLastError());
+    
+    BlackPixelFilter<<<grid_cb, blk_cb, 0, s>>>(res->cameras_cuda, res->plane_hypotheses_cuda, res->costs_cuda);
+    CUDA_CHECK(cudaPeekAtLastError());
+    
+    RedPixelFilter<<<grid_cb, blk_cb, 0, s>>>(res->cameras_cuda, res->plane_hypotheses_cuda, res->costs_cuda);
+    CUDA_CHECK(cudaPeekAtLastError());
 
-    BlackPixelFilter<<<grid_size_checkerboard, block_size_checkerboard>>>(cameras_cuda, plane_hypotheses_cuda, costs_cuda);
-    CUDA_SAFE_CALL(cudaDeviceSynchronize());
-    RedPixelFilter<<<grid_size_checkerboard, block_size_checkerboard>>>(cameras_cuda, plane_hypotheses_cuda, costs_cuda);
-    CUDA_SAFE_CALL(cudaDeviceSynchronize());
-
-    cudaMemcpy(plane_hypotheses_host, plane_hypotheses_cuda, sizeof(float4) * width * height, cudaMemcpyDeviceToHost);
-    cudaMemcpy(costs_host, costs_cuda, sizeof(float) * width * height, cudaMemcpyDeviceToHost);
-    CUDA_SAFE_CALL(cudaDeviceSynchronize());
+    // Asynchronously copy results from device to the resource's pinned host memory.
+    CUDA_CHECK(cudaMemcpyAsync(res->planes_host_pinned, res->plane_hypotheses_cuda,
+                    sizeof(float4) * width * height,
+                    cudaMemcpyDeviceToHost, s));
+    CUDA_CHECK(cudaMemcpyAsync(res->costs_host_pinned, res->costs_cuda,
+                    sizeof(float) * width * height,
+                    cudaMemcpyDeviceToHost, s));
+    
+    // Wait for the stream to finish all operations, including the copies.
+    CUDA_CHECK(cudaStreamSynchronize(s));
+    
+    // Now that the data is on the host, do a fast CPU-side copy
+    // from the pinned buffer to this object's final result buffer.
+    memcpy(plane_hypotheses_host, res->planes_host_pinned, sizeof(float4) * width * height);
+    memcpy(costs_host, res->costs_host_pinned, sizeof(float) * width * height);
 }
 
 __global__ void JBU_cu(JBUParameters *jp, JBUTexObj *jt, float *depth)
@@ -1630,34 +1647,37 @@ __global__ void JBU_cu(JBUParameters *jp, JBUTexObj *jt, float *depth)
 
 void JBU::CudaRun()
 {
-    int rows = jp_h.height;
-    int cols = jp_h.width;
+    const cudaStream_t s = stream_ ? stream_ : 0;
 
-    dim3 grid_size_initrand;
-    grid_size_initrand.x= (cols + 16 - 1) / 16;
-    grid_size_initrand.y=(rows + 16 - 1) / 16;
-    grid_size_initrand.z= 1;
-    dim3 block_size_initrand;
-    block_size_initrand.x = 16;
-    block_size_initrand.y = 16;
-    block_size_initrand.z = 1;
+    const int rows = jp_h.height;
+    const int cols = jp_h.width;
+
+    dim3 grid((cols + 15) / 16, (rows + 15) / 16, 1);
+    dim3 blk (16, 16, 1);
 
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
 
-    cudaEventRecord(start);
+    // Record events on the SAME stream
+    cudaEventRecord(start, s);
 
-    cudaDeviceSynchronize();
-    JBU_cu<<< grid_size_initrand, block_size_initrand>>>(jp_d, jt_d, depth_d);
-    cudaDeviceSynchronize();
+    // Launch on s (not default stream)
+    JBU_cu<<<grid, blk, 0, s>>>(jp_d, jt_d, depth_d);
+    CUDA_SAFE_CALL(cudaPeekAtLastError());
 
-    cudaMemcpy(depth_h, depth_d, sizeof(float) * rows * cols, cudaMemcpyDeviceToHost);
-    cudaDeviceSynchronize();
+    // Async copy on s, then fence s once
+    CUDA_SAFE_CALL(cudaMemcpyAsync(
+        depth_h, depth_d, sizeof(float) * rows * cols,
+        cudaMemcpyDeviceToHost, s));
 
-    cudaEventRecord(stop);
-    cudaEventSynchronize(stop);
-    float milliseconds = 0;
-    cudaEventElapsedTime(&milliseconds, start, stop);
-    printf("Total time needed for computation: %f seconds\n", milliseconds / 1000.f);
+    CUDA_SAFE_CALL(cudaEventRecord(stop, s));
+    CUDA_SAFE_CALL(cudaEventSynchronize(stop));
+
+    float ms = 0.f;
+    cudaEventElapsedTime(&ms, start, stop);
+    printf("Total time needed for computation: %f seconds\n", ms / 1000.f);
+
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
 }

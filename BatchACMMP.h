@@ -14,6 +14,7 @@
 #include <unordered_map>
 #include <functional>
 #include <cuda_runtime.h>
+#include "main.h"
 
 // CUDA error checking macro
 #define CUDA_CHECK(call) do { \
@@ -26,7 +27,49 @@
 
 // Forward declarations
 struct Problem;
-struct ProblemGPUResources;
+class ProblemGPUResources {
+public:
+    ProblemGPUResources();
+    ~ProblemGPUResources();
+
+    // NEW METHOD: Handles one-time allocation of all necessary GPU memory.
+    void allocate(int max_width, int max_height, int max_images);
+
+    // Handles freeing all allocated GPU memory.
+    void cleanup();
+
+    cudaStream_t stream = nullptr;
+    int stream_id = -1;
+
+    // === GPU DEVICE MEMORY (Owned by this object) ===
+    // CUDA arrays for 2D texture memory
+    cudaArray* cuArray[MAX_IMAGES];
+    cudaArray* cuDepthArray[MAX_IMAGES];
+    
+    // Pointers to device memory buffers
+    Camera* cameras_cuda = nullptr;
+    cudaTextureObjects* texture_objects_cuda = nullptr;
+    cudaTextureObjects* texture_depths_cuda = nullptr;
+    float4* plane_hypotheses_cuda = nullptr;
+    float4* scaled_plane_hypotheses_cuda = nullptr;
+    float* costs_cuda = nullptr;
+    float* pre_costs_cuda = nullptr;
+    curandState* rand_states_cuda = nullptr;
+    unsigned int* selected_views_cuda = nullptr;
+    float* depths_cuda = nullptr;
+    float4* prior_planes_cuda = nullptr;
+    unsigned int* plane_masks_cuda = nullptr;
+
+    // === HOST-SIDE HELPERS (Owned by this object) ===
+    // Host-side structs that hold the CUDA texture object handles.
+    // These need to be persistent to be copied to texture_objects_cuda.
+    cudaTextureObjects texture_objects_host;
+    cudaTextureObjects texture_depths_host;
+
+    // Pinned host memory for fast, asynchronous DMA transfers
+    float4* planes_host_pinned = nullptr;
+    float* costs_host_pinned = nullptr;
+};
 
 // Structure to hold completed results for disk writing
 struct CompletedResult {
@@ -83,7 +126,8 @@ public:
     void waitForGPUCompletion();
     void waitForDiskCompletion();
     void waitForCompletion();
-    
+    void allocate(int max_width, int max_height, int max_images);
+    void cleanup();
     // Memory and progress monitoring
     size_t getPeakMemoryUsage() const;
     size_t getCurrentMemoryUsage() const;
@@ -168,36 +212,6 @@ private:
     size_t getProcessMemoryUsage() const;
 };
 
-// GPU resource management struct
-struct ProblemGPUResources {
-    static constexpr int MAX_IMAGES_PER_PROBLEM = 32;
-    
-    int stream_id = -1;
-    cudaStream_t stream = nullptr;
-    
-    cudaArray* cuArray[MAX_IMAGES_PER_PROBLEM];
-    cudaArray* cuDepthArray[MAX_IMAGES_PER_PROBLEM];
-    
-    void* cameras_cuda = nullptr;
-    void* texture_objects_cuda = nullptr;
-    void* texture_depths_cuda = nullptr;
-    void* plane_hypotheses_cuda = nullptr;
-    void* scaled_plane_hypotheses_cuda = nullptr;
-    void* costs_cuda = nullptr;
-    void* pre_costs_cuda = nullptr;
-    void* rand_states_cuda = nullptr;
-    void* selected_views_cuda = nullptr;
-    void* depths_cuda = nullptr;
-    void* prior_planes_cuda = nullptr;
-    void* plane_masks_cuda = nullptr;
-    
-    void* planes_host_pinned = nullptr;
-    void* costs_host_pinned = nullptr;
-    
-    ProblemGPUResources();
-    ~ProblemGPUResources();
-    void cleanup();
-};
 
 #endif // BATCHACMMP_H
 

@@ -2,7 +2,7 @@
 #define _ACMMP_H_
 
 #include "main.h"
-
+class ProblemGPUResources; 
 int readDepthDmb(const std::string file_path, cv::Mat_<float> &depth);
 int readNormalDmb(const std::string file_path, cv::Mat_<cv::Vec3f> &normal);
 int writeDepthDmb(const std::string file_path, const cv::Mat_<float> depth);
@@ -60,10 +60,11 @@ public:
     ACMMP();
     ~ACMMP();
     void SetStream(cudaStream_t s) { stream_ = s; }
-    void InuputInitialization(const std::string &dense_folder, const std::vector<Problem> &problem, const int idx);
-    void Colmap2MVS(const std::string &dense_folder, std::vector<Problem> &problems);
-    void CudaSpaceInitialization(const std::string &dense_folder, const Problem &problem);
-    void RunPatchMatch();
+    cudaStream_t GetStream() const { return stream_; }   // <-- add this
+
+    void InuputInitialization(const std::string &dense_folder, const std::vector<Problem> &problems, const int idx);
+    void CudaSpaceInitialization(const std::string &dense_folder, const Problem &problem, ProblemGPUResources* res);
+    void RunPatchMatch(ProblemGPUResources* res);    void Colmap2MVS(const std::string &dense_folder, std::vector<Problem> &problems);
     void SetGeomConsistencyParams(bool multi_geometry);
     void SetPlanarPriorParams();
     void SetHierarchyParams();
@@ -137,7 +138,9 @@ public:
     float *depth_h;
     JBUTexObj jt_h;
     JBUParameters jp_h;
-
+    void SetStream(cudaStream_t s) { stream_ = s; }
+    void CudaRun();
+    cudaStream_t stream_ = 0; 
     // Device Parameters
     float *depth_d;
     cudaArray *cuArray[JBU_NUM]; // The first for reference image, and the second for stereo depth image
@@ -145,7 +148,7 @@ public:
     JBUParameters *jp_d;
 
     void InitializeParameters(int n);
-    void CudaRun();
+    
 };
 
 #endif // _ACMMP_H_

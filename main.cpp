@@ -30,6 +30,7 @@ void ProcessProblem(const std::string &dense_folder, const std::vector<Problem> 
                    const int idx, bool geom_consistency, bool planar_prior, 
                    bool hierarchy, bool multi_geometrty)
 {
+    ProblemGPUResources resources;
     const Problem problem = problems[idx];
     std::cout << "Processing image " << std::setw(8) << std::setfill('0') 
               << problem.ref_image_id << "..." << std::endl;
@@ -50,8 +51,8 @@ void ProcessProblem(const std::string &dense_folder, const std::vector<Problem> 
     }
 
     acmmp.InuputInitialization(dense_folder, problems, idx);
-    acmmp.CudaSpaceInitialization(dense_folder, problem);
-    acmmp.RunPatchMatch();
+    acmmp.CudaSpaceInitialization(dense_folder, problem,&resources);
+    acmmp.RunPatchMatch(&resources);
 
     const int width = acmmp.GetReferenceImageWidth();
     const int height = acmmp.GetReferenceImageHeight();
@@ -269,7 +270,7 @@ if (planar_prior) {
     std::cout << "  [timing] CudaPlanarPriorInitialization: " << ms(Tc0, Tc1) << " ms\n";
 
     auto Tp0 = clock::now();
-    acmmp.RunPatchMatch();
+    acmmp.RunPatchMatch(&resources);
     cudaDeviceSynchronize();
     auto Tp1 = clock::now();
     std::cout << "  [timing] RunPatchMatch (prior-assisted): " << ms(Tp0, Tp1) << " ms\n";
@@ -543,7 +544,7 @@ void JointBilateralUpsampling(const std::string &dense_folder, const Problem &pr
     cv::resize(image_float, scaled_image_float, cv::Size(new_cols,new_rows), 0, 0, cv::INTER_LINEAR);
 
     std::cout << "Run JBU for image " << problem.ref_image_id <<  ".jpg" << std::endl;
-    RunJBU(scaled_image_float, ref_depth, dense_folder, problem );
+    RunJBU(scaled_image_float, ref_depth, dense_folder, problem);
 }
 
 void ProcessProblemsInParallel(const std::string &dense_folder, 
