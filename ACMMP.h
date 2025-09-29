@@ -2,13 +2,7 @@
 #define _ACMMP_H_
 
 #include "main.h"
-
-int readDepthDmb(const std::string file_path, cv::Mat_<float> &depth);
-int readNormalDmb(const std::string file_path, cv::Mat_<cv::Vec3f> &normal);
-int writeDepthDmb(const std::string file_path, const cv::Mat_<float> depth);
-int writeNormalDmb(const std::string file_path, const cv::Mat_<cv::Vec3f> normal);
-
-Camera ReadCamera(const std::string &cam_path);
+#include "asyncio.h"
 void  RescaleImageAndCamera(cv::Mat_<cv::Vec3b> &src, cv::Mat_<cv::Vec3b> &dst, cv::Mat_<float> &depth, Camera &camera);
 float3 Get3DPointonWorld(const int x, const int y, const float depth, const Camera camera);
 void ProjectonCamera(const float3 PointX, const Camera camera, float2 &point, float &depth);
@@ -57,7 +51,34 @@ struct PatchMatchParams {
 
 class ACMMP {
 public:
-    ACMMP();
+    ACMMP() :
+    plane_hypotheses_host(nullptr),
+    costs_host(nullptr),
+    texture_objects_cuda(nullptr),
+    cameras_cuda(nullptr),
+    plane_hypotheses_cuda(nullptr),
+    costs_cuda(nullptr),
+    rand_states_cuda(nullptr),
+    selected_views_cuda(nullptr),
+    depths_cuda(nullptr),
+    texture_depths_cuda(nullptr),
+    scaled_plane_hypotheses_host(nullptr),
+    pre_costs_host(nullptr),
+    scaled_plane_hypotheses_cuda(nullptr),
+    pre_costs_cuda(nullptr),
+    prior_planes_host(nullptr),
+    plane_masks_host(nullptr),
+    prior_planes_cuda(nullptr),
+    plane_masks_cuda(nullptr),
+    num_images(0) // Also initialize non-pointer members
+{
+    // Initialize the pointer arrays to null
+    for (int i = 0; i < MAX_IMAGES; ++i) { // Assuming MAX_IMAGES is defined somewhere
+        cuArray[i] = nullptr;
+        cuDepthArray[i] = nullptr;
+    }
+}
+
     ~ACMMP();
     void SetStream(cudaStream_t s) { stream_ = s; }
     void InuputInitialization(const std::string &dense_folder, const std::vector<Problem> &problem, const int idx);
@@ -80,7 +101,13 @@ public:
     float GetMinDepth();
     float GetMaxDepth();
     void CudaPlanarPriorInitialization(const std::vector<float4> &PlaneParams, const cv::Mat_<float> &masks);
+    void SetAsyncLoader(std::shared_ptr<AsyncImageLoader> loader) {
+        loader_ = loader;
+    }
+    
 private:
+    std::shared_ptr<AsyncImageLoader> loader_;
+    
     cudaStream_t stream_ = 0; // default stream
     int num_images;
     std::vector<cv::Mat> images;

@@ -103,6 +103,7 @@ public:
 
 private:
     // Configuration
+    std::shared_ptr<AsyncImageLoader> async_loader_;
     std::string dense_folder;
     std::vector<Problem> all_problems;
     bool geom_consistency;
@@ -156,7 +157,11 @@ private:
     void initializeDiskWriters();
     ProblemGPUResources* acquireResources();
     void releaseResources(ProblemGPUResources* r);
-    
+    void printAsyncStats() {
+        if (async_loader_) {
+            async_loader_->printStats();
+        }
+    }
     void gpuWorkerFunction();
     void diskWriterFunction();
     void processProblemOnStream(int problem_idx, ProblemGPUResources* resources);

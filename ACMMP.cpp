@@ -97,7 +97,7 @@ void CudaCheckError(const char* file, const int line) {
   }
 }
 
-ACMMP::ACMMP() {}
+// ACMMP::ACMMP() {}
 
 ACMMP::~ACMMP()
 {
@@ -142,73 +142,73 @@ ACMMP::~ACMMP()
     }
 
 }
-#include <string> // For std::stof
+// #include <string> // For std::stof
 
-Camera ReadCamera(const std::string &cam_path)
-{
-    Camera camera;
-    std::ifstream file(cam_path);
-    if (!file.is_open()) {
-        std::cerr << "Error: Could not open camera file: " << cam_path << std::endl;
-        return camera;
-    }
-    std::string token;
+// Camera ReadCamera(const std::string &cam_path)
+// {
+//     Camera camera;
+//     std::ifstream file(cam_path);
+//     if (!file.is_open()) {
+//         std::cerr << "Error: Could not open camera file: " << cam_path << std::endl;
+//         return camera;
+//     }
+//     std::string token;
 
-    file >> token; // Consume "extrinsic"
-    for (int i = 0; i < 3; ++i) {
-        file >> camera.R[3 * i + 0] >> camera.R[3 * i + 1] >> camera.R[3 * i + 2] >> camera.t[i];
-    }
+//     file >> token; // Consume "extrinsic"
+//     for (int i = 0; i < 3; ++i) {
+//         file >> camera.R[3 * i + 0] >> camera.R[3 * i + 1] >> camera.R[3 * i + 2] >> camera.t[i];
+//     }
     
-    // --- FIX 1: Consume the extra "0.0 0.0 0.0 1.0" line ---
-    // This is the primary parsing bug.
-    float dummy_float;
-    for (int i = 0; i < 4; ++i) {
-        file >> dummy_float;
-    }
+//     // --- FIX 1: Consume the extra "0.0 0.0 0.0 1.0" line ---
+//     // This is the primary parsing bug.
+//     float dummy_float;
+//     for (int i = 0; i < 4; ++i) {
+//         file >> dummy_float;
+//     }
 
-    // Now the file stream is positioned correctly.
-    file >> token; // Consume "intrinsic" header
-    file >> token; // This token should be the model name or K[0]
+//     // Now the file stream is positioned correctly.
+//     file >> token; // Consume "intrinsic" header
+//     file >> token; // This token should be the model name or K[0]
 
-    if (token == "SPHERE") {
-        camera.model = ::SPHERE;
+//     if (token == "SPHERE") {
+//         camera.model = ::SPHERE;
         
-        // Use clear variable names
-        float file_f, file_cx, file_cy;
-        file >> file_f >> file_cx >> file_cy;
+//         // Use clear variable names
+//         float file_f, file_cx, file_cy;
+//         file >> file_f >> file_cx >> file_cy;
 
-        // Store the intrinsic parameters. Note that 'f' is not used in the new math,
-        // but we store it anyway.
-        camera.params[0] = file_f;
-        camera.params[1] = file_cx; 
-        camera.params[2] = file_cy; 
-        camera.width = file_cx*2;
-        camera.height = file_cy*2;
-        float depth_min, depth_interval;
-        int   n_depth_planes;
-        float depth_max;
+//         // Store the intrinsic parameters. Note that 'f' is not used in the new math,
+//         // but we store it anyway.
+//         camera.params[0] = file_f;
+//         camera.params[1] = file_cx; 
+//         camera.params[2] = file_cy; 
+//         camera.width = file_cx*2;
+//         camera.height = file_cy*2;
+//         float depth_min, depth_interval;
+//         int   n_depth_planes;
+//         float depth_max;
 
-        file >> depth_min >> depth_interval >> n_depth_planes >> depth_max;
+//         file >> depth_min >> depth_interval >> n_depth_planes >> depth_max;
 
-        camera.depth_min  = depth_min;
-        camera.depth_max  = depth_max;
+//         camera.depth_min  = depth_min;
+//         camera.depth_max  = depth_max;
         
-    } else {
-        // This is the PINHOLE camera format
-        camera.model = ::PINHOLE;
+//     } else {
+//         // This is the PINHOLE camera format
+//         camera.model = ::PINHOLE;
         
-        // The token was the first value of the K matrix.
-        camera.K[0] = std::stof(token);
-        file >> camera.K[1] >> camera.K[2];
-        file >> camera.K[3] >> camera.K[4] >> camera.K[5];
-        file >> camera.K[6] >> camera.K[7] >> camera.K[8];
+//         // The token was the first value of the K matrix.
+//         camera.K[0] = std::stof(token);
+//         file >> camera.K[1] >> camera.K[2];
+//         file >> camera.K[3] >> camera.K[4] >> camera.K[5];
+//         file >> camera.K[6] >> camera.K[7] >> camera.K[8];
 
-        float dummy1, dummy2;
-        file >> camera.depth_min >> camera.depth_max >> dummy1 >> dummy2;
-    }
+//         float dummy1, dummy2;
+//         file >> camera.depth_min >> camera.depth_max >> dummy1 >> dummy2;
+//     }
 
-    return camera;
-}
+//     return camera;
+// }
 // In file: ACMH.cpp
 // Replace the entire function with this one.
 
@@ -358,123 +358,123 @@ float GetAngle( const cv::Vec3f &v1, const cv::Vec3f &v2 )
     return angle;
 }
 
-int readDepthDmb(const std::string file_path, cv::Mat_<float> &depth)
-{
-    FILE *inimage;
-    inimage = fopen(file_path.c_str(), "rb");
-    if (!inimage){
-        std::cout << "Error opening file " << file_path << std::endl;
-        return -1;
-    }
+// int readDepthDmb(const std::string file_path, cv::Mat_<float> &depth)
+// {
+//     FILE *inimage;
+//     inimage = fopen(file_path.c_str(), "rb");
+//     if (!inimage){
+//         std::cout << "Error opening file " << file_path << std::endl;
+//         return -1;
+//     }
 
-    int32_t type, h, w, nb;
+//     int32_t type, h, w, nb;
 
-    type = -1;
+//     type = -1;
 
-    fread(&type,sizeof(int32_t),1,inimage);
-    fread(&h,sizeof(int32_t),1,inimage);
-    fread(&w,sizeof(int32_t),1,inimage);
-    fread(&nb,sizeof(int32_t),1,inimage);
+//     fread(&type,sizeof(int32_t),1,inimage);
+//     fread(&h,sizeof(int32_t),1,inimage);
+//     fread(&w,sizeof(int32_t),1,inimage);
+//     fread(&nb,sizeof(int32_t),1,inimage);
 
-    if (type != 1) {
-        fclose(inimage);
-        return -1;
-    }
+//     if (type != 1) {
+//         fclose(inimage);
+//         return -1;
+//     }
 
-    int32_t dataSize = h*w*nb;
+//     int32_t dataSize = h*w*nb;
 
-    depth = cv::Mat::zeros(h,w,CV_32F);
-    fread(depth.data,sizeof(float),dataSize,inimage);
+//     depth = cv::Mat::zeros(h,w,CV_32F);
+//     fread(depth.data,sizeof(float),dataSize,inimage);
 
-    fclose(inimage);
-    return 0;
-}
+//     fclose(inimage);
+//     return 0;
+// }
 
-int writeDepthDmb(const std::string file_path, const cv::Mat_<float> depth)
-{
-    FILE *outimage;
-    outimage = fopen(file_path.c_str(), "wb");
-    if (!outimage) {
-        std::cout << "Error opening file " << file_path << std::endl;
-    }
+// int writeDepthDmb(const std::string file_path, const cv::Mat_<float> depth)
+// {
+//     FILE *outimage;
+//     outimage = fopen(file_path.c_str(), "wb");
+//     if (!outimage) {
+//         std::cout << "Error opening file " << file_path << std::endl;
+//     }
 
-    int32_t type = 1;
-    int32_t h = depth.rows;
-    int32_t w = depth.cols;
-    int32_t nb = 1;
+//     int32_t type = 1;
+//     int32_t h = depth.rows;
+//     int32_t w = depth.cols;
+//     int32_t nb = 1;
 
-    fwrite(&type,sizeof(int32_t),1,outimage);
-    fwrite(&h,sizeof(int32_t),1,outimage);
-    fwrite(&w,sizeof(int32_t),1,outimage);
-    fwrite(&nb,sizeof(int32_t),1,outimage);
+//     fwrite(&type,sizeof(int32_t),1,outimage);
+//     fwrite(&h,sizeof(int32_t),1,outimage);
+//     fwrite(&w,sizeof(int32_t),1,outimage);
+//     fwrite(&nb,sizeof(int32_t),1,outimage);
 
-    float* data = (float*)depth.data;
+//     float* data = (float*)depth.data;
 
-    int32_t datasize = w*h*nb;
-    fwrite(data,sizeof(float),datasize,outimage);
+//     int32_t datasize = w*h*nb;
+//     fwrite(data,sizeof(float),datasize,outimage);
 
-    fclose(outimage);
-    return 0;
-}
+//     fclose(outimage);
+//     return 0;
+// }
 
-int readNormalDmb (const std::string file_path, cv::Mat_<cv::Vec3f> &normal)
-{
-    FILE *inimage;
-    inimage = fopen(file_path.c_str(), "rb");
-    if (!inimage) {
-        std::cout << "Error opening file " << file_path << std::endl;
-        return -1;
-    }
+// int readNormalDmb (const std::string file_path, cv::Mat_<cv::Vec3f> &normal)
+// {
+//     FILE *inimage;
+//     inimage = fopen(file_path.c_str(), "rb");
+//     if (!inimage) {
+//         std::cout << "Error opening file " << file_path << std::endl;
+//         return -1;
+//     }
 
-    int32_t type, h, w, nb;
+//     int32_t type, h, w, nb;
 
-    type = -1;
+//     type = -1;
 
-    fread(&type,sizeof(int32_t),1,inimage);
-    fread(&h,sizeof(int32_t),1,inimage);
-    fread(&w,sizeof(int32_t),1,inimage);
-    fread(&nb,sizeof(int32_t),1,inimage);
+//     fread(&type,sizeof(int32_t),1,inimage);
+//     fread(&h,sizeof(int32_t),1,inimage);
+//     fread(&w,sizeof(int32_t),1,inimage);
+//     fread(&nb,sizeof(int32_t),1,inimage);
 
-    if (type != 1) {
-        fclose(inimage);
-        return -1;
-    }
+//     if (type != 1) {
+//         fclose(inimage);
+//         return -1;
+//     }
 
-    int32_t dataSize = h*w*nb;
+//     int32_t dataSize = h*w*nb;
 
-    normal = cv::Mat::zeros(h,w,CV_32FC3);
-    fread(normal.data,sizeof(float),dataSize,inimage);
+//     normal = cv::Mat::zeros(h,w,CV_32FC3);
+//     fread(normal.data,sizeof(float),dataSize,inimage);
 
-    fclose(inimage);
-    return 0;
-}
+//     fclose(inimage);
+//     return 0;
+// }
 
-int writeNormalDmb(const std::string file_path, const cv::Mat_<cv::Vec3f> normal)
-{
-    FILE *outimage;
-    outimage = fopen(file_path.c_str(), "wb");
-    if (!outimage) {
-        std::cout << "Error opening file " << file_path << std::endl;
-    }
+// int writeNormalDmb(const std::string file_path, const cv::Mat_<cv::Vec3f> normal)
+// {
+//     FILE *outimage;
+//     outimage = fopen(file_path.c_str(), "wb");
+//     if (!outimage) {
+//         std::cout << "Error opening file " << file_path << std::endl;
+//     }
 
-    int32_t type = 1; //float
-    int32_t h = normal.rows;
-    int32_t w = normal.cols;
-    int32_t nb = 3;
+//     int32_t type = 1; //float
+//     int32_t h = normal.rows;
+//     int32_t w = normal.cols;
+//     int32_t nb = 3;
 
-    fwrite(&type,sizeof(int32_t),1,outimage);
-    fwrite(&h,sizeof(int32_t),1,outimage);
-    fwrite(&w,sizeof(int32_t),1,outimage);
-    fwrite(&nb,sizeof(int32_t),1,outimage);
+//     fwrite(&type,sizeof(int32_t),1,outimage);
+//     fwrite(&h,sizeof(int32_t),1,outimage);
+//     fwrite(&w,sizeof(int32_t),1,outimage);
+//     fwrite(&nb,sizeof(int32_t),1,outimage);
 
-    float* data = (float*)normal.data;
+//     float* data = (float*)normal.data;
 
-    int32_t datasize = w*h*nb;
-    fwrite(data,sizeof(float),datasize,outimage);
+//     int32_t datasize = w*h*nb;
+//     fwrite(data,sizeof(float),datasize,outimage);
 
-    fclose(outimage);
-    return 0;
-}
+//     fclose(outimage);
+//     return 0;
+// }
 
 void StoreColorPlyFileBinaryPointCloud (const std::string &plyFilePath, const std::vector<PointList> &pc)
 {
@@ -564,6 +564,10 @@ void ACMMP::SetPlanarPriorParams()
 
 void ACMMP::InuputInitialization(const std::string &dense_folder, const std::vector<Problem> &problems, const int idx)
 {
+    if (!loader_) {
+        throw std::runtime_error("AsyncImageLoader not set");
+    }
+
     images.clear();
     cameras.clear();
     const Problem problem = problems[idx];
@@ -571,74 +575,33 @@ void ACMMP::InuputInitialization(const std::string &dense_folder, const std::vec
     std::string image_folder = dense_folder + std::string("/images");
     std::string cam_folder = dense_folder + std::string("/cams");
 
-    std::stringstream image_path;
-    image_path << image_folder << "/" << std::setw(8) << std::setfill('0') << problem.ref_image_id << ".jpg";
-    cv::Mat_<uint8_t> image_uint = cv::imread(image_path.str(), cv::IMREAD_GRAYSCALE);
-    cv::Mat image_float;
-    image_uint.convertTo(image_float, CV_32FC1);
-    images.push_back(image_float);
-    std::stringstream cam_path;
-    cam_path << cam_folder << "/" << std::setw(8) << std::setfill('0') << problem.ref_image_id << "_cam.txt";
-    Camera camera = ReadCamera(cam_path.str());
-    camera.height = image_float.rows;
-    camera.width = image_float.cols;
-    cameras.push_back(camera);
-
-    size_t num_src_images = problem.src_image_ids.size();
-    for (size_t i = 0; i < num_src_images; ++i) {
-        std::stringstream image_path;
-        image_path << image_folder << "/" << std::setw(8) << std::setfill('0') << problem.src_image_ids[i] << ".jpg";
-        cv::Mat_<uint8_t> image_uint = cv::imread(image_path.str(), cv::IMREAD_GRAYSCALE);
-        cv::Mat image_float;
-        image_uint.convertTo(image_float, CV_32FC1);
-        images.push_back(image_float);
-        std::stringstream cam_path;
-        cam_path << cam_folder << "/" << std::setw(8) << std::setfill('0') << problem.src_image_ids[i] << "_cam.txt";
-        Camera camera = ReadCamera(cam_path.str());
-        camera.height = image_float.rows;
-        camera.width = image_float.cols;
-        cameras.push_back(camera);
+    // std::stringstream image_path;
+    // image_path << image_folder << "/" << std::setw(8) << std::setfill('0') << problem.ref_image_id << ".jpg";
+    // cv::Mat_<uint8_t> image_uint = cv::imread(image_path.str(), cv::IMREAD_GRAYSCALE);
+    // cv::Mat image_float;
+    // image_uint.convertTo(image_float, CV_32FC1);
+    // images.push_back(image_float);
+    // std::stringstream cam_path;
+    // cam_path << cam_folder << "/" << std::setw(8) << std::setfill('0') << problem.ref_image_id << "_cam.txt";
+    // Camera camera = ReadCamera(cam_path.str());
+    // camera.height = image_float.rows;
+    // camera.width = image_float.cols;
+    // cameras.push_back(camera);
+    {
+    auto data = loader_->getProblemData(idx);
+        
+    if (data->exception) {
+        std::rethrow_exception(data->exception);
     }
-
-    // Scale cameras and images
-    int max_image_size = problems[idx].cur_image_size;
-    for (size_t i = 0; i < images.size(); ++i) {
-        if (i > 0) {
-            max_image_size = problems[problem.src_image_ids[i - 1]].cur_image_size;
-        }
-
-        if (images[i].cols <= max_image_size && images[i].rows <= max_image_size) {
-            continue;
-        }
-
-        const float factor_x = static_cast<float>(max_image_size) / images[i].cols;
-        const float factor_y = static_cast<float>(max_image_size) / images[i].rows;
-        const float factor = std::min(factor_x, factor_y);
-
-        const int new_cols = std::round(images[i].cols * factor);
-        const int new_rows = std::round(images[i].rows * factor);
-
-        const float scale_x = new_cols / static_cast<float>(images[i].cols);
-        const float scale_y = new_rows / static_cast<float>(images[i].rows);
-
-        cv::Mat_<float> scaled_image_float;
-        cv::resize(images[i], scaled_image_float, cv::Size(new_cols,new_rows), 0, 0, cv::INTER_LINEAR);
-        images[i] = scaled_image_float.clone();
-
-    if (cameras[i].model == SPHERE) {
-        // For spherical, scale the principal point parameters
-        cameras[i].params[1] *= scale_x; // cx
-        cameras[i].params[2] *= scale_y; // cy
-    } else { // PINHOLE
-        // For pinhole, scale the K matrix
-        cameras[i].K[0] *= scale_x;
-        cameras[i].K[2] *= scale_x;
-        cameras[i].K[4] *= scale_y;
-        cameras[i].K[5] *= scale_y;
+    
+    // Copy preloaded data to ACMMP members
+    images = data->images_float;
+    cameras = data->cameras;
+    
+    if (!data->depths.empty()) {
+        depths = data->depths;
     }
-        cameras[i].height = scaled_image_float.rows;
-        cameras[i].width = scaled_image_float.cols;
-    }
+}
 
     params.depth_min = cameras[0].depth_min * 0.6f;
     params.depth_max = cameras[0].depth_max * 1.2f;
@@ -648,32 +611,32 @@ void ACMMP::InuputInitialization(const std::string &dense_folder, const std::vec
     params.disparity_min = cameras[0].K[0] * params.baseline / params.depth_max;
     params.disparity_max = cameras[0].K[0] * params.baseline / params.depth_min;
 
-    if (params.geom_consistency) {
-        depths.clear();
+    // if (params.geom_consistency) {
+    //     depths.clear();
 
-        std::stringstream result_path;
-        result_path << dense_folder << "/ACMMP" << "/2333_" << std::setw(8) << std::setfill('0') << problem.ref_image_id;
-        std::string result_folder = result_path.str();
-        std::string suffix = "/depths.dmb";
-        if (params.multi_geometry) {
-            suffix = "/depths_geom.dmb";
-        }
-        std::string depth_path = result_folder + suffix;
-        cv::Mat_<float> ref_depth;
-        readDepthDmb(depth_path, ref_depth);
-        depths.push_back(ref_depth);
+    //     std::stringstream result_path;
+    //     result_path << dense_folder << "/ACMMP" << "/2333_" << std::setw(8) << std::setfill('0') << problem.ref_image_id;
+    //     std::string result_folder = result_path.str();
+    //     std::string suffix = "/depths.dmb";
+    //     if (params.multi_geometry) {
+    //         suffix = "/depths_geom.dmb";
+    //     }
+    //     std::string depth_path = result_folder + suffix;
+    //     cv::Mat_<float> ref_depth;
+    //     readDepthDmb(depth_path, ref_depth);
+    //     depths.push_back(ref_depth);
 
-        size_t num_src_images = problem.src_image_ids.size();
-        for (size_t i = 0; i < num_src_images; ++i) {
-            std::stringstream result_path;
-            result_path << dense_folder << "/ACMMP" << "/2333_" << std::setw(8) << std::setfill('0') << problem.src_image_ids[i];
-            std::string result_folder = result_path.str();
-            std::string depth_path = result_folder + suffix;
-            cv::Mat_<float> depth;
-            readDepthDmb(depth_path, depth);
-            depths.push_back(depth);
-        }
-    }
+    //     size_t num_src_images = problem.src_image_ids.size();
+    //     for (size_t i = 0; i < num_src_images; ++i) {
+    //         std::stringstream result_path;
+    //         result_path << dense_folder << "/ACMMP" << "/2333_" << std::setw(8) << std::setfill('0') << problem.src_image_ids[i];
+    //         std::string result_folder = result_path.str();
+    //         std::string depth_path = result_folder + suffix;
+    //         cv::Mat_<float> depth;
+    //         readDepthDmb(depth_path, depth);
+    //         depths.push_back(depth);
+    //     }
+    // }
 }
 
 void ACMMP::CudaSpaceInitialization(const std::string &dense_folder, const Problem &problem)

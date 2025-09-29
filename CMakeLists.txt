@@ -40,7 +40,7 @@ set(CUDA_SOURCES
 set(CXX_SOURCES
     main.cpp
     ACMMP.cpp
-    
+    asyncio.cpp
 )
 
 set(HEADERS
@@ -50,6 +50,7 @@ set(HEADERS
     FusionGPU.h
     SphericalLUT_MultiRes.h
     BatchACMMP.h
+    asyncio.h
 )
 
 # ─── Create Executable ──────────────────────────────────────────────

@@ -101,6 +101,19 @@ BatchACMMP::BatchACMMP(const std::string& dense_folder_,
       geom_consistency(geom_consistency_), planar_prior(planar_prior_),
       hierarchy(hierarchy_), multi_geometry(multi_geometry_)
 {
+    
+    // Create async loader with appropriate settings
+    size_t num_loader_threads = std::min(size_t(4), size_t(std::thread::hardware_concurrency() / 4));   
+    size_t max_preload = max_concurrent_problems * 4;  // Preload ahead
+    size_t max_memory_gb = 4;  // Adjust based on system
+    
+    async_loader_ = std::make_shared<AsyncImageLoader>(
+        dense_folder, problems, geom_consistency, multi_geometry,
+        max_preload, num_loader_threads, max_memory_gb
+    );
+    
+    std::cout << "[BatchACMMP] Initialized async I/O with " 
+                << num_loader_threads << " loader threads" << std::endl;
     // Device properties
     cudaDeviceProp prop{};
     CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
@@ -302,10 +315,12 @@ ProblemGPUResources* BatchACMMP::acquireResources() {
 
 void BatchACMMP::releaseResources(ProblemGPUResources* r) {
     if (!r) return;
-    
+    if (r->stream) {
+        cudaStreamSynchronize(r->stream);
+    }
     {
         std::lock_guard<std::mutex> lk(resource_mutex_);
-        if (r->stream) cudaStreamSynchronize(r->stream);  // Move inside lock
+        // if (r->stream) cudaStreamSynchronize(r->stream);  // Move inside lock
         available_resources.push(r);
     }
     resource_cv_.notify_one();
@@ -403,6 +418,7 @@ void BatchACMMP::processProblemOnStream(int problem_idx, ProblemGPUResources* re
     try {
         // Process with ACMMP
         ACMMP acmmp;
+        acmmp.SetAsyncLoader(async_loader_);
         if (geom_consistency) acmmp.SetGeomConsistencyParams(multi_geometry);
         if (hierarchy) acmmp.SetHierarchyParams();
 
