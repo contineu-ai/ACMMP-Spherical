@@ -312,20 +312,16 @@ ProblemGPUResources* BatchACMMP::acquireResources() {
     available_resources.pop();
     return r;
 }
-
 void BatchACMMP::releaseResources(ProblemGPUResources* r) {
     if (!r) return;
+    
+    std::lock_guard<std::mutex> lk(resource_mutex_);
     if (r->stream) {
-        cudaStreamSynchronize(r->stream);
+        cudaStreamSynchronize(r->stream);  // Now atomic
     }
-    {
-        std::lock_guard<std::mutex> lk(resource_mutex_);
-        // if (r->stream) cudaStreamSynchronize(r->stream);  // Move inside lock
-        available_resources.push(r);
-    }
+    available_resources.push(r);
     resource_cv_.notify_one();
 }
-
 void BatchACMMP::processAllProblems() {
     {
         std::lock_guard<std::mutex> lk(gpu_queue_mutex_);
