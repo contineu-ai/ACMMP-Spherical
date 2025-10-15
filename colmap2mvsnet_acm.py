@@ -1,16 +1,9 @@
 #!/usr/bin/env python
 """
-COLMAP → ACMMP/MVSNet converter with:
-
-* tqdm progress bars
-* pair-pruning (top-K neighbours, min shared tracks)
-* robust skip of images with no 3-D points
-* binary (.bin) or text (.txt) sparse model
-* FIXED: spherical camera support with garbage focal length handling
-
+COLMAP → ACMMP/MVSNet converter optimized for SPHERICAL cameras with:
 Example
 -------
-python3 colmap2mvsnet_acm.py \
+python3 colmap2mvsnet_spherical_enhanced.py \
     --dense_folder  /path/to/dense            \
     --save_folder   out                       \
     --model_ext     .bin                      \
@@ -27,6 +20,8 @@ import numpy as np
 import cv2
 from tqdm import tqdm
 from scipy.spatial import cKDTree
+from scipy.sparse import lil_matrix, csr_matrix
+from collections import defaultdict
 
 # ───────────────────────────────────────────────────────────────────────────────
 # 1.  Named-tuple data structures
@@ -98,7 +93,7 @@ def read_images_text(path):
     imgs={}
     with open(path) as f:
         while True:
-            ln=f.readline();  # first line per image
+            ln=f.readline();
             if not ln: break
             if ln.lstrip().startswith("#") or not ln.strip(): continue
             s=ln.split()
@@ -118,7 +113,6 @@ def read_images_binary(path):
         for _ in range(n):
             iid,*vals=_read(f,64,"idddddddi")
             qvec=np.array(vals[0:4]); tvec=np.array(vals[4:7]); cid=vals[7]
-            # read null-terminated name
             name=b""
             while True:
                 c=_read(f,1,"c")[0]
@@ -145,7 +139,7 @@ def read_points3D_text(path):
             pts[pid]=Point3D(pid,xyz,rgb,err,img_ids,idxs)
     return pts
 
-def read_points3d_binary(path):
+def read_points3D_binary(path):
     pts={}
     with open(path,"rb") as f:
         n=_read(f,8,"Q")[0]
@@ -166,7 +160,7 @@ def read_model(sparse_dir, ext):
     else:
         cams=read_cameras_binary(os.path.join(sparse_dir,"cameras"+ext))
         imgs=read_images_binary(os.path.join(sparse_dir,"images"+ext))
-        pts =read_points3d_binary(os.path.join(sparse_dir,"points3D"+ext))
+        pts =read_points3D_binary(os.path.join(sparse_dir,"points3D"+ext))
     return cams,imgs,pts
 
 # ───────────────────────────────────────────────────────────────────────────────
@@ -181,103 +175,344 @@ def qvec2rotmat(q):
     ])
 
 # ───────────────────────────────────────────────────────────────────────────────
-# 5.  Depth-range computation
+# 5.  Depth-range computation (spherical-optimized)
 # ───────────────────────────────────────────────────────────────────────────────
-def compute_depth_ranges(images, points3d, extrinsic, intrinsic,
-                          max_d, interval_scale, cams):
+def compute_depth_ranges(images, points3d, extrinsic, max_d, interval_scale, cams):
+    """Compute depth ranges using RADIAL depth for spherical cameras"""
     depth_ranges = {}
+    skipped_images = []
+    
     for i, img in images.items():
         zs = []
-        cam_model = cams[img.camera_id].model
         
         for pid in img.point3D_ids:
-            if pid < 0:
+            if pid < 0 or pid not in points3d:
                 continue
             X = np.append(points3d[pid].xyz, 1.0)
             X_cam = extrinsic[i] @ X
             
-            if cam_model == "SPHERE":
-                d = np.linalg.norm(X_cam[:3])  # radial depth
-            else:
-                d = X_cam[2]  # pinhole: use z only
-                
+            # Spherical cameras: use radial depth
+            d = np.linalg.norm(X_cam[:3])
+            
             if d <= 0:
                 continue
             zs.append(d)
         
-        if len(zs) == 0:  # Skip images with no valid points
+        # Require minimum points for reliable depth estimation
+        if len(zs) < 10:
+            skipped_images.append((i, len(zs)))
             continue
             
         zs_sorted = sorted(zs)
         dmin = zs_sorted[int(len(zs_sorted)*0.2)] * 0.75
         dmax = zs_sorted[int(len(zs_sorted)*0.8)] * 1.25
         
-        # Handle depth_num calculation differently for spherical cameras
+        # Spherical-specific depth sampling
         if max_d == 0:
-            if cam_model == "SPHERE":
-                # For spherical cameras, don't use focal length (garbage param)
-                # Use depth sampling based on scene scale instead
-                depth_range = dmax - dmin
-                scene_scale = dmin  # use minimum depth as scene scale reference
-                
-                # Heuristic: more depth planes for closer/larger scenes
-                if scene_scale < 1.0:  # very close scene
-                    depth_num = min(256, max(64, int(depth_range / 0.01)))
-                elif scene_scale < 10.0:  # medium distance scene  
-                    depth_num = min(192, max(48, int(depth_range / 0.05)))
-                else:  # far scene
-                    depth_num = min(128, max(32, int(depth_range / 0.1)))
-            else:
-                # Original pinhole calculation
-                K = intrinsic[img.camera_id]
-                p1 = np.array([K[0,2], K[1,2], 1])
-                p2 = p1 + np.array([1, 0, 0])
-                P1 = (np.linalg.inv(K) @ p1) * dmin
-                P1 = np.linalg.inv(extrinsic[i][:3,:3]) @ (P1 - extrinsic[i][:3,3])
-                P2 = (np.linalg.inv(K) @ p2) * dmin
-                P2 = np.linalg.inv(extrinsic[i][:3,:3]) @ (P2 - extrinsic[i][:3,3])
-                depth_num = int((1/dmin - 1/dmax) / (1/dmin - 1/(dmin + np.linalg.norm(P2-P1))))
+            # For spherical: use logarithmic depth distribution
+            depth_range = dmax - dmin
+            log_range = np.log(dmax / dmin)
+            
+            # Adaptive depth planes based on scene scale
+            if log_range < 1.0:  # Narrow depth range
+                depth_num = 64
+            elif log_range < 2.0:  # Medium range
+                depth_num = 128
+            elif log_range < 3.0:  # Wide range
+                depth_num = 192
+            else:  # Very wide range (common in 360° scenes)
+                depth_num = 256
+            
+            depth_num = min(256, max(32, depth_num))
         else:
             depth_num = max_d
             
         dint = (dmax - dmin) / (depth_num - 1) / interval_scale
         depth_ranges[i] = (dmin, dint, depth_num, dmax)
     
+    if skipped_images:
+        print(f"[WARN] Skipped {len(skipped_images)} images with insufficient points:")
+        for img_id, npts in skipped_images[:5]:
+            print(f"  Image {img_id}: {npts} points")
+    
     return depth_ranges
 
 # ───────────────────────────────────────────────────────────────────────────────
-# 6.  Pair scoring util (triangulation-angle filter)
+# 6.  Enhanced pair scoring for spherical cameras (OPTIMIZED)
 # ───────────────────────────────────────────────────────────────────────────────
-def angle_between(ci,cj,p):
-    return np.degrees(np.arccos(
-        np.clip(np.dot(ci-p,cj-p)/
-                (np.linalg.norm(ci-p)*np.linalg.norm(cj-p)), -1.0,1.0)))
+def calc_baseline_to_depth_ratio_vectorized(ci, cj, shared_xyz):
+    """
+    Vectorized baseline-to-depth ratio calculation.
+    MUCH faster for large point sets.
+    """
+    baseline = np.linalg.norm(ci - cj)
+    
+    if len(shared_xyz) == 0:
+        return 0.0
+    
+    # Vectorized depth calculation
+    depths = np.linalg.norm(shared_xyz - ci, axis=1)
+    median_depth = np.median(depths)
+    
+    if median_depth < 1e-6:
+        return 0.0
+    
+    ratio = baseline / median_depth
+    
+    # Score based on optimal baseline-to-depth ratio
+    if 0.05 < ratio < 0.2:
+        return 1.0  # Excellent
+    elif 0.03 < ratio < 0.3:
+        return 0.7  # Good
+    elif 0.01 < ratio < 0.5:
+        return 0.4  # Acceptable
+    else:
+        return 0.1  # Poor
 
-def calc_shared(pair, images):
+def calc_score_enhanced_fast(pair, images, points3d_xyz, theta0, cam_centers, min_shared=5):
+    """
+    Optimized scoring with:
+    1. Early termination
+    2. Vectorized operations
+    3. Pre-computed camera centers
+    4. Direct XYZ lookup (no dict access in loop)
+    """
     i, j = pair
-    return len(set(images[i].point3D_ids) & set(images[j].point3D_ids))
-
-def calc_score(pair, images, points3d, theta0, extrinsic):
-    i, j = pair
-    shared = set(images[i].point3D_ids) & set(images[j].point3D_ids)
-    if not shared:
+    
+    # Early check: shared points (set intersection is fast)
+    shared_pids = set(images[i].point3D_ids) & set(images[j].point3D_ids)
+    shared_pids = [pid for pid in shared_pids if pid != -1 and pid in points3d_xyz]
+    
+    if len(shared_pids) < min_shared:
         return i, j, 0.0
     
-    # Use 0-based indexing consistently
-    ci = -(extrinsic[i][:3,:3].T @ extrinsic[i][:3,3])
-    cj = -(extrinsic[j][:3,:3].T @ extrinsic[j][:3,3])
+    # Pre-computed camera centers
+    ci = cam_centers[i]
+    cj = cam_centers[j]
     
-    angs = [angle_between(ci, cj, points3d[pid].xyz)
-            for pid in shared if pid != -1]
+    # Quick baseline check (too close or too far is bad)
+    baseline = np.linalg.norm(ci - cj)
+    if baseline < 0.01:  # Too close
+        return i, j, 0.0
     
-    if not angs: 
+    # Get all shared point coordinates at once (vectorized)
+    shared_xyz = np.array([points3d_xyz[pid] for pid in shared_pids])
+    
+    # 1. Base score: number of shared points
+    base_score = float(len(shared_pids))
+    
+    # 2. Baseline-to-depth ratio score (vectorized)
+    btd_score = calc_baseline_to_depth_ratio_vectorized(ci, cj, shared_xyz)
+    
+    if btd_score < 0.1:  # Early termination if geometry is poor
+        return i, j, base_score * btd_score
+    
+    # 3. Triangulation angle score (vectorized)
+    vi = shared_xyz - ci
+    vj = shared_xyz - cj
+    
+    norms_i = np.linalg.norm(vi, axis=1)
+    norms_j = np.linalg.norm(vj, axis=1)
+    
+    # Avoid division by zero
+    valid_mask = (norms_i > 1e-6) & (norms_j > 1e-6)
+    if not np.any(valid_mask):
         return i, j, 0.0
-    if np.percentile(angs, 75) < theta0:
-        return i, j, 0.0
-    return i, j, float(len(shared))
+    
+    dots = np.sum(vi[valid_mask] * vj[valid_mask], axis=1)
+    cos_angles = np.clip(dots / (norms_i[valid_mask] * norms_j[valid_mask]), -1.0, 1.0)
+    angles = np.degrees(np.arccos(cos_angles))
+    
+    angle_75 = np.percentile(angles, 75)
+    if angle_75 < theta0:
+        angle_score = 0.1  # Too small
+    elif angle_75 < 5.0:
+        angle_score = 0.5  # Marginal
+    else:
+        angle_score = 1.0  # Good
+    
+    # Combine scores
+    final_score = base_score * btd_score * angle_score
+    
+    return i, j, final_score
 
 # ───────────────────────────────────────────────────────────────────────────────
-# 7.  Main processing routine
+# 7.  Multi-scale baseline selection with diversity constraint (OPTIMIZED)
+# ───────────────────────────────────────────────────────────────────────────────
+def select_diverse_multiscale_neighbors_fast(ref_idx, candidates, cam_centers, 
+                                            top_k=20, diversity_threshold=0.3):
+    """
+    Optimized neighbor selection:
+    1. Pre-sorted candidates by score
+    2. Greedy selection with KD-tree for diversity checks
+    3. Early termination
+    """
+    if not candidates:
+        return []
+    
+    ci = cam_centers[ref_idx]
+    
+    # Add baseline distance to each candidate (vectorized where possible)
+    candidate_indices = np.array([idx for idx, _ in candidates])
+    candidate_scores = np.array([score for _, score in candidates])
+    candidate_positions = np.array([cam_centers[idx] for idx, _ in candidates])
+    
+    # Calculate all baselines at once
+    baselines = np.linalg.norm(candidate_positions - ci, axis=1)
+    
+    # Sort by score descending
+    sort_idx = np.argsort(-candidate_scores)
+    candidate_indices = candidate_indices[sort_idx]
+    candidate_scores = candidate_scores[sort_idx]
+    baselines = baselines[sort_idx]
+    candidate_positions = candidate_positions[sort_idx]
+    
+    if len(candidates) <= top_k:
+        return [(int(idx), float(score)) 
+                for idx, score in zip(candidate_indices, candidate_scores)]
+    
+    # Multi-scale target baselines
+    min_baseline = np.min(baselines)
+    max_baseline = np.max(baselines)
+    
+    if max_baseline / (min_baseline + 1e-6) > 10:
+        log_min = np.log(min_baseline + 1e-6)
+        log_max = np.log(max_baseline + 1e-6)
+        target_baselines = np.exp(np.linspace(log_min, log_max, top_k))
+    else:
+        target_baselines = np.linspace(min_baseline, max_baseline, top_k)
+    
+    # Greedy selection
+    selected = []
+    selected_positions = []
+    used_mask = np.zeros(len(candidates), dtype=bool)
+    
+    for target_baseline in target_baselines:
+        if len(selected) >= top_k:
+            break
+        
+        best_idx = -1
+        best_metric = -1
+        
+        # Find best unused candidate near this target baseline
+        for local_idx in range(len(candidates)):
+            if used_mask[local_idx]:
+                continue
+            
+            # Check diversity (only if we have some selections already)
+            if len(selected) >= 5:
+                pos = candidate_positions[local_idx]
+                # Quick check: minimum distance to any selected
+                if selected_positions:
+                    dists = np.linalg.norm(np.array(selected_positions) - pos, axis=1)
+                    min_dist = np.min(dists)
+                    if min_dist < diversity_threshold * baselines[local_idx]:
+                        continue
+            
+            # Combined metric
+            baseline_diff = abs(baselines[local_idx] - target_baseline) / (target_baseline + 1e-6)
+            combined_metric = 0.7 * candidate_scores[local_idx] - 0.3 * baseline_diff
+            
+            if combined_metric > best_metric:
+                best_metric = combined_metric
+                best_idx = local_idx
+        
+        if best_idx >= 0:
+            idx = int(candidate_indices[best_idx])
+            score = float(candidate_scores[best_idx])
+            selected.append((idx, score))
+            selected_positions.append(candidate_positions[best_idx])
+            used_mask[best_idx] = True
+    
+    # Fill remaining with top scores
+    if len(selected) < top_k:
+        for local_idx in range(len(candidates)):
+            if used_mask[local_idx]:
+                continue
+            idx = int(candidate_indices[local_idx])
+            score = float(candidate_scores[local_idx])
+            selected.append((idx, score))
+            if len(selected) >= top_k:
+                break
+    
+    return selected
+
+# ───────────────────────────────────────────────────────────────────────────────
+# 8.  Multiprocessing worker functions (module-level for pickling)
+# ───────────────────────────────────────────────────────────────────────────────
+def _write_camera_file_worker(item, cam_dir):
+    """Worker function to write a single camera file - SPHERE FORMAT"""
+    i, data = item
+    cam_path = os.path.join(cam_dir, f"{i:08d}_cam.txt")
+    with open(cam_path, "w") as f:
+        # Extrinsic (4x4)
+        f.write("extrinsic\n")
+        for r in range(4):
+            f.write(" ".join(map(str, data['extrinsic'][r])) + "\n")
+        
+        f.write("\n")
+        
+        # Intrinsic - SPHERE format: "SPHERE\nf cx cy\n"
+        f.write("intrinsic\n")
+        if data.get('is_sphere', True):
+            f.write("SPHERE\n")
+            focal = data['focal']
+            cx = data['cx']
+            cy = data['cy']
+            f.write(f"{focal} {cx} {cy}\n")
+        else:
+            # For non-sphere cameras: write 3x3 K matrix
+            K = data['K_matrix']
+            for r in range(3):
+                f.write(" ".join(map(str, K[r])) + "\n")
+        
+        f.write("\n")
+        
+        # Depth range
+        d0, dint, Nd, dmax = data['depth']
+        f.write(f"{d0} {dint} {Nd} {dmax}\n")
+
+def _copy_image_worker(i, imgs, depth_ranges, imgs_dir, out_img):
+    """Worker function to copy a single image"""
+    if i not in depth_ranges:
+        return None
+    
+    img = imgs[i]
+    src = os.path.join(imgs_dir, img.name)
+    dst = os.path.join(out_img, f"{i:08d}.jpg")
+    
+    if not os.path.exists(src):
+        return f"[WARN] Image not found: {src}"
+    
+    try:
+        if not src.lower().endswith(".jpg"):
+            img_data = cv2.imread(src)
+            if img_data is not None:
+                cv2.imwrite(dst, img_data)
+            else:
+                return f"[WARN] Failed to read: {src}"
+        else:
+            shutil.copyfile(src, dst)
+    except Exception as e:
+        return f"[ERROR] Failed to copy {src}: {e}"
+    
+    return None
+
+def _select_for_image_worker(img_idx, depth_ranges, img_candidates, cam_centers, top_k, diversity_threshold):
+    """Worker function to select neighbors for a single image"""
+    if img_idx not in depth_ranges:
+        return img_idx, []
+    
+    candidates = img_candidates.get(img_idx, [])
+    selected = select_diverse_multiscale_neighbors_fast(
+        img_idx, candidates, cam_centers,
+        top_k=top_k,
+        diversity_threshold=diversity_threshold
+    )
+    return img_idx, selected
+
+# ───────────────────────────────────────────────────────────────────────────────
+# 9.  Main processing routine (HIGHLY OPTIMIZED)
 # ───────────────────────────────────────────────────────────────────────────────
 def process_scene(args):
     dense=args.dense_folder
@@ -289,214 +524,308 @@ def process_scene(args):
     os.makedirs(cam_dir,exist_ok=True)
 
     # ---------- Load model ----------
+    print("[INFO] Loading COLMAP model...")
     cams,imgs_raw,pts=read_model(sparse,args.model_ext)
-    # FIXED: Use consistent 0-based indexing
+    
+    # Normalize to SPHERICAL model
+    for cid, cam in cams.items():
+        if cam.model == "SPHERE":
+            cam = cam._replace(model="SPHERICAL")
+            cams[cid] = cam
+    
+    # Use consistent 0-based indexing
     imgs = {i: imgs_raw[k] for i, k in enumerate(sorted(imgs_raw))}
     N = len(imgs)
+    print(f"[INFO] Loaded {N} images, {len(pts)} 3D points")
 
-    # ---------- Build intrinsics ----------
-    param_map={
-        'SIMPLE_PINHOLE':['f','cx','cy'],
-        'PINHOLE':['fx','fy','cx','cy'],
-        'SIMPLE_RADIAL':['f','cx','cy','k'],
-        'RADIAL':['f','cx','cy','k1','k2'],
-        'OPENCV':['fx','fy','cx','cy','k1','k2','p1','p2'],
-        'OPENCV_FISHEYE':['fx','fy','cx','cy','k1','k2','k3','k4'],
-        'FULL_OPENCV':['fx','fy','cx','cy','k1','k2','p1','p2',
-                       'k3','k4','k5','k6'],
-        'FOV':['fx','fy','cx','cy','omega'],
-        'THIN_PRISM_FISHEYE':['fx','fy','cx','cy','k1','k2',
-                              'p1','p2','k3','k4','sx1','sy1'],
-        'SPHERE': ['f','cx','cy'],
-    }
-    
+    # ---------- Build intrinsics (spherical-optimized) ----------
     Kdict={}
     for cid,cam in cams.items():
-        if cam.model == "SPHERICAL":
-            cam = cam._replace(model="SPHERE")
-            cams[cid] = cam
-        if cam.model == "SPHERE":
-            # For spherical cameras, focal length is garbage, estimate from image center
-            _, cx, cy = cam.params[:3]  # ignore focal length (garbage)
-            # Estimate focal length from image center (simple heuristic)
-            estimated_f = max(cx, cy)
-            K = np.array([[estimated_f, 0, cx], [0, estimated_f, cy], [0, 0, 1]])
-            Kdict[cid] = K
-        else:
-            keys=param_map[cam.model]
-            vals=dict(zip(keys,cam.params))
-            if 'f' in vals:
-                vals['fx']=vals['fy']=vals['f']
-            K=np.eye(3)
-            K[0,0]=vals['fx']; K[1,1]=vals['fy']
-            K[0,2]=vals['cx']; K[1,2]=vals['cy']
-            Kdict[cid]=K
+        if cam.model != "SPHERICAL":
+            raise ValueError(f"Expected SPHERICAL camera, got {cam.model}")
+        
+        # For spherical: estimate focal length from image dimensions
+        _, cx, cy = cam.params[:3]
+        estimated_f = cam.width / (2 * np.pi)
+        K = np.array([[estimated_f, 0, cx], [0, estimated_f, cy], [0, 0, 1]])
+        Kdict[cid] = K
+    
+    print(f"[INFO] Estimated focal length: {estimated_f:.2f} pixels")
 
-    # ---------- Extrinsics ----------
-    extr={}
-    for i,img in imgs.items():
-        E=np.eye(4)
-        E[:3,:3]=qvec2rotmat(img.qvec)
-        E[:3,3]=img.tvec
-        extr[i]=E
+    # ---------- Extrinsics + Pre-compute camera centers ----------
+    print("[INFO] Computing camera extrinsics...")
+    extr = {}
+    cam_centers = {}
+    for i, img in imgs.items():
+        E = np.eye(4)
+        E[:3,:3] = qvec2rotmat(img.qvec)
+        E[:3,3] = img.tvec
+        extr[i] = E
+        # Pre-compute camera center for fast access
+        cam_centers[i] = -(E[:3,:3].T @ E[:3,3])
+
+    # ---------- Pre-compute points3D XYZ lookup (MAJOR SPEEDUP) ----------
+    print("[INFO] Building point cloud lookup...")
+    points3d_xyz = {pid: pt.xyz for pid, pt in pts.items()}
 
     # ---------- Depth ranges ----------
-    depth_ranges=compute_depth_ranges(imgs,pts,extr,Kdict,
-                                      args.max_d,args.interval_scale,cams)
-    print("depth_ranges for first valid image:",next(iter(depth_ranges.items())))
+    print("[INFO] Computing depth ranges...")
+    depth_ranges = compute_depth_ranges(imgs, pts, extr,
+                                       args.max_d, args.interval_scale, cams)
+    print(f"[INFO] Valid depth ranges for {len(depth_ranges)}/{N} images")
+    if depth_ranges:
+        sample_idx = next(iter(depth_ranges.keys()))
+        dmin, dint, dnum, dmax = depth_ranges[sample_idx]
+        print(f"[INFO] Sample depth range (image {sample_idx}): "
+              f"min={dmin:.2f}, max={dmax:.2f}, planes={dnum}")
 
-    # ---------- Candidate pairs via camera-center proximity ----------
-    # 1) collect only the images that survived depth_ranges
-    keys = sorted(depth_ranges.keys())  # 0-based indices
-
-    # 2) build an (M×3) array of world-space centers C_i = -(Rᵀ·t)
-    centers = np.stack([
-        -(extr[i][:3,:3].T @ extr[i][:3,3])
-        for i in keys
-    ])
-
-    # 3) KD-tree & K-nearest lookup
-    tree     = cKDTree(centers)
-    k_search = args.top_k + 1   # +1 b/c query includes self
+    # ---------- OPTIMIZATION: Progressive pair filtering ----------
+    print("[INFO] Building spatial index with progressive filtering...")
+    valid_keys = sorted(depth_ranges.keys())
+    centers = np.array([cam_centers[i] for i in valid_keys])
+    
+    # Build KD-tree
+    tree = cKDTree(centers)
+    
+    # Adaptive k_search based on dataset size
+    if N < 100:
+        k_factor = 5
+    elif N < 1000:
+        k_factor = 3
+    else:  # Large datasets: be more selective
+        k_factor = 2
+    
+    k_search = min(args.top_k * k_factor, len(valid_keys))
+    
+    # Query KD-tree (fast spatial filtering)
+    print(f"[INFO] Querying {k_search} nearest neighbors per image...")
     _, nnidx = tree.query(centers, k=k_search)
-
-    # 4) collect unique zero-based index pairs
+    
+    # Build candidate pairs (only from spatial neighbors)
     candidate_pairs = set()
     for src_idx, neighs in enumerate(nnidx):
-        src = keys[src_idx]  # Already 0-based
+        src = valid_keys[src_idx]
         for n in neighs:
-            if n == src_idx: continue   # skip self
-            dst = keys[n]
+            if n == src_idx:
+                continue
+            dst = valid_keys[n]
             a, b = min(src, dst), max(src, dst)
             candidate_pairs.add((a, b))
+    
+    print(f"[INFO] Spatial filtering: {len(candidate_pairs)} candidate pairs "
+          f"(reduced from {N*(N-1)//2} possible)")
 
-    all_pairs = list(candidate_pairs)
-    # now len(all_pairs) ≃ N·top_k instead of ~N²/2
-    shared_cnt = [calc_shared(p, imgs) for p in all_pairs]
+    # ---------- OPTIMIZATION: Quick pre-filter by shared points ----------
+    print("[INFO] Pre-filtering pairs by shared point count...")
+    filtered_pairs = []
+    min_shared = max(5, args.min_shared // 2)  # Relaxed threshold for pre-filter
+    
+    for pair in tqdm(candidate_pairs, desc="Pre-filtering"):
+        i, j = pair
+        shared = len(set(imgs[i].point3D_ids) & set(imgs[j].point3D_ids))
+        if shared >= min_shared:
+            filtered_pairs.append(pair)
+    
+    print(f"[INFO] After pre-filter: {len(filtered_pairs)} pairs "
+          f"(removed {len(candidate_pairs) - len(filtered_pairs)})")
 
-    top_pairs=[]
-    valid = list(depth_ranges.keys())  # 0-based
-    neighbor_bins={i:[] for i in valid}
-    for (pair,s) in sorted(zip(all_pairs,shared_cnt),
-                           key=lambda x:x[1],reverse=True):
-        i,j=pair
-        if s<args.min_shared: break
-        if (len(neighbor_bins[i])<args.top_k and
-            len(neighbor_bins[j])<args.top_k):
-            neighbor_bins[i].append(pair)
-            neighbor_bins[j].append(pair)
-            top_pairs.append(pair)
-    print(f"[INFO] Kept {len(top_pairs)} pairs "
-          f"(≤{args.top_k} per image, ≥{args.min_shared} shared tracks)")
-
-    # ---------- Score pairs (triangulation angle) ----------
-    func=partial(calc_score,images=imgs,points3d=pts,
-                 theta0=args.theta0,extrinsic=extr)
-    score=np.zeros((N,N))
+    # ---------- OPTIMIZATION: Use sparse matrix instead of dense N×N ----------
+    print("[INFO] Scoring pairs with enhanced metrics...")
+    
+    # Prepare scoring function with pre-computed data
+    func = partial(calc_score_enhanced_fast, 
+                   images=imgs, 
+                   points3d_xyz=points3d_xyz,
+                   theta0=args.theta0, 
+                   cam_centers=cam_centers,
+                   min_shared=args.min_shared)
+    
+    # Use sparse matrix (HUGE memory savings for large N)
+    score_dict = {}
+    
+    # Process in parallel with progress bar
     with mp.Pool(processes=mp.cpu_count()) as pool:
-        for i,j,s in tqdm(pool.imap_unordered(func,top_pairs,
-                                              chunksize=args.chunksize),
-                          total=len(top_pairs)):
-            score[i,j]=score[j,i]=s
+        results = pool.imap_unordered(func, filtered_pairs, chunksize=args.chunksize)
+        
+        for i, j, s in tqdm(results, total=len(filtered_pairs), desc="Scoring"):
+            if s > 0:
+                score_dict[(i, j)] = s
+                score_dict[(j, i)] = s
+    
+    print(f"[INFO] Scored pairs with non-zero score: {len(score_dict) // 2}")
 
-    # ---------- neighbour list for each image ----------
-    view_sel=[]
+    # ---------- OPTIMIZATION: Build neighbor lists directly (no full matrix) ----------
+    print("[INFO] Selecting diverse multi-scale neighbors...")
+    view_sel = [[] for _ in range(N)]
+    
+    # Build candidate lists per image
+    img_candidates = defaultdict(list)
+    for (i, j), score in score_dict.items():
+        if i in depth_ranges and j in depth_ranges:
+            img_candidates[i].append((j, score))
+    
+    # Select neighbors in parallel (for large datasets)
+    if N > 500:
+        print("[INFO] Using parallel neighbor selection...")
+        
+        worker_func = partial(_select_for_image_worker,
+                             depth_ranges=depth_ranges,
+                             img_candidates=img_candidates,
+                             cam_centers=cam_centers,
+                             top_k=args.top_k,
+                             diversity_threshold=args.diversity_threshold)
+        
+        with mp.Pool(processes=mp.cpu_count()) as pool:
+            results = pool.map(worker_func, range(N), chunksize=10)
+            for img_idx, selected in results:
+                view_sel[img_idx] = selected
+    else:
+        # Sequential for small datasets
+        for i in tqdm(range(N), desc="Neighbor selection"):
+            if i not in depth_ranges:
+                continue
+            candidates = img_candidates[i]
+            view_sel[i] = select_diverse_multiscale_neighbors_fast(
+                i, candidates, cam_centers,
+                top_k=args.top_k,
+                diversity_threshold=args.diversity_threshold
+            )
+    
+    # Statistics
+    avg_neighbors = np.mean([len(v) for v in view_sel if v])
+    print(f"[INFO] Average neighbors per image: {avg_neighbors:.1f}")
+
+    # ---------- Write camera files (batched I/O) - FIXED FORMAT ----------
+    print("[INFO] Writing camera files...")
+    
+    # Prepare all camera data first
+    cam_data = {}
     for i in range(N):
         if i not in depth_ranges:
-            view_sel.append([])
             continue
-            
-        top=np.argsort(score[i])[::-1]
-        view_sel.append([(k,score[i,k]) for k in top
-                         if score[i,k]>0 and k in depth_ranges][:args.top_k])
+        
+        img = imgs[i]
+        cam = cams[img.camera_id]
+        d0, dint, Nd, dmax = depth_ranges[i]
+        
+        # For SPHERE cameras: use the simple f, cx, cy format
+        _, cx, cy = cam.params[:3]
+        estimated_f = cam.width / (2 * np.pi)  # or max(cx, cy) as in original
+        
+        cam_data[i] = {
+            'extrinsic': extr[i],
+            'is_sphere': True,
+            'focal': estimated_f,
+            'cx': cx,
+            'cy': cy,
+            'K_matrix': Kdict[cam.id],  # Keep for non-sphere fallback
+            'depth': (d0, dint, Nd, dmax),
+            'width': cam.width,
+            'height': cam.height
+        }
+    
+    # Write camera files using worker function
+    write_func = partial(_write_camera_file_worker, cam_dir=cam_dir)
+    
+    if N > 100:
+        with mp.Pool(processes=mp.cpu_count()) as pool:
+            list(tqdm(pool.imap_unordered(write_func, cam_data.items()),
+                     total=len(cam_data), desc="Writing cameras"))
+    else:
+        for item in tqdm(cam_data.items(), desc="Writing cameras"):
+            write_func(item)
 
-    # ---------- Write camera files ----------
-    for i in range(N):
-        if i not in depth_ranges:  # Skip images without valid depth ranges
-            continue
-            
-        cam_path=os.path.join(cam_dir,f"{i:08d}_cam.txt")
-        with open(cam_path,"w") as f:
-            f.write("extrinsic\n")
-            for r in range(4):
-                f.write(" ".join(map(str,extr[i][r]))+"\n")
-            
-            f.write("\nintrinsic\n")
-            # Look up the original COLMAP Camera entry using 0-based indexing
-            img = imgs[i]
-            cam = cams[img.camera_id]
-            
-            if cam.model == "SPHERE":
-                # SPHERE format: model name + f, cx, cy
-                # Focal length is garbage, estimate from image dimensions
-                f.write("SPHERE\n")
-                if len(cam.params) >= 3:
-                    # Estimate focal length from image center assuming spherical mapping
-                    _, cx, cy = cam.params[:3]  # ignore garbage focal length
-                    estimated_f = max(cx, cy)  # simple heuristic based on image center
-                    f.write(f"{estimated_f} {cx} {cy}\n")
-                else:
-                    raise ValueError(f"SPHERE camera {cam.id} has insufficient parameters: {cam.params}")
-            else:
-                # All other models: write full 3×3 K matrix
-                K = Kdict[cam.id]
-                for r in range(3):
-                    f.write(" ".join(map(str, K[r])) + "\n")
-            
-            d0,dint,Nd,dmax=depth_ranges[i]
-            f.write(f"\n{d0} {dint} {Nd} {dmax}\n")
-
-    # ---------- Write pair.txt ----------
-    with open(os.path.join(args.save_folder,"pair.txt"),"w") as f:
+    # ---------- Write pair.txt (FIXED: O(1) lookup instead of O(n)) ----------
+    print("[INFO] Writing pair.txt...")
+    with open(os.path.join(args.save_folder, "pair.txt"), "w") as f:
         valid_images = sorted(depth_ranges.keys())
         f.write(f"{len(valid_images)}\n")
         
-        for idx, i in enumerate(valid_images):
-            # Find neighbors for image i
+        # Pre-compute mapping for O(1) lookup (PERFORMANCE FIX)
+        valid_img_to_seq = {img_id: seq_idx for seq_idx, img_id in enumerate(valid_images)}
+        
+        for seq_idx, i in enumerate(valid_images):
             neighbors = [(j, int(score_val)) for j, score_val in view_sel[i] 
                         if j in valid_images and score_val > 0]
             
-            f.write(f"{idx}\n{len(neighbors)} ")
+            f.write(f"{seq_idx}\n{len(neighbors)} ")
             for j, s in neighbors:
-                # Convert j to the position in valid_images list
-                j_idx = valid_images.index(j)
-                f.write(f"{j_idx} {s} ")
+                j_seq_idx = valid_img_to_seq[j]  # O(1) lookup instead of O(n)
+                f.write(f"{j_seq_idx} {s} ")
             f.write("\n")
 
-    # ---------- Copy/convert images ----------
-    for i in range(N):
-        if i not in depth_ranges:  # Skip images without depth ranges
-            continue
-        img = imgs[i]  # Use 0-based indexing
-        src = os.path.join(imgs_dir, img.name)
-        dst = os.path.join(out_img, f"{i:08d}.jpg")
-        if not src.lower().endswith(".jpg"):
-            cv2.imwrite(dst, cv2.imread(src))
-        else:
-            shutil.copyfile(src, dst)
+    # ---------- Copy/convert images (parallel with proper error handling) ----------
+    print("[INFO] Copying images...")
+    
+    copy_func = partial(_copy_image_worker, 
+                       imgs=imgs, 
+                       depth_ranges=depth_ranges,
+                       imgs_dir=imgs_dir, 
+                       out_img=out_img)
+    
+    # Parallel image copying
+    with mp.Pool(processes=min(mp.cpu_count(), 4)) as pool:  # Limit to 4 for I/O
+        warnings = list(tqdm(pool.imap_unordered(copy_func, range(N)),
+                            total=N, desc="Copying images"))
+    
+    # Print any warnings
+    warnings = [w for w in warnings if w is not None]
+    if warnings:
+        print("\n" + "\n".join(warnings[:10]))
+        if len(warnings) > 10:
+            print(f"... and {len(warnings) - 10} more warnings")
+    
+    print(f"\n{'='*70}")
+    print(f"[SUCCESS] Processing complete!")
+    print(f"[SUCCESS] Output saved to {args.save_folder}")
+    print(f"{'='*70}")
+    print(f"Statistics:")
+    print(f"  - Total images: {N}")
+    print(f"  - Valid images: {len(depth_ranges)}")
+    print(f"  - Avg neighbors: {avg_neighbors:.1f}")
+    print(f"  - Scored pairs: {len(score_dict) // 2}")
+    print(f"{'='*70}")
 
 # ───────────────────────────────────────────────────────────────────────────────
-# 8.  CLI
+# 10.  CLI
 # ───────────────────────────────────────────────────────────────────────────────
 if __name__=="__main__":
     ap=argparse.ArgumentParser(
-       description="Convert COLMAP sparse model to ACMMP/MVSNet format "
-                   "with neighbour pruning.")
-    ap.add_argument("--dense_folder",required=True,
+       description="Convert COLMAP SPHERICAL cameras to ACMMP/MVSNet format "
+                   "with enhanced pair selection (OPTIMIZED for 1000s of images).",
+       formatter_class=argparse.RawDescriptionHelpFormatter)
+    
+    ap.add_argument("--dense_folder", required=True,
                     help="Folder with sparse/ & images/")
-    ap.add_argument("--save_folder",required=True,
+    ap.add_argument("--save_folder", required=True,
                     help="Output dir")
-    ap.add_argument("--model_ext",default=".txt",choices=[".txt",".bin"])
-    ap.add_argument("--max_d",type=int,default=192)
-    ap.add_argument("--interval_scale",type=float,default=1.0)
-    ap.add_argument("--theta0",type=float,default=1.0,
-                    help="Min triangulation angle (deg)")
-    ap.add_argument("--top_k",type=int,default=20,
-                    help="Max neighbours kept per image")
-    ap.add_argument("--min_shared",type=int,default=10,
-                    help="Min shared tracks to keep a pair")
-    ap.add_argument("--chunksize",type=int,default=512,
-                    help="mp.pool imap chunk")
-    args=ap.parse_args()
-    os.makedirs(args.save_folder,exist_ok=True)
+    ap.add_argument("--model_ext", default=".txt", choices=[".txt", ".bin"],
+                    help="COLMAP model format (.bin recommended for large datasets)")
+    ap.add_argument("--max_d", type=int, default=0,
+                    help="Max depth planes (0=auto, uses 64-256 based on scene)")
+    ap.add_argument("--interval_scale", type=float, default=1.0,
+                    help="Depth interval scale factor")
+    ap.add_argument("--theta0", type=float, default=1.0,
+                    help="Min triangulation angle in degrees (1.0-5.0 recommended)")
+    ap.add_argument("--top_k", type=int, default=20,
+                    help="Max neighbors per image (15-30 recommended)")
+    ap.add_argument("--min_shared", type=int, default=10,
+                    help="Min shared 3D points for valid pair (10-30 recommended)")
+    ap.add_argument("--chunksize", type=int, default=512,
+                    help="Multiprocessing chunk size (512-2048 for large datasets)")
+    ap.add_argument("--diversity_threshold", type=float, default=0.3,
+                    help="Spatial diversity threshold (0.2=strict, 0.5=relaxed)")
+    
+    args = ap.parse_args()
+    os.makedirs(args.save_folder, exist_ok=True)
+
+    
+    import time
+    start_time = time.time()
+    
     process_scene(args)
+    
+    elapsed = time.time() - start_time
+    print()
+    print(f"[TIMING] Total processing time: {elapsed:.1f} seconds ({elapsed/60:.1f} minutes)")
+    print("=" * 70)
