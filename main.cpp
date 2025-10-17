@@ -483,7 +483,7 @@ void InitializeLUTsForAllResolutions(const std::string &dense_folder,
 int ComputeMultiScaleSettings(const std::string &dense_folder, std::vector<Problem> &problems)
 {
     int max_num_downscale = -1;
-    int size_bound = 700;
+    int size_bound = 800;
     PatchMatchParams pmp;
     std::string image_folder = dense_folder + std::string("/images");
 

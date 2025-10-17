@@ -1324,21 +1324,69 @@ void RunFusionCuda(const std::string &dense_folder,
         
         std::vector<Camera> all_cameras;
         std::vector<int> camera_image_ids;
+        
+        std::cout << "[FusionFix] Loading cameras with correct resolutions..." << std::endl;
+        
         for (int image_id : all_image_ids) {
-            char buf[512];
-            int ret = snprintf(buf, sizeof(buf), "%s/cams/%08d_cam.txt", dense_folder.c_str(), image_id);
-            if (ret < 0 || ret >= static_cast<int>(sizeof(buf))) continue;
-            
             try {
-                Camera cam = ReadCamera(std::string(buf));
-                if (cam.width > 0 && cam.height > 0) {
-                    all_cameras.push_back(cam);
-                    camera_image_ids.push_back(image_id);
+                // 1. Load camera from file
+                char cam_buf[512];
+                int ret = snprintf(cam_buf, sizeof(cam_buf), "%s/cams/%08d_cam.txt", 
+                                dense_folder.c_str(), image_id);
+                if (ret < 0 || ret >= static_cast<int>(sizeof(cam_buf))) continue;
+                
+                Camera cam = ReadCamera(std::string(cam_buf));
+                if (cam.width <= 0 || cam.height <= 0) continue;
+                
+                // 2. Load depth map to get TRUE resolution
+                std::string depth_suffix = geom_consistency ? "/depths_geom.dmb" : "/depths.dmb";
+                char depth_buf[512];
+                ret = snprintf(depth_buf, sizeof(depth_buf), "%s/ACMMP/2333_%08d%s", 
+                            dense_folder.c_str(), image_id, depth_suffix.c_str());
+                if (ret < 0 || ret >= static_cast<int>(sizeof(depth_buf))) continue;
+                
+                cv::Mat_<float> depth;
+                if (readDepthDmb(std::string(depth_buf), depth) != 0) continue;
+                if (depth.cols <= 0 || depth.rows <= 0) continue;
+                
+                // 3. Load image to calculate scale
+                char img_buf[512];
+                ret = snprintf(img_buf, sizeof(img_buf), "%s/images/%08d.jpg", 
+                            dense_folder.c_str(), image_id);
+                if (ret < 0 || ret >= static_cast<int>(sizeof(img_buf))) continue;
+                
+                cv::Mat image = cv::imread(std::string(img_buf), cv::IMREAD_COLOR);
+                if (image.empty()) continue;
+                
+                // 4. Calculate scale factors
+                float scale_x = (float)depth.cols / (float)image.cols;
+                float scale_y = (float)depth.rows / (float)image.rows;
+                
+                // 5. Adjust camera to match depth resolution
+                cam.width = depth.cols;
+                cam.height = depth.rows;
+                
+                if (cam.model == SPHERE) {
+                    cam.params[1] *= scale_x;  // cx
+                    cam.params[2] *= scale_y;  // cy
+                } else {  // PINHOLE
+                    cam.K[0] *= scale_x;  // fx
+                    cam.K[2] *= scale_x;  // cx
+                    cam.K[4] *= scale_y;  // fy
+                    cam.K[5] *= scale_y;  // cy
                 }
+                
+                // 6. Add correctly adjusted camera
+                all_cameras.push_back(cam);  // ← NOW CORRECT!
+                camera_image_ids.push_back(image_id);
+                
             } catch (...) {
                 continue;
             }
         }
+    
+    std::cout << "[FusionFix] Loaded " << all_cameras.size() 
+              << " cameras with correct resolutions" << std::endl;
         
         if (all_cameras.empty()) {
             throw std::runtime_error("No valid cameras found");
