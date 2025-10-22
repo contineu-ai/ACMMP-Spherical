@@ -117,10 +117,11 @@ public:
                bool geom_consistency_,
                bool planar_prior_,
                bool hierarchy_,
-               bool multi_geometry_);
+               bool multi_geometry_,size_t mask_disk_queue_size_ = 400);
+               
     
     ~BatchACMMP();
-
+    
     void processAllProblems();
     void processBatch(const std::vector<int>& idxs);
     void waitForGPUCompletion();
@@ -144,7 +145,7 @@ public:
         return disk_completed_.load() >= problems_enqueued_.load() &&
                active_gpu_problems_.load() == 0;
     }
-
+    std::condition_variable disk_queue_space_cv_;      
 private:
     // Configuration
     std::string dense_folder;
@@ -153,7 +154,7 @@ private:
     bool planar_prior;
     bool hierarchy;
     bool multi_geometry;
-
+    size_t mask_disk_queue_size; 
     // GPU processing resources
     size_t max_concurrent_problems;
     size_t num_disk_writers;

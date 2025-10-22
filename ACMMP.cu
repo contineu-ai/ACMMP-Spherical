@@ -1676,7 +1676,7 @@ void JBU::CudaRun()
 
     float ms = 0.f;
     cudaEventElapsedTime(&ms, start, stop);
-    printf("Total time needed for computation: %f seconds\n", ms / 1000.f);
+    // printf("Total time needed for computation: %f seconds\n", ms / 1000.f);
 
     cudaEventDestroy(start);
     cudaEventDestroy(stop);

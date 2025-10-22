@@ -8,22 +8,118 @@
 // Access to constant memory LUTs
 extern __constant__ SphericalLUT* d_lut_array_const[10];
 extern __constant__ int d_num_luts;
+extern __constant__ InverseTrigLUT* d_inverse_trig_lut;
 
 // Shared memory cache for frequently accessed LUT data
-__shared__ float3 shared_dir_cache[256];  // Cache for current block
+__shared__ float3 shared_dir_cache[256];
 
-// Optimized branchless LUT finder
+// ============================================================================
+// FAST INVERSE TRIGONOMETRIC LOOKUP FUNCTIONS
+// ============================================================================
+
+// Fast ASIN lookup with linear interpolation
+__device__ __forceinline__ float FastAsin(float x, const InverseTrigLUT* lut) {
+    // Clamp input to valid range
+    x = fmaxf(lut->asin_min, fminf(lut->asin_max, x));
+    
+    // Map to index space
+    float idx_f = (x - lut->asin_min) * lut->asin_scale;
+    int idx0 = __float2int_rd(idx_f); // Floor
+    int idx1 = min(idx0 + 1, lut->asin_size - 1);
+    
+    // Linear interpolation weight
+    float t = idx_f - static_cast<float>(idx0);
+    
+    // Fetch values and interpolate
+    float v0 = lut->d_asin_lut[idx0];
+    float v1 = lut->d_asin_lut[idx1];
+    
+    return fmaf(t, v1 - v0, v0);
+}
+
+// Fast ATAN2 lookup with bilinear interpolation
+__device__ __forceinline__ float FastAtan2(float y, float x, const InverseTrigLUT* lut) {
+    // Handle edge cases
+    if (fabsf(x) < 1e-8f && fabsf(y) < 1e-8f) {
+        return 0.0f;
+    }
+    
+    // Check if outside LUT range - fallback to direct computation
+    float abs_x = fabsf(x);
+    float abs_y = fabsf(y);
+    if (abs_x > lut->atan2_range || abs_y > lut->atan2_range) {
+        return atan2f(y, x);
+    }
+    
+    // Map to index space [0, size-1]
+    float x_norm = (x + lut->atan2_range) * lut->atan2_scale;
+    float z_norm = (y + lut->atan2_range) * lut->atan2_scale;
+    
+    // Get integer indices
+    int x0 = __float2int_rd(x_norm);
+    int z0 = __float2int_rd(z_norm);
+    int x1 = min(x0 + 1, lut->atan2_size - 1);
+    int z1 = min(z0 + 1, lut->atan2_size - 1);
+    
+    // Clamp to valid range
+    x0 = max(0, min(x0, lut->atan2_size - 1));
+    z0 = max(0, min(z0, lut->atan2_size - 1));
+    
+    // Interpolation weights
+    float tx = x_norm - static_cast<float>(x0);
+    float tz = z_norm - static_cast<float>(z0);
+    
+    // Fetch 4 corners for bilinear interpolation
+    int idx00 = z0 * lut->atan2_size + x0;
+    int idx10 = z0 * lut->atan2_size + x1;
+    int idx01 = z1 * lut->atan2_size + x0;
+    int idx11 = z1 * lut->atan2_size + x1;
+    
+    float v00 = lut->d_atan2_lut[idx00];
+    float v10 = lut->d_atan2_lut[idx10];
+    float v01 = lut->d_atan2_lut[idx01];
+    float v11 = lut->d_atan2_lut[idx11];
+    
+    // Handle angle wrapping (difference > π means we crossed -π/π boundary)
+    // Adjust values to be in consistent range for interpolation
+    if (fabsf(v10 - v00) > CUDART_PI_F) {
+        if (v10 < v00) v10 += 2.0f * CUDART_PI_F;
+        else v00 += 2.0f * CUDART_PI_F;
+    }
+    if (fabsf(v01 - v00) > CUDART_PI_F) {
+        if (v01 < v00) v01 += 2.0f * CUDART_PI_F;
+        else v00 += 2.0f * CUDART_PI_F;
+    }
+    if (fabsf(v11 - v00) > CUDART_PI_F) {
+        if (v11 < v00) v11 += 2.0f * CUDART_PI_F;
+        else v00 += 2.0f * CUDART_PI_F;
+    }
+    
+    // Bilinear interpolation
+    float v0 = fmaf(tx, v10 - v00, v00);
+    float v1 = fmaf(tx, v11 - v01, v01);
+    float result = fmaf(tz, v1 - v0, v0);
+    
+    // Normalize to [-π, π]
+    while (result > CUDART_PI_F) result -= 2.0f * CUDART_PI_F;
+    while (result < -CUDART_PI_F) result += 2.0f * CUDART_PI_F;
+    
+    return result;
+}
+
+// ============================================================================
+// ORIGINAL HELPER FUNCTIONS (OPTIMIZED)
+// ============================================================================
+
 __device__ __forceinline__ SphericalLUT* FindLUTForCamera_Optimized(const Camera& cam, int* lut_index) {
     SphericalLUT* best_lut = nullptr;
     float min_diff = FLT_MAX;
     int best_idx = -1;
     
-    // Unroll the loop for better performance with small constant d_num_luts
     #pragma unroll
     for (int i = 0; i < d_num_luts && i < 10; ++i) {
         SphericalLUT* lut = d_lut_array_const[i];
         
-        // Branchless exact match check
         bool exact_match = (lut->width == cam.width) && 
                           (lut->height == cam.height) &&
                           (fabsf(lut->cx - cam.params[1]) < 0.1f) && 
@@ -31,14 +127,12 @@ __device__ __forceinline__ SphericalLUT* FindLUTForCamera_Optimized(const Camera
         
         if (exact_match) {
             *lut_index = i;
-            return lut;  // Early return for exact match
+            return lut;
         }
         
-        // Calculate difference for closest match using branchless min
         float diff = fabsf(lut->width - cam.width) + fabsf(lut->height - cam.height) +
                     fabsf(lut->cx - cam.params[1]) + fabsf(lut->cy - cam.params[2]);
         
-        // Branchless minimum update
         bool is_better = diff < min_diff;
         min_diff = is_better ? diff : min_diff;
         best_lut = is_better ? lut : best_lut;
@@ -49,9 +143,7 @@ __device__ __forceinline__ SphericalLUT* FindLUTForCamera_Optimized(const Camera
     return best_lut;
 }
 
-// Fast analytical direction computation with reduced operations
 __device__ __forceinline__ void ComputeDirectionAnalytical_Fast(const Camera& cam, const int2 p, float3* dir) {
-    // Use faster division and multiplication
     const float inv_width = __fdividef(1.0f, static_cast<float>(cam.width));
     const float inv_height = __fdividef(1.0f, static_cast<float>(cam.height));
     
@@ -67,56 +159,46 @@ __device__ __forceinline__ void ComputeDirectionAnalytical_Fast(const Camera& ca
     dir->z = __fmul_rn(cos_lat, cos_lon);
 }
 
-// Optimized direct LUT lookup with prefetching and caching
 __device__ __forceinline__ float3 GetDirectionFromLUT_Optimized(SphericalLUT* lut, int x, int y) {
     int idx = y * lut->width + x;
     
-    // Use vector load if possible (assuming proper alignment)
     if (idx < lut->width * lut->height) {
         return lut->d_dir_vectors[idx];
     }
     
-    return make_float3(0.0f, 0.0f, 1.0f); // fallback
+    return make_float3(0.0f, 0.0f, 1.0f);
 }
 
-// Find the appropriate LUT for given camera parameters (original interface)
 __device__ __forceinline__ SphericalLUT* FindLUTForCamera(const Camera& cam) {
     int lut_index;
     return FindLUTForCamera_Optimized(cam, &lut_index);
 }
 
-// Optimized PixelToDir with multi-resolution support and reduced branching
 __device__ __forceinline__ void PixelToDir_MultiRes(const Camera& cam, const int2 p, float3* dir) {
     int lut_index;
     SphericalLUT* lut = FindLUTForCamera_Optimized(cam, &lut_index);
     
-    // Branchless bounds checking
     bool valid_lut = (lut != nullptr);
     bool in_bounds = (p.x >= 0) && (p.x < cam.width) && (p.y >= 0) && (p.y < cam.height);
     bool exact_resolution = valid_lut && (lut->width == cam.width) && (lut->height == cam.height);
     
     if (valid_lut && in_bounds && exact_resolution) {
-        // Fast path: Direct memory access with optimized indexing
         *dir = GetDirectionFromLUT_Optimized(lut, p.x, p.y);
     } else {
-        // Analytical computation - optimized for performance
         ComputeDirectionAnalytical_Fast(cam, p, dir);
     }
 }
 
-// Optimized Get3DPoint with better memory patterns
 __device__ __forceinline__ void Get3DPoint_MultiRes(const Camera camera, const int2 p, 
                                                     const float depth, float *X) {
     float3 dir;
     PixelToDir_MultiRes(camera, p, &dir);
     
-    // Use fused multiply-add for better performance
     X[0] = __fmul_rn(dir.x, depth);
     X[1] = __fmul_rn(dir.y, depth);
     X[2] = __fmul_rn(dir.z, depth);
 }
 
-// Optimized GetViewDirection with reduced memory operations
 __device__ __forceinline__ float4 GetViewDirection_MultiRes(const Camera camera, const int2 p, 
                                                             const float depth) {
     float3 dir;
@@ -124,7 +206,6 @@ __device__ __forceinline__ float4 GetViewDirection_MultiRes(const Camera camera,
     return make_float4(dir.x, dir.y, dir.z, 0.0f);
 }
 
-// Optimized depth computation with reduced branching
 __device__ __forceinline__ float ComputeDepthfromPlaneHypothesis_MultiRes(
     const Camera camera, const float4 plane_hypothesis, const int2 p) {
     
@@ -135,7 +216,6 @@ __device__ __forceinline__ float ComputeDepthfromPlaneHypothesis_MultiRes(
                         fmaf(plane_hypothesis.y, dir.y, 
                              plane_hypothesis.z * dir.z));
     
-    // Branchless depth computation
     const float abs_denom = fabsf(denom);
     const bool valid_denom = abs_denom >= 1e-6f;
     const float result = __fdividef(-plane_hypothesis.w, denom);
@@ -143,28 +223,24 @@ __device__ __forceinline__ float ComputeDepthfromPlaneHypothesis_MultiRes(
     return valid_denom ? result : 1e6f;
 }
 
-// Optimized world point computation with FMA operations
 __device__ __forceinline__ float3 Get3DPointonWorld_MultiRes(const float x, const float y, 
                                                              const float depth, const Camera camera) {
     int2 p = make_int2(__float2int_rn(x), __float2int_rn(y));
     float3 dir;
     PixelToDir_MultiRes(camera, p, &dir);
     
-    // Camera space point with FMA
     float3 point_cam = make_float3(
         __fmul_rn(dir.x, depth),
         __fmul_rn(dir.y, depth),
         __fmul_rn(dir.z, depth)
     );
     
-    // Transform to world coordinates using FMA
     float3 tmp = make_float3(
         fmaf(camera.R[0], point_cam.x, fmaf(camera.R[3], point_cam.y, camera.R[6] * point_cam.z)),
         fmaf(camera.R[1], point_cam.x, fmaf(camera.R[4], point_cam.y, camera.R[7] * point_cam.z)),
         fmaf(camera.R[2], point_cam.x, fmaf(camera.R[5], point_cam.y, camera.R[8] * point_cam.z))
     );
     
-    // Compute camera center with FMA
     float3 C = make_float3(
         -fmaf(camera.R[0], camera.t[0], fmaf(camera.R[3], camera.t[1], camera.R[6] * camera.t[2])),
         -fmaf(camera.R[1], camera.t[0], fmaf(camera.R[4], camera.t[1], camera.R[7] * camera.t[2])),
@@ -174,7 +250,6 @@ __device__ __forceinline__ float3 Get3DPointonWorld_MultiRes(const float x, cons
     return make_float3(tmp.x + C.x, tmp.y + C.y, tmp.z + C.z);
 }
 
-// Optimized reference camera point computation
 __device__ __forceinline__ float3 Get3DPointonRefCam_MultiRes(const int x, const int y, 
                                                               const float depth, const Camera camera) {
     int2 p = make_int2(x, y);
@@ -188,7 +263,10 @@ __device__ __forceinline__ float3 Get3DPointonRefCam_MultiRes(const int x, const
     );
 }
 
-// Optimized projection with cached trigonometric values when possible
+// ============================================================================
+// OPTIMIZED PROJECTION WITH INVERSE TRIG LUTs
+// ============================================================================
+
 __device__ __forceinline__ void ProjectonCamera_MultiRes(const float3 PointX, const Camera camera,
                                                          float2 &point, float &depth) {
     // Transform world point into camera frame using FMA
@@ -208,14 +286,25 @@ __device__ __forceinline__ void ProjectonCamera_MultiRes(const float3 PointX, co
         return;
     }
     
-    // Optimized angle computation
+    // Optimized angle computation using inverse trig LUTs
     const float inv_depth = __fdividef(1.0f, depth);
     const float normalized_y = __fmul_rn(tmp.y, inv_depth);
     
-    // Clamp to valid range before asin
+    // Clamp to valid range for asin
     const float clamped_y = fmaxf(-1.0f, fminf(1.0f, normalized_y));
-    const float latitude = -asinf(clamped_y);
-    const float longitude = atan2f(tmp.x, tmp.z);
+    
+    // Use fast inverse trig lookups
+    float latitude, longitude;
+    
+#if defined(USE_INVERSE_TRIG_LUTS) && USE_INVERSE_TRIG_LUTS
+    // Fast LUT-based computation
+    latitude = -FastAsin(clamped_y, d_inverse_trig_lut);
+    longitude = FastAtan2(tmp.x, tmp.z, d_inverse_trig_lut);
+#else
+    // Direct computation (fallback)
+    latitude = -asinf(clamped_y);
+    longitude = atan2f(tmp.x, tmp.z);
+#endif
     
     // Final projection with FMA
     const float inv_2pi = __fdividef(1.0f, 2.0f * CUDART_PI_F);
@@ -227,23 +316,22 @@ __device__ __forceinline__ void ProjectonCamera_MultiRes(const float3 PointX, co
                    static_cast<float>(camera.height), camera.params[2]);
 }
 
-// Optimized adaptive reprojection threshold with reduced branching
+// ============================================================================
+// ADAPTIVE THRESHOLDS AND CONFIDENCE
+// ============================================================================
+
 __device__ __forceinline__ float GetAdaptiveReprojectionThreshold(
     const Camera& cam, int x, int y, float base_threshold = 2.0f) {
     
-    // Branchless model check
     float spherical_factor = (cam.model == SPHERE) ? 1.0f : 0.0f;
     
     if (spherical_factor > 0.0f) {
-        // Optimized latitude computation
         const float inv_height = __fdividef(1.0f, static_cast<float>(cam.height));
         const float lat = -((static_cast<float>(y) - cam.params[2]) * inv_height) * CUDART_PI_F;
         
-        // Fast cosine with clamping
         const float cos_lat = fmaxf(cosf(lat), 0.1f);
         const float lat_factor = __fdividef(1.0f, cos_lat);
         
-        // Radial distance computation
         const float dx = static_cast<float>(x) - cam.params[1];
         const float dy = static_cast<float>(y) - cam.params[2];
         const float dist_from_center = __fsqrt_rn(fmaf(dx, dx, dy * dy));
@@ -259,17 +347,13 @@ __device__ __forceinline__ float GetAdaptiveReprojectionThreshold(
     return base_threshold;
 }
 
-// Optimized depth threshold with reduced operations
 __device__ __forceinline__ float GetAdaptiveDepthThreshold(
     float depth, const Camera& cam, float base_threshold = 0.015f) {
     
-    // Branchless computation
     float spherical_factor = (cam.model == SPHERE) ? 1.0f : 0.0f;
     
-    // Linear factor for pinhole
     float linear_factor = fmaf(__fdividef(depth, 100.0f), (1.0f - spherical_factor), 1.0f);
     
-    // Quadratic factor for spherical
     float depth_over_100 = __fdividef(depth, 100.0f);
     float quadratic_factor = fmaf(__fmul_rn(depth_over_100, depth_over_100), spherical_factor, 1.0f);
     
@@ -277,13 +361,11 @@ __device__ __forceinline__ float GetAdaptiveDepthThreshold(
     return __fmul_rn(base_threshold, total_factor);
 }
 
-// Optimized confidence calculation with vectorized operations where possible
 __device__ __forceinline__ float CalculateGeometricConfidence(
     const Camera& ref_cam, const Camera& src_cam,
     float3 point_world, int ref_x, int ref_y, int src_x, int src_y,
     float reproj_error, float depth_diff, float normal_angle) {
     
-    // Pre-compute camera centers using FMA
     float3 ref_center = make_float3(
         -fmaf(ref_cam.R[0], ref_cam.t[0], fmaf(ref_cam.R[3], ref_cam.t[1], ref_cam.R[6] * ref_cam.t[2])),
         -fmaf(ref_cam.R[1], ref_cam.t[0], fmaf(ref_cam.R[4], ref_cam.t[1], ref_cam.R[7] * ref_cam.t[2])),
@@ -296,7 +378,6 @@ __device__ __forceinline__ float CalculateGeometricConfidence(
         -fmaf(src_cam.R[2], src_cam.t[0], fmaf(src_cam.R[5], src_cam.t[1], src_cam.R[8] * src_cam.t[2]))
     );
     
-    // Vectorized baseline computation
     float3 baseline = make_float3(
         src_center.x - ref_center.x,
         src_center.y - ref_center.y,
@@ -305,7 +386,6 @@ __device__ __forceinline__ float CalculateGeometricConfidence(
     float baseline_length = __fsqrt_rn(fmaf(baseline.x, baseline.x, 
                                        fmaf(baseline.y, baseline.y, baseline.z * baseline.z)));
     
-    // Vectorized ray computations
     float3 ray1 = make_float3(
         point_world.x - ref_center.x,
         point_world.y - ref_center.y,
@@ -320,14 +400,12 @@ __device__ __forceinline__ float CalculateGeometricConfidence(
     float ray1_length = __fsqrt_rn(fmaf(ray1.x, ray1.x, fmaf(ray1.y, ray1.y, ray1.z * ray1.z)));
     float ray2_length = __fsqrt_rn(fmaf(ray2.x, ray2.x, fmaf(ray2.y, ray2.y, ray2.z * ray2.z)));
     
-    // Optimized dot product and angle computation
     float dot_product = fmaf(ray1.x, ray2.x, fmaf(ray1.y, ray2.y, ray1.z * ray2.z));
     float cos_angle = __fdividef(dot_product, __fmul_rn(ray1_length, ray2_length));
-    cos_angle = fmaxf(-1.0f, fminf(1.0f, cos_angle)); // clamp for numerical stability
+    cos_angle = fmaxf(-1.0f, fminf(1.0f, cos_angle));
     
     float triangulation_angle = acosf(cos_angle);
     
-    // Fast exponential approximations for weights
     float angle_diff = fabsf(triangulation_angle - 1.047f); // 60 degrees
     float angle_weight = __expf(-2.0f * angle_diff);
     
@@ -335,11 +413,9 @@ __device__ __forceinline__ float CalculateGeometricConfidence(
     float depth_weight = __expf(-__fmul_rn(depth_diff, depth_diff) * 100.0f);
     float normal_weight = __expf(-__fmul_rn(normal_angle, normal_angle) * 10.0f);
     
-    // Combine all weights
     float confidence = __fmul_rn(__fmul_rn(angle_weight, reproj_weight), 
                                 __fmul_rn(depth_weight, normal_weight));
     
-    // Spherical camera pole correction
     if (ref_cam.model == SPHERE) {
         const float inv_height = __fdividef(1.0f, static_cast<float>(ref_cam.height));
         const float ref_lat = -((static_cast<float>(ref_y) - ref_cam.params[2]) * inv_height) * CUDART_PI_F;
@@ -350,7 +426,10 @@ __device__ __forceinline__ float CalculateGeometricConfidence(
     return confidence;
 }
 
-// Macro definitions to replace original functions
+// ============================================================================
+// MACRO DEFINITIONS FOR COMPATIBILITY
+// ============================================================================
+
 #define PixelToDir PixelToDir_MultiRes
 #define Get3DPoint Get3DPoint_MultiRes
 #define GetViewDirection GetViewDirection_MultiRes

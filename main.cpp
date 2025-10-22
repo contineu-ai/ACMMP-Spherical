@@ -482,7 +482,7 @@ void InitializeLUTsForAllResolutions(const std::string &dense_folder,
 
 int ComputeMultiScaleSettings(const std::string &dense_folder, std::vector<Problem> &problems)
 {
-    int max_num_downscale = -1;
+    int max_num_downscale = 2;
     int size_bound = 800;
     PatchMatchParams pmp;
     std::string image_folder = dense_folder + std::string("/images");
@@ -543,7 +543,7 @@ void JointBilateralUpsampling(const std::string &dense_folder, const Problem &pr
     cv::Mat scaled_image_float;
     cv::resize(image_float, scaled_image_float, cv::Size(new_cols,new_rows), 0, 0, cv::INTER_LINEAR);
 
-    std::cout << "Run JBU for image " << problem.ref_image_id <<  ".jpg" << std::endl;
+    // std::cout << "Run JBU for image " << problem.ref_image_id <<  ".jpg" << std::endl;
     RunJBU(scaled_image_float, ref_depth, dense_folder, problem);
 }
 
@@ -587,9 +587,8 @@ void ProcessProblemsInParallel(const std::string &dense_folder,
             size_t disk_completed = batch_processor.getCompletedDiskWrites();
             size_t total = problems.size();
             
-            // Report progress every 5 seconds
             auto now = std::chrono::steady_clock::now();
-            if (std::chrono::duration_cast<std::chrono::seconds>(now - last_report).count() >= 5) {
+            if (std::chrono::duration_cast<std::chrono::seconds>(now - last_report).count() >= 60) {
                 std::cout << "[Progress] GPU: " << gpu_completed << "/" << total 
                           << ", Disk: " << disk_completed << "/" << total
                           << ", Active GPU: " << batch_processor.getActiveGPUProblems()
@@ -688,7 +687,7 @@ int main(int argc, char** argv)
 
         if (flag == 0) {
             flag = 1;
-            
+            std::cout << "Scale: " << max_num_downscale << std::endl;
             // Phase 1: Planar prior processing
             geom_consistency = false;
             planar_prior = true;
@@ -698,6 +697,7 @@ int main(int argc, char** argv)
             // Phase 2: Geometric consistency processing
             geom_consistency = true;
             planar_prior = false;
+            std::cout << "Scale: " << max_num_downscale << std::endl;
             for (int geom_iter = 0; geom_iter < geom_iterations; ++geom_iter) {
                 multi_geometry = (geom_iter > 0);
                 ProcessProblemsWithMode(dense_folder, problems, geom_consistency, 
@@ -706,6 +706,7 @@ int main(int argc, char** argv)
         }
         else {
             // Joint Bilateral Upsampling phase
+            std::cout << "Scale: " << max_num_downscale << std::endl;
             for (size_t i = 0; i < num_images; ++i) {
                JointBilateralUpsampling(dense_folder, problems[i], problems[i].cur_image_size);
             }
@@ -714,6 +715,7 @@ int main(int argc, char** argv)
             hierarchy = true;
             geom_consistency = false;
             planar_prior = true;
+            std::cout << "Scale: " << max_num_downscale << std::endl;
             ProcessProblemsWithMode(dense_folder, problems, geom_consistency, 
                                    planar_prior, hierarchy, false, use_batching);
             
@@ -722,6 +724,7 @@ int main(int argc, char** argv)
             geom_consistency = true;
             planar_prior = false;
             for (int geom_iter = 0; geom_iter < geom_iterations; ++geom_iter) {
+                std::cout << "Scale: " << max_num_downscale << std::endl;
                 multi_geometry = (geom_iter > 0);
                 ProcessProblemsWithMode(dense_folder, problems, geom_consistency, 
                                        planar_prior, hierarchy, multi_geometry, use_batching);

@@ -181,10 +181,11 @@ BatchACMMP::BatchACMMP(const std::string& dense_folder_,
                        bool geom_consistency_,
                        bool planar_prior_,
                        bool hierarchy_,
-                       bool multi_geometry_)
+                       bool multi_geometry_,
+                       size_t mask_disk_queue_size_)
     : dense_folder(dense_folder_), all_problems(problems),
       geom_consistency(geom_consistency_), planar_prior(planar_prior_),
-      hierarchy(hierarchy_), multi_geometry(multi_geometry_)
+      hierarchy(hierarchy_), multi_geometry(multi_geometry_),mask_disk_queue_size(mask_disk_queue_size_) 
 {
     // Device properties
     cudaDeviceProp prop{};
@@ -205,7 +206,7 @@ BatchACMMP::BatchACMMP(const std::string& dense_folder_,
                    (prop.multiProcessorCount >= 5)  ? 4 : 2;
     
     max_concurrent_problems = std::min({by_gpu_mem, by_sm, size_t(12)});
-    max_concurrent_problems = std::max<size_t>(1, max_concurrent_problems);
+    max_concurrent_problems = std::max<size_t>(1, 12);
     
     // Separate disk writer threads - optimize for disk I/O
     num_disk_writers = std::min<size_t>(4, std::max<size_t>(2, hardware_threads / 4));
@@ -232,6 +233,7 @@ BatchACMMP::~BatchACMMP() {
     // Step 2: Wake up all waiting threads
     gpu_queue_cv_.notify_all();
     disk_queue_cv_.notify_all();
+    disk_queue_space_cv_.notify_all();  
     resource_cv_.notify_all();
     
     // Step 3: Join worker threads
@@ -324,34 +326,6 @@ size_t BatchACMMP::getProcessMemoryUsage() const {
     return 0;
 }
 
-
-// void BatchACMMP::initializeResourcePool() {
-//     streams.resize(max_concurrent_problems);
-//     resource_pool.resize(max_concurrent_problems);
-
-//     int prio_low=0, prio_high=0;
-//     CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&prio_low, &prio_high));
-    
-//     for (size_t i = 0; i < max_concurrent_problems; ++i) {
-//         CUDA_CHECK(cudaStreamCreateWithPriority(&streams[i], cudaStreamNonBlocking, prio_high));
-
-//         std::unique_ptr<ProblemGPUResources> res(new ProblemGPUResources());
-//         res->stream_id = (int)i;
-//         res->stream = streams[i];
-
-//         available_resources.push(res.get());
-//         resource_pool[i] = std::move(res);
-//     }
-    
-//     // Launch GPU worker threads
-//     gpu_worker_threads.reserve(max_concurrent_problems);
-//     for (size_t i = 0; i < max_concurrent_problems; ++i) {
-//         gpu_worker_threads.emplace_back(&BatchACMMP::gpuWorkerFunction, this);
-//     }
-    
-//     std::cout << "[BatchACMMP] Created " << max_concurrent_problems << " GPU worker threads" << std::endl;
-// }
-
 void BatchACMMP::initializeDiskWriters() {
     // Launch disk writer threads
     disk_writer_threads.reserve(num_disk_writers);
@@ -379,7 +353,6 @@ void BatchACMMP::releaseResources(ProblemGPUResources* r) {
     
     {
         std::lock_guard<std::mutex> lk(resource_mutex_);
-        if (r->stream) cudaStreamSynchronize(r->stream);  // Move inside lock
         available_resources.push(r);
     }
     resource_cv_.notify_one();
@@ -440,6 +413,7 @@ void BatchACMMP::gpuWorkerFunction() {
 void BatchACMMP::diskWriterFunction() {
     while (!stopping_disk_.load()) {
         CompletedResult result;
+        bool queue_was_full = false;
         
         // Get completed result from queue
         {
@@ -450,8 +424,14 @@ void BatchACMMP::diskWriterFunction() {
             if (stopping_disk_.load() && disk_write_queue_.empty()) break;
             if (disk_write_queue_.empty()) continue;
             
+            queue_was_full = (disk_write_queue_.size() >= mask_disk_queue_size);
             result = std::move(disk_write_queue_.front());
             disk_write_queue_.pop();
+        }
+        
+        // Signal that space is available (OUTSIDE the lock!)
+        if (queue_was_full) {
+            disk_queue_space_cv_.notify_all();
         }
         
         try {
@@ -478,7 +458,7 @@ void BatchACMMP::processProblemOnStream(int problem_idx, ProblemGPUResources* re
     active_gpu_problems_.fetch_add(1);
     
     try {
-        cudaStreamSynchronize(stream);
+        // cudaStreamSynchronize(stream);
         // Ensure the stream is valid before creating ACMMP.
         cudaError_t stream_check = cudaStreamQuery(stream);
         if (stream_check == cudaErrorInvalidResourceHandle) {
@@ -512,8 +492,6 @@ void BatchACMMP::processProblemOnStream(int problem_idx, ProblemGPUResources* re
             // Run the main algorithm, using the provided GPU resources.
             acmmp.RunPatchMatch(resources);
             
-            // Synchronize the stream to ensure results are ready before extraction.
-            cudaStreamSynchronize(stream);
             
             // Extract results...
             const int width = acmmp.GetReferenceImageWidth();
@@ -533,18 +511,30 @@ void BatchACMMP::processProblemOnStream(int problem_idx, ProblemGPUResources* re
                 }
             }
 
-            // Queue the results for asynchronous disk writing.
+            // Queue the results for asynchronous disk writing with backpressure
             {
-                std::lock_guard<std::mutex> lk(disk_queue_mutex_);
+                std::unique_lock<std::mutex> lk(disk_queue_mutex_);
+                // Wait if queue is full - this provides backpressure
+                disk_queue_space_cv_.wait(lk, [&]{
+                    return disk_write_queue_.size() < mask_disk_queue_size || stopping_disk_.load();
+                });
+                
+                size_t queue_size = disk_write_queue_.size();
                 disk_write_queue_.emplace(problem_idx, problem, 
                                          std::move(depths), std::move(normals), 
                                          std::move(costs), geom_consistency);
+                
+                // Warn if queue is getting large
+                // if (queue_size > mask_disk_queue_size * 3 / 4) {  // 75%
+                //     std::cout << "[Backpressure] Disk queue at " << queue_size << "/" 
+                //               << mask_disk_queue_size << " - GPU throttled" << std::endl;
+                // }
             }
             disk_queue_cv_.notify_one();
         } // ACMMP destructor is called here, freeing only its HOST memory.
         
         // Final sync after ACMMP is destroyed.
-        cudaStreamSynchronize(stream);
+        // cudaStreamSynchronize(stream);
         
     } catch (const std::exception& e) {
         std::cerr << "[Problem " << problem_idx << "] Exception: " << e.what() << std::endl;
@@ -585,7 +575,7 @@ void BatchACMMP::waitForGPUCompletion() {
     for (auto& s : streams) {
         if (s) CUDA_CHECK(cudaStreamSynchronize(s));
     }
-    cudaDeviceSynchronize();
+    // cudaDeviceSynchronize();
     
     std::cout << "[BatchACMMP] GPU processing complete!" << std::endl;
 }
@@ -601,7 +591,24 @@ void BatchACMMP::waitForDiskCompletion() {
 
 void BatchACMMP::waitForCompletion() {
     waitForGPUCompletion();
+    
+    size_t pending = getPendingDiskWrites();
+    if (pending > 0) {
+        std::cout << "[BatchACMMP] GPU complete. Flushing remaining " 
+                  << pending << " results to disk..." << std::endl;
+    }
+    
     waitForDiskCompletion();
+    
+    // Verify all problems were written
+    int total = problems_enqueued_.load();
+    int written = disk_completed_.load();
+    if (written == total) {
+        std::cout << "[BatchACMMP] ✓ All " << total << " problems written successfully!" << std::endl;
+    } else {
+        std::cerr << "[BatchACMMP] ✗ WARNING: Only " << written << "/" << total 
+                  << " problems written!" << std::endl;
+    }
 }
 
 size_t BatchACMMP::getPeakMemoryUsage() const {
@@ -626,3 +633,4 @@ size_t BatchACMMP::getCompletedDiskWrites() const {
     return disk_completed_.load();
 }
 
+// ======================================== 

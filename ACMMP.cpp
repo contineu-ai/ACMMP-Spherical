@@ -621,9 +621,9 @@ void ACMMP::InuputInitialization(const std::string &dense_folder, const std::vec
 
     params.depth_min = cameras[0].depth_min * 0.6f;
     params.depth_max = cameras[0].depth_max * 1.2f;
-    std::cout << "depthe range: " << params.depth_min << " " << params.depth_max << std::endl;
+    // std::cout << "depthe range: " << params.depth_min << " " << params.depth_max << std::endl;
     params.num_images = (int)images.size();
-    std::cout << "num images: " << params.num_images << std::endl;
+    // std::cout << "num images: " << params.num_images << std::endl;
     params.disparity_min = cameras[0].K[0] * params.baseline / params.depth_max;
     params.disparity_max = cameras[0].K[0] * params.baseline / params.depth_min;
 
