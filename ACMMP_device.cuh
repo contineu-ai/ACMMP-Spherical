@@ -1,8 +1,8 @@
 #ifndef ACMMP_DEVICE_CUH
 #define ACMMP_DEVICE_CUH
 
-#include "ACMMP.h"
 #include "SphericalLUT_MultiRes.h"
+#include "ACMMP.h"
 #include <math_constants.h>
 
 // Access to constant memory LUTs
@@ -16,6 +16,11 @@ __shared__ float3 shared_dir_cache[256];
 // ============================================================================
 // FAST INVERSE TRIGONOMETRIC LOOKUP FUNCTIONS
 // ============================================================================
+
+// Define the flag if not already defined
+#ifndef USE_INVERSE_TRIG_LUTS
+#define USE_INVERSE_TRIG_LUTS 1
+#endif
 
 // Fast ASIN lookup with linear interpolation
 __device__ __forceinline__ float FastAsin(float x, const InverseTrigLUT* lut) {
@@ -296,10 +301,16 @@ __device__ __forceinline__ void ProjectonCamera_MultiRes(const float3 PointX, co
     // Use fast inverse trig lookups
     float latitude, longitude;
     
-#if defined(USE_INVERSE_TRIG_LUTS) && USE_INVERSE_TRIG_LUTS
+#if USE_INVERSE_TRIG_LUTS
     // Fast LUT-based computation
-    latitude = -FastAsin(clamped_y, d_inverse_trig_lut);
-    longitude = FastAtan2(tmp.x, tmp.z, d_inverse_trig_lut);
+    if (d_inverse_trig_lut != nullptr) {
+        latitude = -FastAsin(clamped_y, d_inverse_trig_lut);
+        longitude = FastAtan2(tmp.x, tmp.z, d_inverse_trig_lut);
+    } else {
+        // Fallback if LUT not initialized
+        latitude = -asinf(clamped_y);
+        longitude = atan2f(tmp.x, tmp.z);
+    }
 #else
     // Direct computation (fallback)
     latitude = -asinf(clamped_y);
@@ -438,4 +449,4 @@ __device__ __forceinline__ float CalculateGeometricConfidence(
 #define Get3DPointonRefCam_cu Get3DPointonRefCam_MultiRes
 #define ProjectonCamera_cu ProjectonCamera_MultiRes
 
-#endif // ACMMP_DEVICE_CUH
+#endif // ACMMP_DEVICE_CUHsssss
