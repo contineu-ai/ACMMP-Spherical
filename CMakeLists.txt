@@ -35,6 +35,7 @@ set(CUDA_SOURCES
     FusionGPU.cu
     SphericalLUT_MultiRes.cu
     BatchACMMP.cu
+    precompute.cu  
 )
 
 set(CXX_SOURCES

@@ -3,6 +3,7 @@
 
 #include "SphericalLUT_MultiRes.h"
 #include "ACMMP.h"
+#include "main.h" 
 #include <math_constants.h>
 
 // Access to constant memory LUTs
@@ -326,6 +327,72 @@ __device__ __forceinline__ void ProjectonCamera_MultiRes(const float3 PointX, co
     point.y = fmaf(__fmul_rn(-latitude, inv_pi),
                    static_cast<float>(camera.height), camera.params[2]);
 }
+
+
+
+// ============================================================================
+// FAST PROJECTION USING PRECOMPUTED DATA
+// ============================================================================
+
+// Fast projection using precomputed ray transformation
+__device__ __forceinline__ void ProjectonCamera_Precomputed(
+    const PrecomputedRayData& precomp,
+    const Camera& camera,
+    const float depth,
+    float2& point,
+    float& out_depth)
+{
+    // Step 1: Compute point in source camera frame using precomputed data
+    // P_src = b + d * r_src (only 3 FMAs!)
+    float3 P_src = precomp.GetPointInSrcFrame(depth);
+    
+    // Step 2: Compute depth (magnitude)
+    out_depth = __fsqrt_rn(fmaf(P_src.x, P_src.x, fmaf(P_src.y, P_src.y, P_src.z * P_src.z)));
+    
+    // Early exit for invalid depth
+    if (out_depth < 1e-6f) {
+        point.x = camera.params[1];
+        point.y = camera.params[2];
+        return;
+    }
+    
+    // Step 3: Normalize to unit sphere
+    const float inv_depth = __fdividef(1.0f, out_depth);
+    const float n_x = __fmul_rn(P_src.x, inv_depth);
+    const float n_y = __fmul_rn(P_src.y, inv_depth);
+    const float n_z = __fmul_rn(P_src.z, inv_depth);
+    
+    // Step 4: Clamp for numerical stability
+    const float clamped_y = fmaxf(-1.0f, fminf(1.0f, n_y));
+    
+    // Step 5: Fast inverse trig using LUTs
+    float latitude, longitude;
+    
+#if USE_INVERSE_TRIG_LUTS
+    if (d_inverse_trig_lut != nullptr) {
+        latitude = -FastAsin(clamped_y, d_inverse_trig_lut);
+        longitude = FastAtan2(n_x, n_z, d_inverse_trig_lut);
+    } else {
+        latitude = -asinf(clamped_y);
+        longitude = atan2f(n_x, n_z);
+    }
+#else
+    latitude = -asinf(clamped_y);
+    longitude = atan2f(n_x, n_z);
+#endif
+    
+    // Step 6: Convert to pixel coordinates
+    const float inv_2pi = __fdividef(1.0f, 2.0f * CUDART_PI_F);
+    const float inv_pi = __fdividef(1.0f, CUDART_PI_F);
+    
+    point.x = fmaf(__fmul_rn(longitude, inv_2pi), 
+                   static_cast<float>(camera.width), camera.params[1]);
+    point.y = fmaf(__fmul_rn(-latitude, inv_pi),
+                   static_cast<float>(camera.height), camera.params[2]);
+}
+
+
+
 
 // ============================================================================
 // ADAPTIVE THRESHOLDS AND CONFIDENCE

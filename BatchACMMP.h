@@ -66,6 +66,12 @@ public:
     cudaTextureObjects texture_objects_host;
     cudaTextureObjects texture_depths_host;
 
+    // === NEW: PRECOMPUTED RAY TRANSFORMATION CACHE ===
+    PrecomputedRayData* precomp_data_cuda = nullptr;
+    PrecomputedProjectionCache precomp_cache;
+
+
+
     // Pinned host memory for fast, asynchronous DMA transfers
     float4* planes_host_pinned = nullptr;
     float* costs_host_pinned = nullptr;

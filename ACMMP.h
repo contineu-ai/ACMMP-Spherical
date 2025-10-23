@@ -3,6 +3,11 @@
 
 #include "main.h"
 class ProblemGPUResources; 
+void InitializePrecomputedTransforms(ProblemGPUResources* res,
+                                     int num_images,
+                                     int width,
+                                     int height,
+                                     cudaStream_t stream);
 int readDepthDmb(const std::string file_path, cv::Mat_<float> &depth);
 int readNormalDmb(const std::string file_path, cv::Mat_<cv::Vec3f> &normal);
 int writeDepthDmb(const std::string file_path, const cv::Mat_<float> depth);

@@ -57,13 +57,89 @@ struct Camera {
     float depth_min, depth_max;
 };
 
+// Precomputed ray transformation data for one (pixel, view) pair
+struct PrecomputedRayData {
+    float3 baseline;      // b = R_src · (C_ref - C_src)
+    float3 ray_src;       // r_src = R_src · R_ref^T · r_cam
+    
+#ifdef __CUDACC__
+    // Device-only inline function
+    __device__ __forceinline__ float3 GetPointInSrcFrame(float depth) const {
+        return make_float3(
+            fmaf(depth, ray_src.x, baseline.x),
+            fmaf(depth, ray_src.y, baseline.y),
+            fmaf(depth, ray_src.z, baseline.z)
+        );
+    }
+#endif
+};
+
+// Storage for all precomputed data
+struct PrecomputedProjectionCache {
+    PrecomputedRayData* data;  // [width * height * (num_images-1)]
+    int width;
+    int height;
+    int num_src_images;
+    
+#ifdef __CUDACC__
+    // Device-only inline functions
+    __device__ __forceinline__ PrecomputedRayData& Get(int x, int y, int src_idx) {
+        return data[((y * width + x) * num_src_images) + src_idx];
+    }
+    
+    __device__ __forceinline__ const PrecomputedRayData& Get(int x, int y, int src_idx) const {
+        return data[((y * width + x) * num_src_images) + src_idx];
+    }
+#endif
+};
+
 struct Problem {
     int ref_image_id;
     std::vector<int> src_image_ids;
-    int max_image_size = 3200;
+    int max_image_size = 1600;
     int num_downscale = 0;
-    int cur_image_size = 3200;
+    int cur_image_size = 1600;
 };
+
+// ============================================================================
+// PRECOMPUTED RAY TRANSFORMATION STRUCTURES (Host & Device Compatible)
+// ============================================================================
+
+// Precomputed ray transformation data for one (pixel, view) pair
+// struct PrecomputedRayData {
+//     float3 baseline;      // b = R_src · (C_ref - C_src)
+//     float3 ray_src;       // r_src = R_src · R_ref^T · r_cam
+    
+// #ifdef __CUDACC__
+//     // Device-only inline function
+//     __device__ __forceinline__ float3 GetPointInSrcFrame(float depth) const {
+//         return make_float3(
+//             fmaf(depth, ray_src.x, baseline.x),
+//             fmaf(depth, ray_src.y, baseline.y),
+//             fmaf(depth, ray_src.z, baseline.z)
+//         );
+//     }
+// #endif
+// };
+
+// // Storage for all precomputed data
+// struct PrecomputedProjectionCache {
+//     PrecomputedRayData* data;  // [width * height * (num_images-1)]
+//     int width;
+//     int height;
+//     int num_src_images;
+    
+// #ifdef __CUDACC__
+//     // Device-only inline functions
+//     __device__ __forceinline__ PrecomputedRayData& Get(int x, int y, int src_idx) {
+//         return data[((y * width + x) * num_src_images) + src_idx];
+//     }
+    
+//     __device__ __forceinline__ const PrecomputedRayData& Get(int x, int y, int src_idx) const {
+//         return data[((y * width + x) * num_src_images) + src_idx];
+//     }
+// #endif
+// };
 
 struct Triangle {
     cv::Point pt1, pt2, pt3;

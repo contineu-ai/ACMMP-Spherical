@@ -655,7 +655,6 @@ void ACMMP::InuputInitialization(const std::string &dense_folder, const std::vec
     }
 }
 
-
 void ACMMP::CudaSpaceInitialization(const std::string &dense_folder, const Problem &problem, ProblemGPUResources* res)
 {
     // This function populates the pre-allocated buffers inside the 'res' object.
@@ -696,7 +695,11 @@ void ACMMP::CudaSpaceInitialization(const std::string &dense_folder, const Probl
 
     // Copy camera data to the pre-allocated device buffer.
     CUDA_CHECK(cudaMemcpyAsync(res->cameras_cuda, &cameras[0], sizeof(Camera) * num_images, cudaMemcpyHostToDevice, s));
-
+    
+    if (res->precomp_data_cuda) {
+        InitializePrecomputedTransforms(res, num_images, 
+                                       cameras[0].width, cameras[0].height, s);
+    }
     // Allocate host memory for results (this is owned by the temporary ACMMP object).
     plane_hypotheses_host = new float4[cameras[0].height * cameras[0].width];
     costs_host = new float[cameras[0].height * cameras[0].width];

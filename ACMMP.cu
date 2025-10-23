@@ -289,14 +289,14 @@ __device__ __forceinline__ float ComputeBilateralWeight(
     return expf(-spatial_dist_sq * inv_sigma_spatial_sq - color_dist * inv_sigma_color_sq);
 }
 
-__device__ float ComputeBilateralNCC(
-    const cudaTextureObject_t ref_image,
-    const Camera ref_camera,
-    const cudaTextureObject_t src_image,
-    const Camera src_camera,
-    const int2 p,
-    const float4 plane_hypothesis,
-    const PatchMatchParams params)
+
+__device__ float ComputeBilateralNCC(const cudaTextureObject_t ref_image,
+                                     const Camera ref_camera,
+                                     const cudaTextureObject_t src_image,
+                                     const Camera src_camera,
+                                     const int2 p,
+                                     const float4 plane_hypothesis,
+                                     const PatchMatchParams params)
 {
     const float cost_max = 2.0f;
     const int radius = params.patch_size / 2;
@@ -317,50 +317,43 @@ __device__ float ComputeBilateralNCC(
         return cost_max;
     }
 
-    // Precompute constants (unchanged from original optimization)
+    // Precompute constants
     const float inv_sigma_spatial_sq = 1.0f / (2.0f * params.sigma_spatial * params.sigma_spatial);
     const float inv_sigma_color_sq = 1.0f / (2.0f * params.sigma_color * params.sigma_color);
     const float ref_center_pix = tex2D<float>(ref_image, p.x + 0.5f, p.y + 0.5f);
 
-    // Single precision accumulation (faster than double precision)
+    // Single precision accumulation
     float sum_ref = 0.0f, sum_ref_ref = 0.0f;
     float sum_src = 0.0f, sum_src_src = 0.0f;
     float sum_ref_src = 0.0f, sum_bw = 0.0f;
 
-    // Optimized inner loop with better memory access
+    // Optimized inner loop
     for (int i = -radius; i <= radius; i += params.radius_increment) {
-        const float i_sq = i * i; // Precompute for spatial distance
+        const float i_sq = i * i;
         
         for (int j = -radius; j <= radius; j += params.radius_increment) {
             const int2 ref_pt = make_int2(p.x + i, p.y + j);
 
-            // Single texture read for reference
             const float ref_pix = tex2D<float>(ref_image, ref_pt.x + 0.5f, ref_pt.y + 0.5f);
             
-            // Optimized 3D point computation
             const float depth_n = ComputeDepthfromPlaneHypothesis(ref_camera, plane_hypothesis, ref_pt);
             const float3 Pw_n = Get3DPointonWorld_cu(ref_pt.x, ref_pt.y, depth_n, ref_camera);
 
-            // Single projection computation
             float2 src_pt; 
             float src_d;
             ProjectonCamera_cu(Pw_n, src_camera, src_pt, src_d);
             
-            // Quick bounds check - continue instead of complex conditionals
             if (src_pt.x < 0.0f || src_pt.x >= src_camera.width ||
                 src_pt.y < 0.0f || src_pt.y >= src_camera.height) {
                 continue;
             }
 
-            // Single texture read for source
             const float src_pix = tex2D<float>(src_image, src_pt.x + 0.5f, src_pt.y + 0.5f);
 
-            // Optimized bilateral weight - avoid sqrt in spatial distance
             const float spatial_dist_sq = i_sq + j * j;
             const float color_dist = fabsf(ref_pix - ref_center_pix);
             const float w = expf(-spatial_dist_sq * inv_sigma_spatial_sq - color_dist * inv_sigma_color_sq);
 
-            // Accumulate - using single precision for speed
             sum_bw      += w;
             sum_ref     += w * ref_pix;
             sum_ref_ref += w * ref_pix * ref_pix;
@@ -370,10 +363,8 @@ __device__ float ComputeBilateralNCC(
         }
     }
 
-    // Early exit for insufficient data
     if (sum_bw < 1e-6f) return cost_max;
 
-    // Optimized normalization and variance computation
     const float inv_bw = 1.0f / sum_bw;
     const float mean_ref = sum_ref * inv_bw;
     const float mean_src = sum_src * inv_bw;
@@ -390,6 +381,102 @@ __device__ float ComputeBilateralNCC(
     
     return fmaxf(0.0f, fminf(cost_max, ncc_cost));
 }
+
+__device__ float ComputeBilateralNCC_Precomputed(
+    const cudaTextureObject_t ref_image,
+    const Camera ref_camera,
+    const cudaTextureObject_t src_image,
+    const Camera src_camera,
+    const int2 p,
+    const float4 plane_hypothesis,
+    const PatchMatchParams params,
+    const PrecomputedProjectionCache& precomp_cache,
+    const int src_idx)  // ← Add this parameter
+{
+    const float cost_max = 2.0f;
+    const int radius = params.patch_size / 2;
+    const float kMinVar = 1e-5f;
+
+    float depth_ref = ComputeDepthfromPlaneHypothesis(ref_camera, plane_hypothesis, p);
+    if (depth_ref <= 0.0f || depth_ref > 1000.0f) return cost_max;
+    
+    // Use precomputed data for center pixel to check bounds
+    const PrecomputedRayData& precomp_center = precomp_cache.Get(p.x, p.y, src_idx);
+    float2 pt_center; 
+    float dummy_depth;
+    ProjectonCamera_Precomputed(precomp_center, src_camera, depth_ref, pt_center, dummy_depth);
+    
+    if (pt_center.x < radius || pt_center.x >= src_camera.width - radius ||
+        pt_center.y < radius || pt_center.y >= src_camera.height - radius) {
+        return cost_max;
+    }
+
+    const float inv_sigma_spatial_sq = 1.0f / (2.0f * params.sigma_spatial * params.sigma_spatial);
+    const float inv_sigma_color_sq = 1.0f / (2.0f * params.sigma_color * params.sigma_color);
+    const float ref_center_pix = tex2D<float>(ref_image, p.x + 0.5f, p.y + 0.5f);
+
+    float sum_ref = 0.0f, sum_ref_ref = 0.0f;
+    float sum_src = 0.0f, sum_src_src = 0.0f;
+    float sum_ref_src = 0.0f, sum_bw = 0.0f;
+
+    for (int i = -radius; i <= radius; i += params.radius_increment) {
+        const float i_sq = i * i;
+        
+        for (int j = -radius; j <= radius; j += params.radius_increment) {
+            const int2 ref_pt = make_int2(p.x + i, p.y + j);
+            
+            // Bounds check for neighbor pixel
+            if (ref_pt.x < 0 || ref_pt.x >= ref_camera.width ||
+                ref_pt.y < 0 || ref_pt.y >= ref_camera.height) {
+                continue;
+            }
+
+            const float ref_pix = tex2D<float>(ref_image, ref_pt.x + 0.5f, ref_pt.y + 0.5f);
+            const float depth_n = ComputeDepthfromPlaneHypothesis(ref_camera, plane_hypothesis, ref_pt);
+            
+            // **FIX**: Get precomputed data for THIS neighbor pixel
+            const PrecomputedRayData& precomp_n = precomp_cache.Get(ref_pt.x, ref_pt.y, src_idx);
+            
+            float2 src_pt;
+            float src_d;
+            ProjectonCamera_Precomputed(precomp_n, src_camera, depth_n, src_pt, src_d);
+            
+            if (src_pt.x < 0.0f || src_pt.x >= src_camera.width ||
+                src_pt.y < 0.0f || src_pt.y >= src_camera.height) {
+                continue;
+            }
+
+            const float src_pix = tex2D<float>(src_image, src_pt.x + 0.5f, src_pt.y + 0.5f);
+            const float spatial_dist_sq = i_sq + j * j;
+            const float color_dist = fabsf(ref_pix - ref_center_pix);
+            const float w = expf(-spatial_dist_sq * inv_sigma_spatial_sq - color_dist * inv_sigma_color_sq);
+
+            sum_bw      += w;
+            sum_ref     += w * ref_pix;
+            sum_ref_ref += w * ref_pix * ref_pix;
+            sum_src     += w * src_pix;
+            sum_src_src += w * src_pix * src_pix;
+            sum_ref_src += w * ref_pix * src_pix;
+        }
+    }
+
+    if (sum_bw < 1e-6f) return cost_max;
+
+    const float inv_bw = 1.0f / sum_bw;
+    const float mean_ref = sum_ref * inv_bw;
+    const float mean_src = sum_src * inv_bw;
+    const float var_ref = sum_ref_ref * inv_bw - mean_ref * mean_ref;
+    const float var_src = sum_src_src * inv_bw - mean_src * mean_src;
+    
+    if (var_ref < kMinVar || var_src < kMinVar) return cost_max;
+
+    const float covar = sum_ref_src * inv_bw - mean_ref * mean_src;
+    const float denom = sqrtf(var_ref * var_src);
+    const float ncc_cost = 1.0f - covar / denom;
+    
+    return fmaxf(0.0f, fminf(cost_max, ncc_cost));
+}
+
 
 __device__ float ComputeMultiViewInitialCostandSelectedViews(const cudaTextureObject_t *images, const Camera *cameras, const int2 p, const float4 plane_hypothesis, unsigned int *selected_views, const PatchMatchParams params)
 {
@@ -430,10 +517,33 @@ __device__ float ComputeMultiViewInitialCostandSelectedViews(const cudaTextureOb
     }
 }
 
-__device__ void ComputeMultiViewCostVector(const cudaTextureObject_t *images, const Camera *cameras, const int2 p, const float4 plane_hypothesis, float *cost_vector, const PatchMatchParams params)
+__device__ void ComputeMultiViewCostVector(const cudaTextureObject_t *images, 
+                                           const Camera *cameras, 
+                                           const int2 p, 
+                                           const float4 plane_hypothesis, 
+                                           float *cost_vector, 
+                                           const PatchMatchParams params)
 {
     for (int i = 1; i < params.num_images; ++i) {
         cost_vector[i - 1] = ComputeBilateralNCC(images[0], cameras[0], images[i], cameras[i], p, plane_hypothesis, params);
+    }
+}
+
+__device__ void ComputeMultiViewCostVector_Precomputed(
+    const cudaTextureObject_t *images, 
+    const Camera *cameras, 
+    const int2 p, 
+    const float4 plane_hypothesis, 
+    float *cost_vector, 
+    const PatchMatchParams params,
+    const PrecomputedProjectionCache& precomp_cache)
+{
+    for (int i = 1; i < params.num_images; ++i) {
+        cost_vector[i - 1] = ComputeBilateralNCC_Precomputed(
+            images[0], cameras[0], 
+            images[i], cameras[i], 
+            p, plane_hypothesis, params,
+            precomp_cache, i - 1);  // ← Pass source index
     }
 }
 
@@ -462,6 +572,81 @@ __device__ float ComputeGeomConsistencyCost(const cudaTextureObject_t depth_imag
     const float diff_col = p.x - backward_point.x;
     const float diff_row = p.y - backward_point.y;
     return min(max_cost, sqrt(diff_col * diff_col + diff_row * diff_row));
+}
+
+// ============================================================================
+// PRECOMPUTATION KERNEL - COMPUTE ONCE PER PROBLEM
+// ============================================================================
+
+__global__ void PrecomputeRayTransformations(
+    PrecomputedProjectionCache cache,
+    Camera* cameras,
+    const PatchMatchParams params)
+{
+    const int2 p = make_int2(blockIdx.x * blockDim.x + threadIdx.x, 
+                             blockIdx.y * blockDim.y + threadIdx.y);
+    
+    if (p.x >= cache.width || p.y >= cache.height) return;
+    
+    const Camera& ref_cam = cameras[0];
+    
+    // Step 1: Get ray direction in reference camera frame
+    float3 r_cam;
+    PixelToDir_MultiRes(ref_cam, p, &r_cam);
+    
+    // Step 2: Compute reference camera center in world coordinates
+    // C_ref = -R_ref^T · t_ref
+    float3 C_ref = make_float3(
+        -fmaf(ref_cam.R[0], ref_cam.t[0], fmaf(ref_cam.R[3], ref_cam.t[1], ref_cam.R[6] * ref_cam.t[2])),
+        -fmaf(ref_cam.R[1], ref_cam.t[0], fmaf(ref_cam.R[4], ref_cam.t[1], ref_cam.R[7] * ref_cam.t[2])),
+        -fmaf(ref_cam.R[2], ref_cam.t[0], fmaf(ref_cam.R[5], ref_cam.t[1], ref_cam.R[8] * ref_cam.t[2]))
+    );
+    
+    // Step 3: Transform ray to world coordinates
+    // r_world = R_ref^T · r_cam
+    float3 r_world = make_float3(
+    fmaf(ref_cam.R[0], r_cam.x, fmaf(ref_cam.R[3], r_cam.y, ref_cam.R[6] * r_cam.z)),
+    fmaf(ref_cam.R[1], r_cam.x, fmaf(ref_cam.R[4], r_cam.y, ref_cam.R[7] * r_cam.z)),
+    fmaf(ref_cam.R[2], r_cam.x, fmaf(ref_cam.R[5], r_cam.y, ref_cam.R[8] * r_cam.z))
+);
+    // Step 4: Precompute for each source view
+    for (int src_idx = 0; src_idx < params.num_images - 1; ++src_idx) {
+        const Camera& src_cam = cameras[src_idx + 1];
+        
+        // Compute source camera center
+        // C_src = -R_src^T · t_src
+        float3 C_src = make_float3(
+            -fmaf(src_cam.R[0], src_cam.t[0], fmaf(src_cam.R[3], src_cam.t[1], src_cam.R[6] * src_cam.t[2])),
+            -fmaf(src_cam.R[1], src_cam.t[0], fmaf(src_cam.R[4], src_cam.t[1], src_cam.R[7] * src_cam.t[2])),
+            -fmaf(src_cam.R[2], src_cam.t[0], fmaf(src_cam.R[5], src_cam.t[1], src_cam.R[8] * src_cam.t[2]))
+        );
+        
+        // Compute baseline vector: baseline = C_ref - C_src
+        float3 baseline_vec = make_float3(
+            C_ref.x - C_src.x, 
+            C_ref.y - C_src.y, 
+            C_ref.z - C_src.z
+        );
+        
+        // Transform baseline to source camera frame: b = R_src · baseline
+        float3 b = make_float3(
+            fmaf(src_cam.R[0], baseline_vec.x, fmaf(src_cam.R[1], baseline_vec.y, src_cam.R[2] * baseline_vec.z)),
+            fmaf(src_cam.R[3], baseline_vec.x, fmaf(src_cam.R[4], baseline_vec.y, src_cam.R[5] * baseline_vec.z)),
+            fmaf(src_cam.R[6], baseline_vec.x, fmaf(src_cam.R[7], baseline_vec.y, src_cam.R[8] * baseline_vec.z))
+        );
+        
+        // Compute transformed ray: r_src = R_src · r_world
+        float3 r_src = make_float3(
+            fmaf(src_cam.R[0], r_world.x, fmaf(src_cam.R[1], r_world.y, src_cam.R[2] * r_world.z)),
+            fmaf(src_cam.R[3], r_world.x, fmaf(src_cam.R[4], r_world.y, src_cam.R[5] * r_world.z)),
+            fmaf(src_cam.R[6], r_world.x, fmaf(src_cam.R[7], r_world.y, src_cam.R[8] * r_world.z))
+        );
+        
+        // Store precomputed data
+        PrecomputedRayData& data = cache.Get(p.x, p.y, src_idx);
+        data.baseline = b;
+        data.ray_src = r_src;
+    }
 }
 
 __global__ void RandomInitialization(cudaTextureObjects *texture_objects, Camera *cameras, float4 *plane_hypotheses,  float4 *scaled_plane_hypotheses, float *costs,  float *pre_costs,  curandState *rand_states, unsigned int *selected_views, float4 *prior_planes, unsigned int *plane_masks, const PatchMatchParams params)
@@ -973,7 +1158,8 @@ __device__ void CheckerboardPropagation(
     unsigned int *plane_masks, 
     const int2 p, 
     const PatchMatchParams params, 
-    const int iter)
+    const int iter,
+    const PrecomputedProjectionCache& precomp_cache)  // NEW parameter
 {
     const int width = cameras[0].width;
     const int height = cameras[0].height;
@@ -1000,9 +1186,8 @@ __device__ void CheckerboardPropagation(
     int down_near = center + width;
     int down_far = center + 3 * width;
 
-    // Adaptive Checkerboard Sampling - original structure for safety
+    // Adaptive Checkerboard Sampling
     float cost_array[8][32];
-    // Initialize cost array
     for (int i = 0; i < 8; ++i) {
         for (int j = 0; j < 32; ++j) {
             cost_array[i][j] = 2.0f;
@@ -1011,76 +1196,75 @@ __device__ void CheckerboardPropagation(
     
     bool flag[8] = {false};
     int num_valid_pixels = 0;
-    const int positions[8] = {up_near, up_far, down_near, down_far, left_near, left_far, right_near, right_far};
 
-    // up_far - safe version
+    // up_far
     if (p.y > 2) {
         flag[1] = true;
         num_valid_pixels++;
         up_far = FindBestNeighborInDirection(costs, center, width, height, p, 1, up_far);
-        ComputeMultiViewCostVector(images, cameras, p, plane_hypotheses[up_far], cost_array[1], params);
+        // Use precomputed version
+        ComputeMultiViewCostVector_Precomputed(images, cameras, p, plane_hypotheses[up_far], cost_array[1], params, precomp_cache);
     }
 
-    // down_far - safe version
+    // down_far
     if (p.y < height - 3) {
         flag[3] = true;
         num_valid_pixels++;
         down_far = FindBestNeighborInDirection(costs, center, width, height, p, 3, down_far);
-        ComputeMultiViewCostVector(images, cameras, p, plane_hypotheses[down_far], cost_array[3], params);
+        ComputeMultiViewCostVector_Precomputed(images, cameras, p, plane_hypotheses[down_far], cost_array[3], params, precomp_cache);
     }
 
-    // left_far - safe version
+    // left_far
     if (p.x > 2) {
         flag[5] = true;
         num_valid_pixels++;
         left_far = FindBestNeighborInDirection(costs, center, width, height, p, 5, left_far);
-        ComputeMultiViewCostVector(images, cameras, p, plane_hypotheses[left_far], cost_array[5], params);
+        ComputeMultiViewCostVector_Precomputed(images, cameras, p, plane_hypotheses[left_far], cost_array[5], params, precomp_cache);
     }
 
-    // right_far - safe version
+    // right_far
     if (p.x < width - 3) {
         flag[7] = true;
         num_valid_pixels++;
         right_far = FindBestNeighborInDirection(costs, center, width, height, p, 7, right_far);
-        ComputeMultiViewCostVector(images, cameras, p, plane_hypotheses[right_far], cost_array[7], params);
+        ComputeMultiViewCostVector_Precomputed(images, cameras, p, plane_hypotheses[right_far], cost_array[7], params, precomp_cache);
     }
 
-    // up_near - safe version
+    // up_near
     if (p.y > 0) {
         flag[0] = true;
         num_valid_pixels++;
         up_near = FindBestNeighborInDirection(costs, center, width, height, p, 0, up_near);
-        ComputeMultiViewCostVector(images, cameras, p, plane_hypotheses[up_near], cost_array[0], params);
+        ComputeMultiViewCostVector_Precomputed(images, cameras, p, plane_hypotheses[up_near], cost_array[0], params, precomp_cache);
     }
 
-    // down_near - safe version
+    // down_near
     if (p.y < height - 1) {
         flag[2] = true;
         num_valid_pixels++;
         down_near = FindBestNeighborInDirection(costs, center, width, height, p, 2, down_near);
-        ComputeMultiViewCostVector(images, cameras, p, plane_hypotheses[down_near], cost_array[2], params);
+        ComputeMultiViewCostVector_Precomputed(images, cameras, p, plane_hypotheses[down_near], cost_array[2], params, precomp_cache);
     }
 
-    // left_near - safe version
+    // left_near
     if (p.x > 0) {
         flag[4] = true;
         num_valid_pixels++;
         left_near = FindBestNeighborInDirection(costs, center, width, height, p, 4, left_near);
-        ComputeMultiViewCostVector(images, cameras, p, plane_hypotheses[left_near], cost_array[4], params);
+        ComputeMultiViewCostVector_Precomputed(images, cameras, p, plane_hypotheses[left_near], cost_array[4], params, precomp_cache);
     }
 
-    // right_near - safe version
+    // right_near
     if (p.x < width - 1) {
         flag[6] = true;
         num_valid_pixels++;
         right_near = FindBestNeighborInDirection(costs, center, width, height, p, 6, right_near);
-        ComputeMultiViewCostVector(images, cameras, p, plane_hypotheses[right_near], cost_array[6], params);
+        ComputeMultiViewCostVector_Precomputed(images, cameras, p, plane_hypotheses[right_near], cost_array[6], params, precomp_cache);
     }
 
-    // Update positions array with safe values
     const int final_positions[8] = {up_near, up_far, down_near, down_far, left_near, left_far, right_near, right_far};
 
-    // Multi-hypothesis Joint View Selection - safe version
+    // Multi-hypothesis Joint View Selection
     float view_weights[32] = {0.0f};
     float view_selection_priors[32];
     
@@ -1093,7 +1277,6 @@ __device__ void CheckerboardPropagation(
 
     TransformPDFToCDF(sampling_probs, params.num_images - 1);
     
-    // Safe random sampling
     for (int sample = 0; sample < 15; ++sample) {
         const float rand_prob = curand_uniform(&rand_states[center]) - FLT_EPSILON;
 
@@ -1117,7 +1300,7 @@ __device__ void CheckerboardPropagation(
         }
     }
 
-    // Safe final cost computation
+    // Compute final costs
     float final_costs[8];
     ComputeFinalCosts(final_costs, cost_array, view_weights, weight_norm,
                       flag, final_positions, depths, cameras, 
@@ -1125,13 +1308,14 @@ __device__ void CheckerboardPropagation(
 
     const int min_cost_idx = FindMinCostIndex(final_costs, 8);
 
-    // Current cost computation - safe version
+    // Current cost computation using precomputed data
     float cost_vector_now[32];
     for (int i = 0; i < 32; ++i) {
         cost_vector_now[i] = 2.0f;
     }
     
-    ComputeMultiViewCostVector(images, cameras, p, plane_hypotheses[center], cost_vector_now, params);
+    ComputeMultiViewCostVector_Precomputed(images, cameras, p, plane_hypotheses[center], cost_vector_now, params, precomp_cache);
+    
     float cost_now = 0.0f;
     for (int i = 0; i < params.num_images - 1 && i < 32; ++i) {
         if (view_weights[i] > 0.0f) {
@@ -1150,7 +1334,7 @@ __device__ void CheckerboardPropagation(
     float depth_now = ComputeDepthfromPlaneHypothesis(cameras[0], plane_hypotheses[center], p);
     float restricted_cost = 0.0f;
     
-    // Planar prior handling - original safe logic
+    // Planar prior handling
     if (params.planar_prior) {
         float restricted_final_costs[8] = {0.0f};
         float gamma = 0.5f;
@@ -1230,7 +1414,21 @@ __device__ void CheckerboardPropagation(
         plane_hypotheses[center] = plane_hypotheses_now;
     }
 }
-__global__ void BlackPixelUpdate(cudaTextureObjects *texture_objects, cudaTextureObjects *texture_depths, Camera *cameras, float4 *plane_hypotheses, float *costs,  float *pre_costs,  curandState *rand_states, unsigned int *selected_views, float4 *prior_planes, unsigned int *plane_masks, const PatchMatchParams params, const int iter)
+
+
+__global__ void BlackPixelUpdate(cudaTextureObjects *texture_objects, 
+                                 cudaTextureObjects *texture_depths, 
+                                 Camera *cameras, 
+                                 float4 *plane_hypotheses, 
+                                 float *costs,  
+                                 float *pre_costs,  
+                                 curandState *rand_states, 
+                                 unsigned int *selected_views, 
+                                 float4 *prior_planes, 
+                                 unsigned int *plane_masks, 
+                                 const PatchMatchParams params, 
+                                 const int iter,
+                                 const PrecomputedProjectionCache precomp_cache)  // NEW parameter
 {
     int2 p = make_int2(blockIdx.x * blockDim.x + threadIdx.x, blockIdx.y * blockDim.y + threadIdx.y);
     if (threadIdx.x % 2 == 0) {
@@ -1239,10 +1437,24 @@ __global__ void BlackPixelUpdate(cudaTextureObjects *texture_objects, cudaTextur
         p.y = p.y * 2 + 1;
     }
 
-    CheckerboardPropagation(texture_objects[0].images, texture_depths[0].images, cameras, plane_hypotheses, costs, pre_costs,  rand_states, selected_views, prior_planes, plane_masks, p, params, iter);
+    CheckerboardPropagation(texture_objects[0].images, texture_depths[0].images, cameras, 
+                          plane_hypotheses, costs, pre_costs, rand_states, selected_views, 
+                          prior_planes, plane_masks, p, params, iter, precomp_cache);  // Pass cache
 }
 
-__global__ void RedPixelUpdate(cudaTextureObjects *texture_objects, cudaTextureObjects *texture_depths, Camera *cameras, float4 *plane_hypotheses, float *costs,  float *pre_costs, curandState *rand_states, unsigned int *selected_views, float4 *prior_planes, unsigned int *plane_masks, const PatchMatchParams params, const int iter)
+__global__ void RedPixelUpdate(cudaTextureObjects *texture_objects, 
+                               cudaTextureObjects *texture_depths, 
+                               Camera *cameras, 
+                               float4 *plane_hypotheses, 
+                               float *costs,  
+                               float *pre_costs, 
+                               curandState *rand_states, 
+                               unsigned int *selected_views, 
+                               float4 *prior_planes, 
+                               unsigned int *plane_masks, 
+                               const PatchMatchParams params, 
+                               const int iter,
+                               const PrecomputedProjectionCache precomp_cache)  // NEW parameter
 {
     int2 p = make_int2(blockIdx.x * blockDim.x + threadIdx.x, blockIdx.y * blockDim.y + threadIdx.y);
     if (threadIdx.x % 2 == 0) {
@@ -1251,7 +1463,9 @@ __global__ void RedPixelUpdate(cudaTextureObjects *texture_objects, cudaTextureO
         p.y = p.y * 2;
     }
 
-    CheckerboardPropagation(texture_objects[0].images, texture_depths[0].images, cameras, plane_hypotheses, costs, pre_costs, rand_states, selected_views, prior_planes, plane_masks, p, params, iter);
+    CheckerboardPropagation(texture_objects[0].images, texture_depths[0].images, cameras, 
+                          plane_hypotheses, costs, pre_costs, rand_states, selected_views, 
+                          prior_planes, plane_masks, p, params, iter, precomp_cache);  // Pass cache
 }
 
 __global__ void GetDepthandNormal(Camera *cameras, float4 *plane_hypotheses, const PatchMatchParams params)
@@ -1518,14 +1732,38 @@ __global__ void RedPixelFilter(const Camera *cameras, float4 *plane_hypotheses, 
 }
 
 void ACMMP::RunPatchMatch(ProblemGPUResources* res) {
-    // Create a local copy of the stream handle for safety.
     cudaStream_t s = stream_ ? stream_ : 0;
     
     const int width  = cameras[0].width;
     const int height = cameras[0].height;
 
+    // ========================================================================
+    // NEW: Setup and run precomputation - ONLY ONCE PER PROBLEM!
+    // ========================================================================
+    res->precomp_cache.data = res->precomp_data_cuda;
+    res->precomp_cache.width = width;
+    res->precomp_cache.height = height;
+    res->precomp_cache.num_src_images = params.num_images - 1;
+    
+    // Precompute all ray transformations
+    dim3 grid_precomp((width + 31) / 32, (height + 31) / 32, 1);
+    dim3 blk_precomp(32, 32, 1);
+    
+    PrecomputeRayTransformations<<<grid_precomp, blk_precomp, 0, s>>>(
+        res->precomp_cache, res->cameras_cuda, params);
+    CUDA_CHECK(cudaPeekAtLastError());
+    
+    // Log precomputation details
+    size_t precomp_mb = (width * height * (params.num_images - 1) * sizeof(PrecomputedRayData)) / (1024.0 * 1024.0);
+    // std::cout << "[ACMMP] Precomputed ray transformations: " 
+    //           << width << "×" << height << " × " << (params.num_images - 1) << " views = "
+    //           << precomp_mb << " MB" << std::endl;
+    
+    // ========================================================================
+    // Regular patch match processing
+    // ========================================================================
     const int BLOCK_W = 32;
-    const int BLOCK_H = 16; // BLOCK_W / 2 is common
+    const int BLOCK_H = 16;
 
     dim3 grid_init((width + 15) / 16, (height + 15) / 16, 1);
     dim3 blk_init(16, 16, 1);
@@ -1535,7 +1773,6 @@ void ACMMP::RunPatchMatch(ProblemGPUResources* res) {
 
     const int max_iterations = params.max_iterations;
 
-    // Launch kernels using the pointers from the resource object 'res'.
     RandomInitialization<<<grid_init, blk_init, 0, s>>>(
         res->texture_objects_cuda, res->cameras_cuda, res->plane_hypotheses_cuda,
         res->scaled_plane_hypotheses_cuda, res->costs_cuda, res->pre_costs_cuda,
@@ -1548,27 +1785,30 @@ void ACMMP::RunPatchMatch(ProblemGPUResources* res) {
             res->texture_objects_cuda, res->texture_depths_cuda, res->cameras_cuda,
             res->plane_hypotheses_cuda, res->costs_cuda, res->pre_costs_cuda,
             res->rand_states_cuda, res->selected_views_cuda, res->prior_planes_cuda,
-            res->plane_masks_cuda, params, i);
+            res->plane_masks_cuda, params, i, res->precomp_cache);  // Pass cache
         CUDA_CHECK(cudaPeekAtLastError());
 
         RedPixelUpdate<<<grid_cb, blk_cb, 0, s>>>(
             res->texture_objects_cuda, res->texture_depths_cuda, res->cameras_cuda,
             res->plane_hypotheses_cuda, res->costs_cuda, res->pre_costs_cuda,
             res->rand_states_cuda, res->selected_views_cuda, res->prior_planes_cuda,
-            res->plane_masks_cuda, params, i);
+            res->plane_masks_cuda, params, i, res->precomp_cache);  // Pass cache
         CUDA_CHECK(cudaPeekAtLastError());
     }
 
-    GetDepthandNormal<<<grid_init, blk_init, 0, s>>>(res->cameras_cuda, res->plane_hypotheses_cuda, params);
+    GetDepthandNormal<<<grid_init, blk_init, 0, s>>>(
+        res->cameras_cuda, res->plane_hypotheses_cuda, params);
     CUDA_CHECK(cudaPeekAtLastError());
     
-    BlackPixelFilter<<<grid_cb, blk_cb, 0, s>>>(res->cameras_cuda, res->plane_hypotheses_cuda, res->costs_cuda);
+    BlackPixelFilter<<<grid_cb, blk_cb, 0, s>>>(
+        res->cameras_cuda, res->plane_hypotheses_cuda, res->costs_cuda);
     CUDA_CHECK(cudaPeekAtLastError());
     
-    RedPixelFilter<<<grid_cb, blk_cb, 0, s>>>(res->cameras_cuda, res->plane_hypotheses_cuda, res->costs_cuda);
+    RedPixelFilter<<<grid_cb, blk_cb, 0, s>>>(
+        res->cameras_cuda, res->plane_hypotheses_cuda, res->costs_cuda);
     CUDA_CHECK(cudaPeekAtLastError());
 
-    // Asynchronously copy results from device to the resource's pinned host memory.
+    // Asynchronously copy results
     CUDA_CHECK(cudaMemcpyAsync(res->planes_host_pinned, res->plane_hypotheses_cuda,
                     sizeof(float4) * width * height,
                     cudaMemcpyDeviceToHost, s));
@@ -1576,11 +1816,8 @@ void ACMMP::RunPatchMatch(ProblemGPUResources* res) {
                     sizeof(float) * width * height,
                     cudaMemcpyDeviceToHost, s));
     
-    // Wait for the stream to finish all operations, including the copies.
     CUDA_CHECK(cudaStreamSynchronize(s));
     
-    // Now that the data is on the host, do a fast CPU-side copy
-    // from the pinned buffer to this object's final result buffer.
     memcpy(plane_hypotheses_host, res->planes_host_pinned, sizeof(float4) * width * height);
     memcpy(costs_host, res->costs_host_pinned, sizeof(float) * width * height);
 }

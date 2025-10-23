@@ -35,16 +35,14 @@ ProblemGPUResources::ProblemGPUResources() {
 }
 
 void ProblemGPUResources::allocate(int max_width, int max_height, int max_images) {
-    // This function is called once per resource object when the pool is initialized.
-    
-    // Allocate arrays for images and depths using the maximum possible dimensions.
+    // Allocate arrays for images and depths
     for (int i = 0; i < max_images; ++i) {
         cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc(32, 0, 0, 0, cudaChannelFormatKindFloat);
         CUDA_CHECK(cudaMallocArray(&cuArray[i], &channelDesc, max_width, max_height));
         CUDA_CHECK(cudaMallocArray(&cuDepthArray[i], &channelDesc, max_width, max_height));
     }
 
-    // Allocate all other required device memory buffers.
+    // Allocate all other required device memory buffers
     CUDA_CHECK(cudaMalloc(&cameras_cuda, sizeof(Camera) * max_images));
     CUDA_CHECK(cudaMalloc(&texture_objects_cuda, sizeof(cudaTextureObjects)));
     CUDA_CHECK(cudaMalloc(&texture_depths_cuda, sizeof(cudaTextureObjects)));
@@ -58,7 +56,15 @@ void ProblemGPUResources::allocate(int max_width, int max_height, int max_images
     CUDA_CHECK(cudaMalloc(&prior_planes_cuda, sizeof(float4) * max_width * max_height));
     CUDA_CHECK(cudaMalloc(&plane_masks_cuda, sizeof(unsigned int) * max_width * max_height));
 
-    // Allocate pinned host memory for high-speed asynchronous transfers.
+    // === NEW: Allocate precomputed ray transformation cache ===
+    size_t precomp_size = max_width * max_height * (max_images - 1) * sizeof(PrecomputedRayData);
+    CUDA_CHECK(cudaMalloc(&precomp_data_cuda, precomp_size));
+    
+    std::cout << "[ProblemGPUResources] Allocated " << (precomp_size / (1024.0 * 1024.0)) 
+              << " MB for precomputed transformations (" 
+              << max_width << "x" << max_height << " × " << (max_images - 1) << " views)" << std::endl;
+
+    // Allocate pinned host memory for high-speed asynchronous transfers
     CUDA_CHECK(cudaMallocHost(&planes_host_pinned, sizeof(float4) * max_width * max_height));
     CUDA_CHECK(cudaMallocHost(&costs_host_pinned, sizeof(float) * max_width * max_height));
 }
@@ -123,9 +129,6 @@ ProblemGPUResources::~ProblemGPUResources() {
 // In BatchACMMP.cu, replace the entire cleanup function with this one.
 
 void ProblemGPUResources::cleanup() {
-    // Don't synchronize the stream here - it's owned by BatchACMMP
-    // Just clean up the resources allocated by this object
-    
     for (int i = 0; i < MAX_IMAGES; ++i) {
         if (cuArray[i]) { 
             cudaFreeArray(cuArray[i]); 
@@ -137,18 +140,16 @@ void ProblemGPUResources::cleanup() {
         }
     }
 
-    // C++11 COMPATIBLE FIX: Define the lambda to take void*&
     auto safeFree = [](void*& ptr, const char* name) {
         if (ptr) {
             cudaError_t err = cudaFree(ptr);
             if (err != cudaSuccess && err != cudaErrorCudartUnloading) {
-                // Don't print errors during shutdown
+                // Ignore errors during shutdown
             }
             ptr = nullptr;
         }
     };
 
-    // C++11 COMPATIBLE FIX: Add a (void*&) cast to every call
     safeFree((void*&)cameras_cuda, "cameras_cuda");
     safeFree((void*&)texture_objects_cuda, "texture_objects_cuda");
     safeFree((void*&)texture_depths_cuda, "texture_depths_cuda");
@@ -161,6 +162,9 @@ void ProblemGPUResources::cleanup() {
     safeFree((void*&)depths_cuda, "depths_cuda");
     safeFree((void*&)prior_planes_cuda, "prior_planes_cuda");
     safeFree((void*&)plane_masks_cuda, "plane_masks_cuda");
+    
+    // === NEW: Free precomputed cache ===
+    safeFree((void*&)precomp_data_cuda, "precomp_data_cuda");
 
     if (planes_host_pinned) { 
         cudaFreeHost(planes_host_pinned); 
@@ -171,7 +175,6 @@ void ProblemGPUResources::cleanup() {
         costs_host_pinned = nullptr; 
     }
     
-    // Clear the stream reference (don't destroy it - BatchACMMP owns it)
     stream = nullptr;
 }
 
@@ -206,7 +209,7 @@ BatchACMMP::BatchACMMP(const std::string& dense_folder_,
                    (prop.multiProcessorCount >= 5)  ? 4 : 2;
     
     max_concurrent_problems = std::min({by_gpu_mem, by_sm, size_t(12)});
-    max_concurrent_problems = std::max<size_t>(1, 12);
+    max_concurrent_problems = std::max<size_t>(1, 4);
     
     // Separate disk writer threads - optimize for disk I/O
     num_disk_writers = std::min<size_t>(4, std::max<size_t>(2, hardware_threads / 4));
