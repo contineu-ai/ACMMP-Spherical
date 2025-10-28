@@ -1624,7 +1624,7 @@ void RunFusionCuda(const std::string &dense_folder,
         std::cout << "[C++11 Compatible Fusion] Total time: " << total_duration.count() << " seconds" << std::endl;
         
         // Write output
-        std::string output_path = dense_folder + "/ACMMP/ACMM_model_cpp11_compatible.ply";
+        std::string output_path = dense_folder + "/ACMMP/final.ply";
         StoreColorPlyFileBinaryPointCloud(output_path, all_points);
         
         std::cout << "[C++11 Compatible Fusion] Complete! Output written to: " << output_path << std::endl;
