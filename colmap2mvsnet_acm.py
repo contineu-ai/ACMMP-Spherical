@@ -473,28 +473,34 @@ def _write_camera_file_worker(item, cam_dir):
         f.write(f"{d0} {dint} {Nd} {dmax}\n")
 
 def _copy_image_worker(i, imgs, depth_ranges, imgs_dir, out_img):
-    """Worker function to copy a single image"""
+    """Worker function to symlink or convert images"""
     if i not in depth_ranges:
         return None
     
     img = imgs[i]
     src = os.path.join(imgs_dir, img.name)
-    dst = os.path.join(out_img, f"{i:08d}.jpg")
+    dst = os.path.join(out_img, f"{i:08d}.png")
     
     if not os.path.exists(src):
         return f"[WARN] Image not found: {src}"
     
     try:
-        if not src.lower().endswith(".jpg"):
-            img_data = cv2.imread(src)
-            if img_data is not None:
-                cv2.imwrite(dst, img_data)
-            else:
-                return f"[WARN] Failed to read: {src}"
+        # If already PNG, create symlink (saves disk space)
+        if src.lower().endswith('.png'):
+            # Use absolute path for symlinks to be safe
+            src_abs = os.path.abspath(src)
+            if os.path.exists(dst) or os.path.islink(dst):
+                os.remove(dst)
+            os.symlink(src_abs, dst)
         else:
-            shutil.copyfile(src, dst)
+            # Convert non-PNG to PNG (JPG, etc.)
+            img_data = cv2.imread(src)
+            if img_data is None:
+                return f"[WARN] Failed to read: {src}"
+            cv2.imwrite(dst, img_data)
+            
     except Exception as e:
-        return f"[ERROR] Failed to copy {src}: {e}"
+        return f"[ERROR] Failed to process {src}: {e}"
     
     return None
 

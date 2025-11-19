@@ -11,6 +11,6 @@ struct Problem;
 void RunFusionCuda(const std::string &dense_folder,
                    const std::vector<Problem> &problems,
                    bool geom_consistency = false,
-                   size_t max_images_per_chunk = 40);
+                   size_t max_images_per_chunk = 100);
 
 #endif // FUSION_GPU_H

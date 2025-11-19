@@ -1013,7 +1013,211 @@ public:
     }
 };
 
-// CORRECTED: Optimized kernel with binary search instead of linear search
+// // CORRECTED: Optimized kernel with binary search instead of linear search
+// __global__ void CorrectedChunkBatchKernel(
+//     cudaTextureObject_t* depth_textures,
+//     cudaTextureObject_t* normal_textures, 
+//     cudaTextureObject_t* image_textures,
+//     int* texture_image_ids,
+//     int num_textures,
+//     Camera* cameras,
+//     int* camera_image_ids,
+//     int num_cameras,
+//     int* ref_image_ids,
+//     int* src_image_ids,
+//     int* src_counts,
+//     int* src_offsets,
+//     int* problem_offsets,
+//     int* widths,
+//     int* heights,
+//     PointList* output_points,
+//     int* valid_flags,
+//     int num_problems_in_chunk,
+//     int* image_to_camera_map,
+//     int* image_to_texture_map,
+//     int max_image_id
+// ) {
+//     int global_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+//     // FIXED: Use binary search instead of linear search
+//     int problem_id = find_problem_id(global_idx, problem_offsets, num_problems_in_chunk);
+    
+//     if (problem_id < 0 || problem_id >= num_problems_in_chunk) return;
+    
+//     int local_idx = global_idx - problem_offsets[problem_id];
+//     int width = widths[problem_id];
+//     int height = heights[problem_id];
+    
+//     if (local_idx >= width * height) return;
+    
+//     int c = local_idx % width;
+//     int r = local_idx / width;
+    
+//     int ref_image_id = ref_image_ids[problem_id];
+    
+//     // O(1) lookup instead of linear search
+//     if (ref_image_id < 0 || ref_image_id > max_image_id) {
+//         valid_flags[global_idx] = 0;
+//         return;
+//     }
+    
+//     int ref_cam_idx = image_to_camera_map[ref_image_id];
+//     int ref_tex_idx = image_to_texture_map[ref_image_id];
+    
+//     if (ref_cam_idx < 0 || ref_tex_idx < 0 || ref_cam_idx >= num_cameras || ref_tex_idx >= num_textures) {
+//         valid_flags[global_idx] = 0;
+//         return;
+//     }
+    
+//     const Camera& ref_cam = cameras[ref_cam_idx];
+    
+//     // Sample reference depth
+//     float ref_depth = tex2D<float>(depth_textures[ref_tex_idx], c + 0.5f, r + 0.5f);
+    
+//     if (ref_depth <= 0.0f) {
+//         valid_flags[global_idx] = 0;
+//         return;
+//     }
+
+//     // Get 3D point in world coordinates
+//     float3 PointX = Get3DPointonWorld_cu(static_cast<float>(c), static_cast<float>(r), ref_depth, ref_cam);
+    
+//     // Sample reference normal and color
+//     float4 ref_normal_tex = tex2D<float4>(normal_textures[ref_tex_idx], c + 0.5f, r + 0.5f);
+//     float3 ref_normal = make_float3(ref_normal_tex.x, ref_normal_tex.y, ref_normal_tex.z);
+    
+//     float4 ref_color = tex2D<float4>(image_textures[ref_tex_idx], c + 0.5f, r + 0.5f);
+    
+//     // Initialize sums for weighted averaging
+//     float3 point_sum = PointX;
+//     float3 normal_sum = ref_normal;
+//     float color_sum[3] = {
+//         ref_color.z * 255.0f,  // R
+//         ref_color.y * 255.0f,  // G
+//         ref_color.x * 255.0f   // B
+//     };
+//     int num_consistent = 1;
+//     float confidence_sum = 1.0f;
+    
+//     // Check source images for this problem
+//     int src_start = src_offsets[problem_id];
+//     int src_count = src_counts[problem_id];
+    
+//     for (int j = 0; j < src_count; ++j) {
+//         int src_image_id = src_image_ids[src_start + j];
+        
+//         // O(1) lookup for source indices
+//         if (src_image_id < 0 || src_image_id > max_image_id) continue;
+        
+//         int src_cam_idx = image_to_camera_map[src_image_id];
+//         int src_tex_idx = image_to_texture_map[src_image_id];
+        
+//         if (src_cam_idx < 0 || src_tex_idx < 0 || src_cam_idx >= num_cameras || src_tex_idx >= num_textures) continue;
+        
+//         const Camera& src_cam = cameras[src_cam_idx];
+        
+//         // Project and check consistency
+//         float2 proj_point;
+//         float proj_depth_in_src;
+//         ProjectonCamera_cu(PointX, src_cam, proj_point, proj_depth_in_src);
+        
+//         int src_c = static_cast<int>(proj_point.x + 0.5f);
+//         int src_r = static_cast<int>(proj_point.y + 0.5f);
+        
+//         if (src_c < 0 || src_c >= src_cam.width || src_r < 0 || src_r >= src_cam.height) 
+//             continue;
+        
+//         float src_depth = tex2D<float>(depth_textures[src_tex_idx], src_c + 0.5f, src_r + 0.5f);
+//         if (src_depth <= 0.0f) continue;
+        
+//         float3 PointX_src = Get3DPointonWorld_cu(static_cast<float>(src_c), static_cast<float>(src_r), src_depth, src_cam);
+        
+//         float2 reproj_point_in_ref;
+//         float dummy_depth;
+//         ProjectonCamera_cu(PointX_src, ref_cam, reproj_point_in_ref, dummy_depth);
+        
+//         float reproj_error = hypotf(c - reproj_point_in_ref.x, r - reproj_point_in_ref.y);
+//         float relative_depth_diff = fabsf(proj_depth_in_src - src_depth) / src_depth;
+        
+//         float4 src_normal_tex = tex2D<float4>(normal_textures[src_tex_idx], src_c + 0.5f, src_r + 0.5f);
+//         float3 src_normal = make_float3(src_normal_tex.x, src_normal_tex.y, src_normal_tex.z);
+        
+//         float dot_product = ref_normal.x * src_normal.x + ref_normal.y * src_normal.y + ref_normal.z * src_normal.z;
+//         dot_product = fmaxf(-1.0f, fminf(1.0f, dot_product));
+//         float angle = acosf(dot_product);
+
+//         float adaptive_reproj_threshold = GetAdaptiveReprojectionThreshold(ref_cam, c, r, 3.0f);
+//         float adaptive_reproj_threshold_src = GetAdaptiveReprojectionThreshold(src_cam, src_c, src_r, 3.0f);
+//         float combined_threshold = fmaxf(adaptive_reproj_threshold, adaptive_reproj_threshold_src);        
+
+//         float adaptive_depth_threshold = fmaxf(
+//             GetAdaptiveDepthThreshold(src_depth, src_cam),
+//             GetAdaptiveDepthThreshold(ref_depth, ref_cam)
+//         );
+
+//         if (reproj_error < combined_threshold && 
+//             relative_depth_diff < adaptive_depth_threshold && 
+//             angle < 0.12f) {
+            
+//             float confidence = CalculateGeometricConfidence(
+//                 ref_cam, src_cam, PointX, c, r, src_c, src_r,
+//                 reproj_error, relative_depth_diff, angle
+//             );
+
+//             point_sum.x += PointX_src.x * confidence;
+//             point_sum.y += PointX_src.y * confidence;
+//             point_sum.z += PointX_src.z * confidence;
+
+//             normal_sum.x += src_normal.x * confidence;
+//             normal_sum.y += src_normal.y * confidence;
+//             normal_sum.z += src_normal.z * confidence;
+            
+//             float4 src_color = tex2D<float4>(image_textures[src_tex_idx], src_c + 0.5f, src_r + 0.5f);
+//             color_sum[0] += src_color.z * 255.0f * confidence;
+//             color_sum[1] += src_color.y * 255.0f * confidence;
+//             color_sum[2] += src_color.x * 255.0f * confidence;
+
+//             confidence_sum += confidence;
+//             num_consistent++;
+//         }
+//     }
+    
+//     if (num_consistent >= 5) {
+//         PointList final_point;
+        
+//         final_point.coord = make_float3(
+//             point_sum.x / confidence_sum,
+//             point_sum.y / confidence_sum,
+//             point_sum.z / confidence_sum
+//         );
+        
+//         float3 avg_normal = make_float3(
+//             normal_sum.x / confidence_sum,
+//             normal_sum.y / confidence_sum,
+//             normal_sum.z / confidence_sum
+//         );
+//         float normal_length = hypotf(hypotf(avg_normal.x, avg_normal.y), avg_normal.z);
+//         if (normal_length > 0.0f) {
+//             avg_normal.x /= normal_length;
+//             avg_normal.y /= normal_length;
+//             avg_normal.z /= normal_length;
+//         }
+//         final_point.normal = avg_normal;
+        
+//         final_point.color = make_float3(
+//             color_sum[0] / confidence_sum,
+//             color_sum[1] / confidence_sum,
+//             color_sum[2] / confidence_sum
+//         );
+        
+//         output_points[global_idx] = final_point;
+//         valid_flags[global_idx] = 1;
+//     } else {
+//         valid_flags[global_idx] = 0;
+//     }
+// }
+
+// CORRECTED: Optimized kernel with binary search AND pole filtering
 __global__ void CorrectedChunkBatchKernel(
     cudaTextureObject_t* depth_textures,
     cudaTextureObject_t* normal_textures, 
@@ -1035,7 +1239,8 @@ __global__ void CorrectedChunkBatchKernel(
     int num_problems_in_chunk,
     int* image_to_camera_map,
     int* image_to_texture_map,
-    int max_image_id
+    int max_image_id,
+    float pole_exclusion_degrees = 10.0f  // NEW PARAMETER
 ) {
     int global_idx = blockIdx.x * blockDim.x + threadIdx.x;
     
@@ -1070,6 +1275,12 @@ __global__ void CorrectedChunkBatchKernel(
     }
     
     const Camera& ref_cam = cameras[ref_cam_idx];
+    
+    // *** NEW: POLE FILTERING - Skip pixels near poles ***
+    if (IsNearPole(ref_cam, c, r, pole_exclusion_degrees)) {
+        valid_flags[global_idx] = 0;
+        return;
+    }
     
     // Sample reference depth
     float ref_depth = tex2D<float>(depth_textures[ref_tex_idx], c + 0.5f, r + 0.5f);
@@ -1127,6 +1338,11 @@ __global__ void CorrectedChunkBatchKernel(
         if (src_c < 0 || src_c >= src_cam.width || src_r < 0 || src_r >= src_cam.height) 
             continue;
         
+        // *** NEW: Also skip if projected point is near poles in source ***
+        if (IsNearPole(src_cam, src_c, src_r, pole_exclusion_degrees)) {
+            continue;
+        }
+        
         float src_depth = tex2D<float>(depth_textures[src_tex_idx], src_c + 0.5f, src_r + 0.5f);
         if (src_depth <= 0.0f) continue;
         
@@ -1147,17 +1363,18 @@ __global__ void CorrectedChunkBatchKernel(
         float angle = acosf(dot_product);
 
         float adaptive_reproj_threshold = GetAdaptiveReprojectionThreshold(ref_cam, c, r, 3.0f);
+
         float adaptive_reproj_threshold_src = GetAdaptiveReprojectionThreshold(src_cam, src_c, src_r, 3.0f);
         float combined_threshold = fmaxf(adaptive_reproj_threshold, adaptive_reproj_threshold_src);        
 
         float adaptive_depth_threshold = fmaxf(
-            GetAdaptiveDepthThreshold(src_depth, src_cam),
-            GetAdaptiveDepthThreshold(ref_depth, ref_cam)
+            GetAdaptiveDepthThreshold(src_depth, src_cam,0.025f),
+            GetAdaptiveDepthThreshold(ref_depth, ref_cam,0.025f)
         );
 
         if (reproj_error < combined_threshold && 
             relative_depth_diff < adaptive_depth_threshold && 
-            angle < 0.12f) {
+            angle < 0.3f) {
             
             float confidence = CalculateGeometricConfidence(
                 ref_cam, src_cam, PointX, c, r, src_c, src_r,
@@ -1216,7 +1433,6 @@ __global__ void CorrectedChunkBatchKernel(
         valid_flags[global_idx] = 0;
     }
 }
-
 // Smart chunking strategy
 std::vector<std::vector<size_t>> createSmartChunks(const std::vector<Problem>& problems, 
                                                    size_t max_images_per_chunk) {
@@ -1292,7 +1508,7 @@ void RunFusionCuda(const std::string &dense_folder,
             chunk_src_images += problem.src_image_ids.size();
             
             // Conservative pixel estimate
-            chunk_pixels += 3200 * 1600;
+            chunk_pixels += 1800 * 900;
         }
         
         est_max_src_images = std::max(est_max_src_images, chunk_src_images);
@@ -1561,11 +1777,14 @@ void RunFusionCuda(const std::string &dense_folder,
             CUDA_SAFE_CALL(cudaStreamDestroy(copy_stream));
             
             // Launch corrected kernel with binary search optimization
+// Launch corrected kernel with binary search optimization AND pole filtering
             int block_size = 256;
             int grid_size = (total_pixels + block_size - 1) / block_size;
-            
+
             auto chunk_start = std::chrono::high_resolution_clock::now();
-            
+
+            float pole_exclusion_degrees = 3;  // Exclude 10 degrees from each pole (adjustable)
+
             CorrectedChunkBatchKernel<<<grid_size, block_size>>>(
                 depth_textures_cuda,
                 normal_textures_cuda,
@@ -1587,9 +1806,9 @@ void RunFusionCuda(const std::string &dense_folder,
                 (int)chunk.size(),
                 lookup_tables.d_image_to_camera_map,
                 lookup_tables.d_image_to_texture_map,
-                lookup_tables.max_image_id
+                lookup_tables.max_image_id,
+                pole_exclusion_degrees  // NEW PARAMETER
             );
-            
             CUDA_SAFE_CALL(cudaDeviceSynchronize());
             
             auto chunk_end = std::chrono::high_resolution_clock::now();

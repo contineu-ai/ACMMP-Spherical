@@ -504,6 +504,28 @@ __device__ __forceinline__ float CalculateGeometricConfidence(
     return confidence;
 }
 
+__device__ __forceinline__ bool IsNearPole(
+    const Camera& cam, int x, int y, 
+    float pole_exclusion_degrees = 10.0f) {
+    
+    // Only applies to spherical cameras
+    if (cam.model != SPHERE) {
+        return false;
+    }
+    
+    // Calculate latitude for this pixel
+    const float inv_height = __fdividef(1.0f, static_cast<float>(cam.height));
+    const float lat = -((static_cast<float>(y) - cam.params[2]) * inv_height) * CUDART_PI_F;
+    
+    // Convert exclusion angle to radians
+    const float exclusion_rad = pole_exclusion_degrees * CUDART_PI_F / 180.0f;
+    const float pole_threshold = (CUDART_PI_F * 0.5f) - exclusion_rad;
+    
+    // Check if within exclusion zone of either pole
+    const float abs_lat = fabsf(lat);
+    return abs_lat > pole_threshold;
+}
+
 // ============================================================================
 // MACRO DEFINITIONS FOR COMPATIBILITY
 // ============================================================================
