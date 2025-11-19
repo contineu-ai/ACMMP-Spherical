@@ -289,6 +289,41 @@ __device__ __forceinline__ float ComputeBilateralWeight(
     return expf(-spatial_dist_sq * inv_sigma_spatial_sq - color_dist * inv_sigma_color_sq);
 }
 
+__device__ __forceinline__ float GetLatitude(const int y, const int height, const float cy) {
+    const float inv_height = __fdividef(1.0f, static_cast<float>(height));
+    return -((static_cast<float>(y) - cy) * inv_height) * CUDART_PI_F;
+}
+
+
+// Add after the existing helper functions (around line 100)
+
+// ============================================================================
+// SPHERICAL GEOMETRY HELPERS
+// ============================================================================
+
+/**
+ * Calculate latitude from pixel y-coordinate in equirectangular projection
+ * Latitude ranges from π/2 (top, North Pole) to -π/2 (bottom, South Pole)
+ */
+__device__ __forceinline__ float GetLatitude(const int y, const int height)
+{
+    return (0.5f - (float)y / (float)height) * CUDART_PI_F;
+}
+
+/**
+ * Get cosine of latitude with clamping to prevent division by zero near poles
+ * Minimum value of 0.1 prevents extreme window expansion
+ */
+__device__ __forceinline__ float GetCosLatitudeClamped(const int y, const int height)
+{
+    const float lat = GetLatitude(y, height);
+    return fmaxf(cosf(lat), 0.1f);
+}
+
+
+// ============================================================================
+// MODIFIED BILATERAL NCC WITH SPHERICAL AWARENESS
+// ============================================================================
 
 __device__ float ComputeBilateralNCC(const cudaTextureObject_t ref_image,
                                      const Camera ref_camera,
@@ -302,7 +337,7 @@ __device__ float ComputeBilateralNCC(const cudaTextureObject_t ref_image,
     const int radius = params.patch_size / 2;
     const float kMinVar = 1e-5f;
 
-    // Early validation with tighter bounds checking
+    // Early validation
     float depth_ref = ComputeDepthfromPlaneHypothesis(ref_camera, plane_hypothesis, p);
     if (depth_ref <= 0.0f || depth_ref > 1000.0f) return cost_max;
     
@@ -311,8 +346,20 @@ __device__ float ComputeBilateralNCC(const cudaTextureObject_t ref_image,
     float dummy_depth;
     ProjectonCamera_cu(Pw_center, src_camera, pt_center, dummy_depth);
     
-    // Expanded early exit - check if patch will be mostly out of bounds
-    if (pt_center.x < radius || pt_center.x >= src_camera.width - radius ||
+    // [Adaptive Window]
+    int radius_x = radius;
+    float cos_lat = 1.0f;
+    if (ref_camera.model == SPHERE) {
+        const float lat = GetLatitude(p.y, ref_camera.height);
+        cos_lat = cosf(lat);
+        // Scale radius inversely with cos(lat) to maintain physical width
+        float scale = 1.0f / fmaxf(fabsf(cos_lat), 0.1f);
+        radius_x = (int)(radius * scale);
+        radius_x = min(radius_x, radius * 4); // Clamp to avoid excessive cost
+    }
+    
+    // Check if expanded patch will be mostly out of bounds
+    if (pt_center.x < radius_x || pt_center.x >= src_camera.width - radius_x ||
         pt_center.y < radius || pt_center.y >= src_camera.height - radius) {
         return cost_max;
     }
@@ -322,20 +369,28 @@ __device__ float ComputeBilateralNCC(const cudaTextureObject_t ref_image,
     const float inv_sigma_color_sq = 1.0f / (2.0f * params.sigma_color * params.sigma_color);
     const float ref_center_pix = tex2D<float>(ref_image, p.x + 0.5f, p.y + 0.5f);
 
-    // Single precision accumulation
     float sum_ref = 0.0f, sum_ref_ref = 0.0f;
     float sum_src = 0.0f, sum_src_src = 0.0f;
     float sum_ref_src = 0.0f, sum_bw = 0.0f;
 
-    // Optimized inner loop
-    for (int i = -radius; i <= radius; i += params.radius_increment) {
-        const float i_sq = i * i;
-        
+    // **SPHERICAL MODIFICATION 2: Expanded horizontal loop with geodesic weighting**
+    for (int i = -radius_x; i <= radius_x; i += params.radius_increment) {
+        float i_metric = i;
+        if (ref_camera.model == SPHERE) {
+             i_metric *= cos_lat;
+        }
+        const float i_sq = i_metric * i_metric;
+
         for (int j = -radius; j <= radius; j += params.radius_increment) {
             const int2 ref_pt = make_int2(p.x + i, p.y + j);
 
+            // Skip out-of-bounds pixels
+            if (ref_pt.x < 0 || ref_pt.x >= ref_camera.width ||
+                ref_pt.y < 0 || ref_pt.y >= ref_camera.height) {
+                continue;
+            }
+
             const float ref_pix = tex2D<float>(ref_image, ref_pt.x + 0.5f, ref_pt.y + 0.5f);
-            
             const float depth_n = ComputeDepthfromPlaneHypothesis(ref_camera, plane_hypothesis, ref_pt);
             const float3 Pw_n = Get3DPointonWorld_cu(ref_pt.x, ref_pt.y, depth_n, ref_camera);
 
@@ -350,7 +405,9 @@ __device__ float ComputeBilateralNCC(const cudaTextureObject_t ref_image,
 
             const float src_pix = tex2D<float>(src_image, src_pt.x + 0.5f, src_pt.y + 0.5f);
 
+            // **SPHERICAL MODIFICATION 3: Geodesic spatial distance**
             const float spatial_dist_sq = i_sq + j * j;
+            
             const float color_dist = fabsf(ref_pix - ref_center_pix);
             const float w = expf(-spatial_dist_sq * inv_sigma_spatial_sq - color_dist * inv_sigma_color_sq);
 
@@ -391,7 +448,7 @@ __device__ float ComputeBilateralNCC_Precomputed(
     const float4 plane_hypothesis,
     const PatchMatchParams params,
     const PrecomputedProjectionCache& precomp_cache,
-    const int src_idx)  // ← Add this parameter
+    const int src_idx)
 {
     const float cost_max = 2.0f;
     const int radius = params.patch_size / 2;
@@ -400,13 +457,24 @@ __device__ float ComputeBilateralNCC_Precomputed(
     float depth_ref = ComputeDepthfromPlaneHypothesis(ref_camera, plane_hypothesis, p);
     if (depth_ref <= 0.0f || depth_ref > 1000.0f) return cost_max;
     
-    // Use precomputed data for center pixel to check bounds
+    // [Adaptive Window]
+    int radius_x = radius;
+    float cos_lat = 1.0f;
+    if (ref_camera.model == SPHERE) {
+        const float lat = GetLatitude(p.y, ref_camera.height);
+        cos_lat = cosf(lat);
+        // Scale radius inversely with cos(lat) to maintain physical width
+        float scale = 1.0f / fmaxf(fabsf(cos_lat), 0.1f);
+        radius_x = (int)(radius * scale);
+        radius_x = min(radius_x, radius * 4); // Clamp to avoid excessive cost
+    }
+    
     const PrecomputedRayData& precomp_center = precomp_cache.Get(p.x, p.y, src_idx);
     float2 pt_center; 
     float dummy_depth;
     ProjectonCamera_Precomputed(precomp_center, src_camera, depth_ref, pt_center, dummy_depth);
     
-    if (pt_center.x < radius || pt_center.x >= src_camera.width - radius ||
+    if (pt_center.x < radius_x || pt_center.x >= src_camera.width - radius_x ||
         pt_center.y < radius || pt_center.y >= src_camera.height - radius) {
         return cost_max;
     }
@@ -419,13 +487,17 @@ __device__ float ComputeBilateralNCC_Precomputed(
     float sum_src = 0.0f, sum_src_src = 0.0f;
     float sum_ref_src = 0.0f, sum_bw = 0.0f;
 
-    for (int i = -radius; i <= radius; i += params.radius_increment) {
-        const float i_sq = i * i;
-        
+    // **SPHERICAL MODIFICATION 2: Expanded horizontal loop**
+    for (int i = -radius_x; i <= radius_x; i += params.radius_increment) {
+        float i_metric = i;
+        if (ref_camera.model == SPHERE) {
+             i_metric *= cos_lat;
+        }
+        const float i_sq = i_metric * i_metric;
+
         for (int j = -radius; j <= radius; j += params.radius_increment) {
             const int2 ref_pt = make_int2(p.x + i, p.y + j);
             
-            // Bounds check for neighbor pixel
             if (ref_pt.x < 0 || ref_pt.x >= ref_camera.width ||
                 ref_pt.y < 0 || ref_pt.y >= ref_camera.height) {
                 continue;
@@ -434,7 +506,6 @@ __device__ float ComputeBilateralNCC_Precomputed(
             const float ref_pix = tex2D<float>(ref_image, ref_pt.x + 0.5f, ref_pt.y + 0.5f);
             const float depth_n = ComputeDepthfromPlaneHypothesis(ref_camera, plane_hypothesis, ref_pt);
             
-            // **FIX**: Get precomputed data for THIS neighbor pixel
             const PrecomputedRayData& precomp_n = precomp_cache.Get(ref_pt.x, ref_pt.y, src_idx);
             
             float2 src_pt;
@@ -447,7 +518,10 @@ __device__ float ComputeBilateralNCC_Precomputed(
             }
 
             const float src_pix = tex2D<float>(src_image, src_pt.x + 0.5f, src_pt.y + 0.5f);
+            
+            // **SPHERICAL MODIFICATION 3: Geodesic spatial distance**
             const float spatial_dist_sq = i_sq + j * j;
+            
             const float color_dist = fabsf(ref_pix - ref_center_pix);
             const float w = expf(-spatial_dist_sq * inv_sigma_spatial_sq - color_dist * inv_sigma_color_sq);
 
@@ -477,6 +551,52 @@ __device__ float ComputeBilateralNCC_Precomputed(
     return fmaxf(0.0f, fminf(cost_max, ncc_cost));
 }
 
+
+// ============================================================================
+// MODIFIED GEOMETRIC CONSISTENCY WITH SPHERICAL AWARENESS
+// ============================================================================
+
+__device__ float ComputeGeomConsistencyCost(const cudaTextureObject_t depth_image, 
+                                            const Camera ref_camera, 
+                                            const Camera src_camera, 
+                                            const float4 plane_hypothesis, 
+                                            const int2 p)
+{
+    const float max_cost = 3.0f;
+
+    float depth = ComputeDepthfromPlaneHypothesis(ref_camera, plane_hypothesis, p);
+    float3 forward_point = Get3DPointonWorld_cu(p.x, p.y, depth, ref_camera);
+
+    float2 src_pt;
+    float src_d;
+    ProjectonCamera_cu(forward_point, src_camera, src_pt, src_d);
+    const float src_depth = tex2D<float>(depth_image, (int)src_pt.x + 0.5f, (int)src_pt.y + 0.5f);
+
+    if (src_depth == 0.0f) {
+        return max_cost;
+    }
+
+    float3 src_3D_pt = Get3DPointonWorld_cu(src_pt.x, src_pt.y, src_depth, src_camera);
+
+    float2 backward_point;
+    float ref_d;
+    ProjectonCamera_cu(src_3D_pt, ref_camera, backward_point, ref_d);
+
+    const float diff_col = p.x - backward_point.x;
+    const float diff_row = p.y - backward_point.y;
+    
+    float dist_sq;
+    if (ref_camera.model == SPHERE) {
+        const float lat = GetLatitude(p.y, ref_camera.height);
+        const float cos_lat = cosf(lat);
+        const float diff_col_metric = diff_col * cos_lat;
+        dist_sq = diff_col_metric * diff_col_metric + diff_row * diff_row;
+    } else {
+        dist_sq = diff_col * diff_col + diff_row * diff_row;
+    }
+
+    return fminf(max_cost, sqrtf(dist_sq));
+}
 
 __device__ float ComputeMultiViewInitialCostandSelectedViews(const cudaTextureObject_t *images, const Camera *cameras, const int2 p, const float4 plane_hypothesis, unsigned int *selected_views, const PatchMatchParams params)
 {
@@ -547,32 +667,32 @@ __device__ void ComputeMultiViewCostVector_Precomputed(
     }
 }
 
-__device__ float ComputeGeomConsistencyCost(const cudaTextureObject_t depth_image, const Camera ref_camera, const Camera src_camera, const float4 plane_hypothesis, const int2 p)
-{
-    const float max_cost = 3.0f;
+// __device__ float ComputeGeomConsistencyCost(const cudaTextureObject_t depth_image, const Camera ref_camera, const Camera src_camera, const float4 plane_hypothesis, const int2 p)
+// {
+//     const float max_cost = 3.0f;
 
-    float depth = ComputeDepthfromPlaneHypothesis(ref_camera, plane_hypothesis, p);
-    float3 forward_point = Get3DPointonWorld_cu(p.x, p.y, depth, ref_camera);
+//     float depth = ComputeDepthfromPlaneHypothesis(ref_camera, plane_hypothesis, p);
+//     float3 forward_point = Get3DPointonWorld_cu(p.x, p.y, depth, ref_camera);
 
-    float2 src_pt;
-    float src_d;
-    ProjectonCamera_cu(forward_point, src_camera, src_pt, src_d);
-    const float src_depth = tex2D<float>(depth_image,  (int)src_pt.x + 0.5f, (int)src_pt.y + 0.5f);
+//     float2 src_pt;
+//     float src_d;
+//     ProjectonCamera_cu(forward_point, src_camera, src_pt, src_d);
+//     const float src_depth = tex2D<float>(depth_image,  (int)src_pt.x + 0.5f, (int)src_pt.y + 0.5f);
 
-    if (src_depth == 0.0f) {
-        return max_cost;
-    }
+//     if (src_depth == 0.0f) {
+//         return max_cost;
+//     }
 
-    float3 src_3D_pt = Get3DPointonWorld_cu(src_pt.x, src_pt.y, src_depth, src_camera);
+//     float3 src_3D_pt = Get3DPointonWorld_cu(src_pt.x, src_pt.y, src_depth, src_camera);
 
-    float2 backward_point;
-    float ref_d;
-    ProjectonCamera_cu(src_3D_pt, ref_camera, backward_point, ref_d);
+//     float2 backward_point;
+//     float ref_d;
+//     ProjectonCamera_cu(src_3D_pt, ref_camera, backward_point, ref_d);
 
-    const float diff_col = p.x - backward_point.x;
-    const float diff_row = p.y - backward_point.y;
-    return min(max_cost, sqrt(diff_col * diff_col + diff_row * diff_row));
-}
+//     const float diff_col = p.x - backward_point.x;
+//     const float diff_row = p.y - backward_point.y;
+//     return min(max_cost, sqrt(diff_col * diff_col + diff_row * diff_row));
+// }
 
 // ============================================================================
 // PRECOMPUTATION KERNEL - COMPUTE ONCE PER PROBLEM
