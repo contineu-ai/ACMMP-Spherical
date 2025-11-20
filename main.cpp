@@ -674,65 +674,65 @@ int main(int argc, char** argv)
     bool hierarchy = false;
     bool multi_geometry = false;
     
-    while (max_num_downscale >= 0) {
-        std::cout << "Scale: " << max_num_downscale << std::endl;
+    // while (max_num_downscale >= 0) {
+    //     std::cout << "Scale: " << max_num_downscale << std::endl;
 
-        for (size_t i = 0; i < num_images; ++i) {
-            if (problems[i].num_downscale >= 0) {
-                problems[i].cur_image_size = problems[i].max_image_size / 
-                                            pow(2, problems[i].num_downscale);
-                problems[i].num_downscale--;
-            }
-        }
+    //     for (size_t i = 0; i < num_images; ++i) {
+    //         if (problems[i].num_downscale >= 0) {
+    //             problems[i].cur_image_size = problems[i].max_image_size / 
+    //                                         pow(2, problems[i].num_downscale);
+    //             problems[i].num_downscale--;
+    //         }
+    //     }
 
-        if (flag == 0) {
-            flag = 1;
-            std::cout << "Scale: " << max_num_downscale << std::endl;
-            // Phase 1: Planar prior processing
-            geom_consistency = false;
-            planar_prior = true;
-            ProcessProblemsWithMode(dense_folder, problems, geom_consistency, 
-                                   planar_prior, hierarchy, false, use_batching);
+    //     if (flag == 0) {
+    //         flag = 1;
+    //         std::cout << "Scale: " << max_num_downscale << std::endl;
+    //         // Phase 1: Planar prior processing
+    //         geom_consistency = false;
+    //         planar_prior = true;
+    //         ProcessProblemsWithMode(dense_folder, problems, geom_consistency, 
+    //                                planar_prior, hierarchy, false, use_batching);
             
-            // Phase 2: Geometric consistency processing
-            geom_consistency = true;
-            planar_prior = false;
-            std::cout << "Scale: " << max_num_downscale << std::endl;
-            for (int geom_iter = 0; geom_iter < geom_iterations; ++geom_iter) {
-                multi_geometry = (geom_iter > 0);
-                ProcessProblemsWithMode(dense_folder, problems, geom_consistency, 
-                                       planar_prior, hierarchy, multi_geometry, use_batching);
-            }
-        }
-        else {
-            // Joint Bilateral Upsampling phase
-            std::cout << "Scale: " << max_num_downscale << std::endl;
-            for (size_t i = 0; i < num_images; ++i) {
-               JointBilateralUpsampling(dense_folder, problems[i], problems[i].cur_image_size);
-            }
+    //         // Phase 2: Geometric consistency processing
+    //         geom_consistency = true;
+    //         planar_prior = false;
+    //         std::cout << "Scale: " << max_num_downscale << std::endl;
+    //         for (int geom_iter = 0; geom_iter < geom_iterations; ++geom_iter) {
+    //             multi_geometry = (geom_iter > 0);
+    //             ProcessProblemsWithMode(dense_folder, problems, geom_consistency, 
+    //                                    planar_prior, hierarchy, multi_geometry, use_batching);
+    //         }
+    //     }
+    //     else {
+    //         // Joint Bilateral Upsampling phase
+    //         std::cout << "Scale: " << max_num_downscale << std::endl;
+    //         for (size_t i = 0; i < num_images; ++i) {
+    //            JointBilateralUpsampling(dense_folder, problems[i], problems[i].cur_image_size);
+    //         }
 
-            // Phase 3: Hierarchy processing
-            hierarchy = true;
-            geom_consistency = false;
-            planar_prior = true;
-            std::cout << "Scale: " << max_num_downscale << std::endl;
-            ProcessProblemsWithMode(dense_folder, problems, geom_consistency, 
-                                   planar_prior, hierarchy, false, use_batching);
+    //         // Phase 3: Hierarchy processing
+    //         hierarchy = true;
+    //         geom_consistency = false;
+    //         planar_prior = true;
+    //         std::cout << "Scale: " << max_num_downscale << std::endl;
+    //         ProcessProblemsWithMode(dense_folder, problems, geom_consistency, 
+    //                                planar_prior, hierarchy, false, use_batching);
             
-            // Phase 4: Final geometric consistency
-            hierarchy = false;
-            geom_consistency = true;
-            planar_prior = false;
-            for (int geom_iter = 0; geom_iter < geom_iterations; ++geom_iter) {
-                std::cout << "Scale: " << max_num_downscale << std::endl;
-                multi_geometry = (geom_iter > 0);
-                ProcessProblemsWithMode(dense_folder, problems, geom_consistency, 
-                                       planar_prior, hierarchy, multi_geometry, use_batching);
-            }
-        }
+    //         // Phase 4: Final geometric consistency
+    //         hierarchy = false;
+    //         geom_consistency = true;
+    //         planar_prior = false;
+    //         for (int geom_iter = 0; geom_iter < geom_iterations; ++geom_iter) {
+    //             std::cout << "Scale: " << max_num_downscale << std::endl;
+    //             multi_geometry = (geom_iter > 0);
+    //             ProcessProblemsWithMode(dense_folder, problems, geom_consistency, 
+    //                                    planar_prior, hierarchy, multi_geometry, use_batching);
+    //         }
+    //     }
 
-        max_num_downscale--;
-    }
+    //     max_num_downscale--;
+    // }
 
     geom_consistency = true;
     RunFusionCuda(dense_folder, problems, geom_consistency);

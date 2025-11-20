@@ -1297,8 +1297,17 @@ __global__ void CorrectedChunkBatchKernel(
     float4 ref_normal_tex = tex2D<float4>(normal_textures[ref_tex_idx], c + 0.5f, r + 0.5f);
     float3 ref_normal = make_float3(ref_normal_tex.x, ref_normal_tex.y, ref_normal_tex.z);
     
+    // float4 ref_color = tex2D<float4>(image_textures[ref_tex_idx], c + 0.5f, r + 0.5f);
     float4 ref_color = tex2D<float4>(image_textures[ref_tex_idx], c + 0.5f, r + 0.5f);
     
+    // *** NEW: Skip black pixels (threshold for floating point comparison) ***
+    const float black_threshold = 0.01f;  // Small threshold for float comparison
+    if (ref_color.x < black_threshold && 
+        ref_color.y < black_threshold && 
+        ref_color.z < black_threshold) {
+        valid_flags[global_idx] = 0;
+        return;
+    }
     // Initialize sums for weighted averaging
     float3 point_sum = PointX;
     float3 normal_sum = ref_normal;
@@ -1362,19 +1371,22 @@ __global__ void CorrectedChunkBatchKernel(
         dot_product = fmaxf(-1.0f, fminf(1.0f, dot_product));
         float angle = acosf(dot_product);
 
-        float adaptive_reproj_threshold = GetAdaptiveReprojectionThreshold(ref_cam, c, r, 3.0f);
+        float adaptive_reproj_threshold = GetAdaptiveReprojectionThreshold(ref_cam, c, r, 2.0f);
 
         float adaptive_reproj_threshold_src = GetAdaptiveReprojectionThreshold(src_cam, src_c, src_r, 3.0f);
         float combined_threshold = fmaxf(adaptive_reproj_threshold, adaptive_reproj_threshold_src);        
 
         float adaptive_depth_threshold = fmaxf(
-            GetAdaptiveDepthThreshold(src_depth, src_cam,0.025f),
-            GetAdaptiveDepthThreshold(ref_depth, ref_cam,0.025f)
+            GetAdaptiveDepthThreshold(src_depth, src_cam,0.03f),
+            GetAdaptiveDepthThreshold(ref_depth, ref_cam,0.03f)
         );
-
+        float adaptive_normal_threshold = 0.3f;
+        if (IsNearPole(ref_cam, c, r, 20.0f)) {
+            adaptive_normal_threshold = 0.45f;  // ~26° near poles
+        }
         if (reproj_error < combined_threshold && 
             relative_depth_diff < adaptive_depth_threshold && 
-            angle < 0.3f) {
+            angle < adaptive_normal_threshold) {
             
             float confidence = CalculateGeometricConfidence(
                 ref_cam, src_cam, PointX, c, r, src_c, src_r,
@@ -1783,7 +1795,7 @@ void RunFusionCuda(const std::string &dense_folder,
 
             auto chunk_start = std::chrono::high_resolution_clock::now();
 
-            float pole_exclusion_degrees = 3;  // Exclude 10 degrees from each pole (adjustable)
+            float pole_exclusion_degrees = 10;  // Exclude 10 degrees from each pole (adjustable)
 
             CorrectedChunkBatchKernel<<<grid_size, block_size>>>(
                 depth_textures_cuda,
