@@ -7,6 +7,8 @@ int readDepthDmb(const std::string file_path, cv::Mat_<float> &depth);
 int readNormalDmb(const std::string file_path, cv::Mat_<cv::Vec3f> &normal);
 int writeDepthDmb(const std::string file_path, const cv::Mat_<float> depth);
 int writeNormalDmb(const std::string file_path, const cv::Mat_<cv::Vec3f> normal);
+int readCostDmb(const std::string file_path, cv::Mat_<float> &cost);
+int writeCostDmb(const std::string file_path, const cv::Mat_<float> cost);
 
 Camera ReadCamera(const std::string &cam_path);
 void  RescaleImageAndCamera(cv::Mat_<cv::Vec3b> &src, cv::Mat_<cv::Vec3b> &dst, cv::Mat_<float> &depth, Camera &camera);

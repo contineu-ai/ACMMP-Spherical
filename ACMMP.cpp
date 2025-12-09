@@ -337,8 +337,31 @@ float GetAngle( const cv::Vec3f &v1, const cv::Vec3f &v2 )
     return angle;
 }
 
+
+#include "CompressedDMB.h"
+
+// ============================================================================
+// REPLACE: readDepthDmb - Now supports both formats
+// ============================================================================
+
 int readDepthDmb(const std::string file_path, cv::Mat_<float> &depth)
 {
+    // Try compressed format first
+    if (CompressedDMB::isCompressedFormat(file_path)) {
+        return CompressedDMB::readDepthCompressed(file_path, depth);
+    }
+    
+    // Also check if .cdmb version exists when .dmb is requested
+    if (file_path.length() > 4 && file_path.substr(file_path.length() - 4) == ".dmb") {
+        std::string cdmb_path = file_path.substr(0, file_path.length() - 4) + ".cdmb";
+        FILE* test = fopen(cdmb_path.c_str(), "rb");
+        if (test) {
+            fclose(test);
+            return CompressedDMB::readDepthCompressed(cdmb_path, depth);
+        }
+    }
+    
+    // Fall back to original DMB format
     FILE *inimage;
     inimage = fopen(file_path.c_str(), "rb");
     if (!inimage){
@@ -369,35 +392,45 @@ int readDepthDmb(const std::string file_path, cv::Mat_<float> &depth)
     return 0;
 }
 
+// ============================================================================
+// REPLACE: writeDepthDmb - Now writes compressed format
+// ============================================================================
+
 int writeDepthDmb(const std::string file_path, const cv::Mat_<float> depth)
 {
-    FILE *outimage;
-    outimage = fopen(file_path.c_str(), "wb");
-    if (!outimage) {
-        std::cout << "Error opening file " << file_path << std::endl;
+    // Convert .dmb extension to .cdmb for compressed output
+    std::string output_path = file_path;
+    if (file_path.length() > 4 && file_path.substr(file_path.length() - 4) == ".dmb") {
+        output_path = file_path.substr(0, file_path.length() - 4) + ".cdmb";
+    } else if (file_path.length() <= 5 || file_path.substr(file_path.length() - 5) != ".cdmb") {
+        output_path = file_path + ".cdmb";
     }
-
-    int32_t type = 1;
-    int32_t h = depth.rows;
-    int32_t w = depth.cols;
-    int32_t nb = 1;
-
-    fwrite(&type,sizeof(int32_t),1,outimage);
-    fwrite(&h,sizeof(int32_t),1,outimage);
-    fwrite(&w,sizeof(int32_t),1,outimage);
-    fwrite(&nb,sizeof(int32_t),1,outimage);
-
-    float* data = (float*)depth.data;
-
-    int32_t datasize = w*h*nb;
-    fwrite(data,sizeof(float),datasize,outimage);
-
-    fclose(outimage);
-    return 0;
+    
+    return CompressedDMB::writeDepthCompressed(output_path, depth);
 }
 
-int readNormalDmb (const std::string file_path, cv::Mat_<cv::Vec3f> &normal)
+// ============================================================================
+// REPLACE: readNormalDmb - Now supports both formats
+// ============================================================================
+
+int readNormalDmb(const std::string file_path, cv::Mat_<cv::Vec3f> &normal)
 {
+    // Try compressed format first
+    if (CompressedDMB::isCompressedFormat(file_path)) {
+        return CompressedDMB::readNormalCompressed(file_path, normal);
+    }
+    
+    // Also check if .cdmb version exists when .dmb is requested
+    if (file_path.length() > 4 && file_path.substr(file_path.length() - 4) == ".dmb") {
+        std::string cdmb_path = file_path.substr(0, file_path.length() - 4) + ".cdmb";
+        FILE* test = fopen(cdmb_path.c_str(), "rb");
+        if (test) {
+            fclose(test);
+            return CompressedDMB::readNormalCompressed(cdmb_path, normal);
+        }
+    }
+    
+    // Fall back to original DMB format
     FILE *inimage;
     inimage = fopen(file_path.c_str(), "rb");
     if (!inimage) {
@@ -428,32 +461,66 @@ int readNormalDmb (const std::string file_path, cv::Mat_<cv::Vec3f> &normal)
     return 0;
 }
 
+// ============================================================================
+// REPLACE: writeNormalDmb - Now writes compressed format
+// ============================================================================
+
 int writeNormalDmb(const std::string file_path, const cv::Mat_<cv::Vec3f> normal)
 {
-    FILE *outimage;
-    outimage = fopen(file_path.c_str(), "wb");
-    if (!outimage) {
-        std::cout << "Error opening file " << file_path << std::endl;
+    // Convert .dmb extension to .cdmb for compressed output
+    std::string output_path = file_path;
+    if (file_path.length() > 4 && file_path.substr(file_path.length() - 4) == ".dmb") {
+        output_path = file_path.substr(0, file_path.length() - 4) + ".cdmb";
+    } else if (file_path.length() <= 5 || file_path.substr(file_path.length() - 5) != ".cdmb") {
+        output_path = file_path + ".cdmb";
     }
-
-    int32_t type = 1; //float
-    int32_t h = normal.rows;
-    int32_t w = normal.cols;
-    int32_t nb = 3;
-
-    fwrite(&type,sizeof(int32_t),1,outimage);
-    fwrite(&h,sizeof(int32_t),1,outimage);
-    fwrite(&w,sizeof(int32_t),1,outimage);
-    fwrite(&nb,sizeof(int32_t),1,outimage);
-
-    float* data = (float*)normal.data;
-
-    int32_t datasize = w*h*nb;
-    fwrite(data,sizeof(float),datasize,outimage);
-
-    fclose(outimage);
-    return 0;
+    
+    return CompressedDMB::writeNormalCompressed(output_path, normal);
 }
+
+// ============================================================================
+// NEW FUNCTION: writeCostDmb - For cost maps (was using writeDepthDmb before)
+// ============================================================================
+
+int writeCostDmb(const std::string file_path, const cv::Mat_<float> cost)
+{
+    // Convert .dmb extension to .cdmb for compressed output
+    std::string output_path = file_path;
+    if (file_path.length() > 4 && file_path.substr(file_path.length() - 4) == ".dmb") {
+        output_path = file_path.substr(0, file_path.length() - 4) + ".cdmb";
+    } else if (file_path.length() <= 5 || file_path.substr(file_path.length() - 5) != ".cdmb") {
+        output_path = file_path + ".cdmb";
+    }
+    
+    return CompressedDMB::writeCostCompressed(output_path, cost);
+}
+
+// ============================================================================
+// NEW FUNCTION: readCostDmb - For cost maps
+// ============================================================================
+
+int readCostDmb(const std::string file_path, cv::Mat_<float> &cost)
+{
+    // Try compressed format first
+    if (CompressedDMB::isCompressedFormat(file_path)) {
+        return CompressedDMB::readCostCompressed(file_path, cost);
+    }
+    
+    // Also check if .cdmb version exists when .dmb is requested
+    if (file_path.length() > 4 && file_path.substr(file_path.length() - 4) == ".dmb") {
+        std::string cdmb_path = file_path.substr(0, file_path.length() - 4) + ".cdmb";
+        FILE* test = fopen(cdmb_path.c_str(), "rb");
+        if (test) {
+            fclose(test);
+            return CompressedDMB::readCostCompressed(cdmb_path, cost);
+        }
+    }
+    
+    // Fall back to reading as depth (original behavior - costs used depth format)
+    return readDepthDmb(file_path, cost);
+}
+
+
 
 void StoreColorPlyFileBinaryPointCloud (const std::string &plyFilePath, const std::vector<PointList> &pc)
 {
@@ -541,6 +608,51 @@ void ACMMP::SetPlanarPriorParams()
     params.planar_prior = true;
 }
 
+static int readDepthAuto(const std::string& base_path, cv::Mat_<float>& depth) {
+    // Try compressed format first (.cdmb)
+    std::string cdmb_path = base_path;
+    if (cdmb_path.length() > 4 && cdmb_path.substr(cdmb_path.length() - 4) == ".dmb") {
+        cdmb_path = cdmb_path.substr(0, cdmb_path.length() - 4) + ".cdmb";
+    }
+    
+    if (CompressedDMB::readDepthCompressed(cdmb_path, depth) == 0) {
+        return 0;
+    }
+    
+    // Fall back to original format (.dmb)
+    return readDepthDmb(base_path, depth);
+}
+
+static int readNormalAuto(const std::string& base_path, cv::Mat_<cv::Vec3f>& normal) {
+    // Try compressed format first (.cdmb)
+    std::string cdmb_path = base_path;
+    if (cdmb_path.length() > 4 && cdmb_path.substr(cdmb_path.length() - 4) == ".dmb") {
+        cdmb_path = cdmb_path.substr(0, cdmb_path.length() - 4) + ".cdmb";
+    }
+    
+    if (CompressedDMB::readNormalCompressed(cdmb_path, normal) == 0) {
+        return 0;
+    }
+    
+    // Fall back to original format (.dmb)
+    return readNormalDmb(base_path, normal);
+}
+
+static int readCostAuto(const std::string& base_path, cv::Mat_<float>& cost) {
+    // Try compressed format first (.cdmb)
+    std::string cdmb_path = base_path;
+    if (cdmb_path.length() > 4 && cdmb_path.substr(cdmb_path.length() - 4) == ".dmb") {
+        cdmb_path = cdmb_path.substr(0, cdmb_path.length() - 4) + ".cdmb";
+    }
+    
+    if (CompressedDMB::readCostCompressed(cdmb_path, cost) == 0) {
+        return 0;
+    }
+    
+    // Fall back to reading as depth (original format used depth I/O for costs)
+    return readDepthDmb(base_path, cost);
+}
+
 void ACMMP::InuputInitialization(const std::string &dense_folder, const std::vector<Problem> &problems, const int idx)
 {
     images.clear();
@@ -551,7 +663,7 @@ void ACMMP::InuputInitialization(const std::string &dense_folder, const std::vec
     std::string cam_folder = dense_folder + std::string("/cams");
 
     std::stringstream image_path;
-    image_path << image_folder << "/" << std::setw(8) << std::setfill('0') << problem.ref_image_id << ".jpg";
+    image_path << image_folder << "/" << std::setw(8) << std::setfill('0') << problem.ref_image_id << ".png";
     cv::Mat_<uint8_t> image_uint = cv::imread(image_path.str(), cv::IMREAD_GRAYSCALE);
     cv::Mat image_float;
     image_uint.convertTo(image_float, CV_32FC1);
@@ -566,7 +678,7 @@ void ACMMP::InuputInitialization(const std::string &dense_folder, const std::vec
     size_t num_src_images = problem.src_image_ids.size();
     for (size_t i = 0; i < num_src_images; ++i) {
         std::stringstream image_path;
-        image_path << image_folder << "/" << std::setw(8) << std::setfill('0') << problem.src_image_ids[i] << ".jpg";
+        image_path << image_folder << "/" << std::setw(8) << std::setfill('0') << problem.src_image_ids[i] << ".png";
         cv::Mat_<uint8_t> image_uint = cv::imread(image_path.str(), cv::IMREAD_GRAYSCALE);
         cv::Mat image_float;
         image_uint.convertTo(image_float, CV_32FC1);
@@ -604,26 +716,22 @@ void ACMMP::InuputInitialization(const std::string &dense_folder, const std::vec
         cv::resize(images[i], scaled_image_float, cv::Size(new_cols,new_rows), 0, 0, cv::INTER_LINEAR);
         images[i] = scaled_image_float.clone();
 
-    if (cameras[i].model == SPHERE) {
-        // For spherical, scale the principal point parameters
-        cameras[i].params[1] *= scale_x; // cx
-        cameras[i].params[2] *= scale_y; // cy
-    } else { // PINHOLE
-        // For pinhole, scale the K matrix
-        cameras[i].K[0] *= scale_x;
-        cameras[i].K[2] *= scale_x;
-        cameras[i].K[4] *= scale_y;
-        cameras[i].K[5] *= scale_y;
-    }
+        if (cameras[i].model == SPHERE) {
+            cameras[i].params[1] *= scale_x;
+            cameras[i].params[2] *= scale_y;
+        } else {
+            cameras[i].K[0] *= scale_x;
+            cameras[i].K[2] *= scale_x;
+            cameras[i].K[4] *= scale_y;
+            cameras[i].K[5] *= scale_y;
+        }
         cameras[i].height = scaled_image_float.rows;
         cameras[i].width = scaled_image_float.cols;
     }
 
     params.depth_min = cameras[0].depth_min * 0.6f;
     params.depth_max = cameras[0].depth_max * 1.2f;
-    // std::cout << "depthe range: " << params.depth_min << " " << params.depth_max << std::endl;
     params.num_images = (int)images.size();
-    // std::cout << "num images: " << params.num_images << std::endl;
     params.disparity_min = cameras[0].K[0] * params.baseline / params.depth_max;
     params.disparity_max = cameras[0].K[0] * params.baseline / params.depth_min;
 
@@ -639,7 +747,9 @@ void ACMMP::InuputInitialization(const std::string &dense_folder, const std::vec
         }
         std::string depth_path = result_folder + suffix;
         cv::Mat_<float> ref_depth;
-        readDepthDmb(depth_path, ref_depth);
+        
+        // Use auto-detection function
+        readDepthAuto(depth_path, ref_depth);
         depths.push_back(ref_depth);
 
         size_t num_src_images = problem.src_image_ids.size();
@@ -649,7 +759,9 @@ void ACMMP::InuputInitialization(const std::string &dense_folder, const std::vec
             std::string result_folder = result_path.str();
             std::string depth_path = result_folder + suffix;
             cv::Mat_<float> depth;
-            readDepthDmb(depth_path, depth);
+            
+            // Use auto-detection function
+            readDepthAuto(depth_path, depth);
             depths.push_back(depth);
         }
     }
@@ -658,8 +770,6 @@ void ACMMP::InuputInitialization(const std::string &dense_folder, const std::vec
 
 void ACMMP::CudaSpaceInitialization(const std::string &dense_folder, const Problem &problem, ProblemGPUResources* res)
 {
-    // This function populates the pre-allocated buffers inside the 'res' object.
-    // It does NOT allocate any new GPU memory.
     num_images = (int)images.size();
     cudaStream_t s = stream_ ? stream_ : 0;
 
@@ -667,13 +777,12 @@ void ACMMP::CudaSpaceInitialization(const std::string &dense_folder, const Probl
         int rows = images[i].rows;
         int cols = images[i].cols;
 
-        // Copy image data to the pre-allocated cudaArray.
         CUDA_CHECK(cudaMemcpy2DToArrayAsync(res->cuArray[i], 0, 0, images[i].ptr<float>(), images[i].step[0], cols * sizeof(float), rows, cudaMemcpyHostToDevice, s));
 
         struct cudaResourceDesc resDesc;
         memset(&resDesc, 0, sizeof(cudaResourceDesc));
         resDesc.resType = cudaResourceTypeArray;
-        resDesc.res.array.array = res->cuArray[i]; // Use the persistent array from the resource pool
+        resDesc.res.array.array = res->cuArray[i];
 
         struct cudaTextureDesc texDesc;
         memset(&texDesc, 0, sizeof(cudaTextureDesc));
@@ -683,21 +792,15 @@ void ACMMP::CudaSpaceInitialization(const std::string &dense_folder, const Probl
         texDesc.readMode = cudaReadModeElementType;
         texDesc.normalizedCoords = 0;
 
-        // Destroy the old texture object handle if it exists from a previous run.
         if (res->texture_objects_host.images[i] != 0) {
             cudaDestroyTextureObject(res->texture_objects_host.images[i]);
         }
-        // Create a new texture object and store its handle in the persistent resource struct.
         CUDA_CHECK(cudaCreateTextureObject(&(res->texture_objects_host.images[i]), &resDesc, &texDesc, NULL));
     }
     
-    // Copy the host-side struct containing the new texture handles to the device-side struct.
     CUDA_CHECK(cudaMemcpyAsync(res->texture_objects_cuda, &res->texture_objects_host, sizeof(cudaTextureObjects), cudaMemcpyHostToDevice, s));
-
-    // Copy camera data to the pre-allocated device buffer.
     CUDA_CHECK(cudaMemcpyAsync(res->cameras_cuda, &cameras[0], sizeof(Camera) * num_images, cudaMemcpyHostToDevice, s));
 
-    // Allocate host memory for results (this is owned by the temporary ACMMP object).
     plane_hypotheses_host = new float4[cameras[0].height * cameras[0].width];
     costs_host = new float[cameras[0].height * cameras[0].width];
 
@@ -743,9 +846,11 @@ void ACMMP::CudaSpaceInitialization(const std::string &dense_folder, const Probl
         cv::Mat_<float> ref_depth;
         cv::Mat_<cv::Vec3f> ref_normal;
         cv::Mat_<float> ref_cost;
-        readDepthDmb(depth_path, ref_depth);
-        readNormalDmb(normal_path, ref_normal);
-        readDepthDmb(cost_path, ref_cost);
+        
+        // Use auto-detection functions that try compressed first
+        readDepthAuto(depth_path, ref_depth);
+        readNormalAuto(normal_path, ref_normal);
+        readCostAuto(cost_path, ref_cost);
         
         int width = ref_depth.cols;
         int height = ref_depth.rows;
@@ -777,14 +882,15 @@ void ACMMP::CudaSpaceInitialization(const std::string &dense_folder, const Probl
         cv::Mat_<float> ref_depth;
         cv::Mat_<cv::Vec3f> ref_normal;
         cv::Mat_<float> ref_cost;
-        readDepthDmb(depth_path, ref_depth);
-        readNormalDmb(normal_path, ref_normal);
-        readDepthDmb(cost_path, ref_cost);
+        
+        // Use auto-detection functions that try compressed first
+        readDepthAuto(depth_path, ref_depth);
+        readNormalAuto(normal_path, ref_normal);
+        readCostAuto(cost_path, ref_cost);
         
         int width = ref_normal.cols;
         int height = ref_normal.rows;
         
-        // Allocate HOST memory for hierarchy data (owned by this ACMMP object)
         scaled_plane_hypotheses_host = new float4[height * width];
         pre_costs_host = new float[height * width];
 
@@ -809,7 +915,6 @@ void ACMMP::CudaSpaceInitialization(const std::string &dense_folder, const Probl
             }
         }
 
-        // Prepare initial plane hypotheses for the current, higher resolution
         std::vector<float4> initial_planes_for_current_res(cameras[0].width * cameras[0].height);
         for (int row = 0; row < cameras[0].height; ++row) {
             for (int col = 0; col < cameras[0].width; ++col) {
@@ -818,7 +923,6 @@ void ACMMP::CudaSpaceInitialization(const std::string &dense_folder, const Probl
             }
         }
         
-        // Copy data to the PRE-ALLOCATED device buffers in the resource pool
         CUDA_CHECK(cudaMemcpyAsync(res->scaled_plane_hypotheses_cuda, scaled_plane_hypotheses_host, sizeof(float4) * height * width, cudaMemcpyHostToDevice, s));
         CUDA_CHECK(cudaMemcpyAsync(res->plane_hypotheses_cuda, initial_planes_for_current_res.data(), sizeof(float4) * cameras[0].width * cameras[0].height, cudaMemcpyHostToDevice, s));
     }
@@ -1101,8 +1205,10 @@ void RunJBU(const cv::Mat_<float>  &scaled_image_float, const cv::Mat_<float> &s
     result_path << dense_folder << "/ACMMP" << "/2333_" << std::setw(8) << std::setfill('0') << problem.ref_image_id;
     std::string result_folder = result_path.str();
     mkdir(result_folder.c_str(), 0777);
-    std::string depth_path = result_folder + "/depths.dmb";
-    writeDepthDmb ( depth_path, disp0 );
+    
+    // Use compressed format for output
+    std::string depth_path = result_folder + "/depths.cdmb";
+    CompressedDMB::writeDepthCompressed(depth_path, disp0);
 
     for (int i=0; i < JBU_NUM; i++) {
         CUDA_SAFE_CALL( cudaDestroyTextureObject(jbu.jt_h.imgs[i]) );

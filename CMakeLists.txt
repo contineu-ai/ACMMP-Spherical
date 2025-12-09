@@ -1,8 +1,8 @@
-cmake_minimum_required(VERSION 3.8)
+cmake_minimum_required(VERSION 3.18) # Updated to support CMAKE_CUDA_ARCHITECTURES
 project(ACMMP LANGUAGES CXX CUDA)
 
 # ─── CUDA Architecture Settings ─────────────────────────────────────
-set(CMAKE_CUDA_ARCHITECTURES  86 89)
+set(CMAKE_CUDA_ARCHITECTURES 86 89)
 
 # ─── C++ Standard ───────────────────────────────────────────────────
 set(CMAKE_CXX_STANDARD 11)
@@ -15,6 +15,9 @@ find_package(CUDAToolkit REQUIRED)
 find_package(OpenCV REQUIRED)
 find_package(Eigen3 3.3 REQUIRED NO_MODULE)
 find_package(OpenMP)
+find_package(ZLIB REQUIRED)
+
+# REMOVED target_link_libraries FROM HERE
 
 # ─── Include Directories ────────────────────────────────────────────
 include_directories(${OpenCV_INCLUDE_DIRS})
@@ -40,7 +43,6 @@ set(CUDA_SOURCES
 set(CXX_SOURCES
     main.cpp
     ACMMP.cpp
-    
 )
 
 set(HEADERS
@@ -50,9 +52,11 @@ set(HEADERS
     FusionGPU.h
     SphericalLUT_MultiRes.h
     BatchACMMP.h
+    CompressedDMB.h
 )
 
 # ─── Create Executable ──────────────────────────────────────────────
+# The target is created here
 add_executable(ACMMP 
     ${CXX_SOURCES}
     ${CUDA_SOURCES}
@@ -63,11 +67,13 @@ add_executable(ACMMP
 set_property(TARGET ACMMP PROPERTY CUDA_ARCHITECTURES ${CMAKE_CUDA_ARCHITECTURES})
 
 # ─── Link Libraries ─────────────────────────────────────────────────
+# Now we can link libraries because ACMMP exists
 target_link_libraries(ACMMP 
     ${OpenCV_LIBS}
     Eigen3::Eigen
     CUDA::cudart
     CUDA::curand
+    ZLIB::ZLIB  # Moved ZLIB here
 )
 
 if(OpenMP_CXX_FOUND)

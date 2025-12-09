@@ -3,6 +3,7 @@
 // ========================================
 
 #include "BatchACMMP.h"
+#include "CompressedDMB.h"
 #include <iostream>
 #include <algorithm>
 #include <chrono>
@@ -458,8 +459,6 @@ void BatchACMMP::processProblemOnStream(int problem_idx, ProblemGPUResources* re
     active_gpu_problems_.fetch_add(1);
     
     try {
-        // cudaStreamSynchronize(stream);
-        // Ensure the stream is valid before creating ACMMP.
         cudaError_t stream_check = cudaStreamQuery(stream);
         if (stream_check == cudaErrorInvalidResourceHandle) {
             std::cerr << "Invalid stream for problem " << problem_idx << ", creating new stream" << std::endl;
@@ -467,33 +466,23 @@ void BatchACMMP::processProblemOnStream(int problem_idx, ProblemGPUResources* re
             resources->stream = stream;
         }
         
-        // Process in an isolated scope to manage ACMMP's lifetime.
         {
             ACMMP acmmp;
             if (geom_consistency) acmmp.SetGeomConsistencyParams(multi_geometry);
             if (hierarchy) acmmp.SetHierarchyParams();
 
-            // Set the stream for the ACMMP object to use for async operations.
             acmmp.SetStream(stream);
-            
-            // Initialize host-side data (reading images from disk).
             acmmp.InuputInitialization(dense_folder, all_problems, problem_idx);
-            
-            // Initialize CUDA space by copying data to the pre-allocated GPU buffers.
             acmmp.CudaSpaceInitialization(dense_folder, problem, resources);
             
-            // Ensure everything is set up before running.
             cudaError_t pre_run_check = cudaGetLastError();
             if (pre_run_check != cudaSuccess) {
                 std::cerr << "Pre-run error: " << cudaGetErrorString(pre_run_check) << std::endl;
                 throw std::runtime_error("CUDA setup failed");
             }
             
-            // Run the main algorithm, using the provided GPU resources.
             acmmp.RunPatchMatch(resources);
             
-            
-            // Extract results...
             const int width = acmmp.GetReferenceImageWidth();
             const int height = acmmp.GetReferenceImageHeight();
 
@@ -511,34 +500,23 @@ void BatchACMMP::processProblemOnStream(int problem_idx, ProblemGPUResources* re
                 }
             }
 
-            // Queue the results for asynchronous disk writing with backpressure
+            // Queue for disk writing (compressed format will be used)
             {
                 std::unique_lock<std::mutex> lk(disk_queue_mutex_);
-                // Wait if queue is full - this provides backpressure
                 disk_queue_space_cv_.wait(lk, [&]{
                     return disk_write_queue_.size() < mask_disk_queue_size || stopping_disk_.load();
                 });
                 
-                size_t queue_size = disk_write_queue_.size();
                 disk_write_queue_.emplace(problem_idx, problem, 
                                          std::move(depths), std::move(normals), 
                                          std::move(costs), geom_consistency);
-                
-                // Warn if queue is getting large
-                // if (queue_size > mask_disk_queue_size * 3 / 4) {  // 75%
-                //     std::cout << "[Backpressure] Disk queue at " << queue_size << "/" 
-                //               << mask_disk_queue_size << " - GPU throttled" << std::endl;
-                // }
             }
             disk_queue_cv_.notify_one();
-        } // ACMMP destructor is called here, freeing only its HOST memory.
-        
-        // Final sync after ACMMP is destroyed.
-        // cudaStreamSynchronize(stream);
+        }
         
     } catch (const std::exception& e) {
         std::cerr << "[Problem " << problem_idx << "] Exception: " << e.what() << std::endl;
-        cudaGetLastError(); // Clear any pending errors.
+        cudaGetLastError();
         throw;
     }
     
@@ -555,15 +533,17 @@ void BatchACMMP::writeProblemToDisk(CompletedResult&& result) {
     // Create directory (mkdir is thread-safe on most systems)
     makeDir(result_folder);
     
-    // Write files
-    std::string suffix = result.geom_consistency ? "/depths_geom.dmb" : "/depths.dmb";
-    std::string depth_path = result_folder + suffix;
-    std::string normal_path = result_folder + "/normals.dmb";
-    std::string cost_path = result_folder + "/costs.dmb";
+    // Use compressed format (.cdmb) instead of raw (.dmb)
+    // This reduces file sizes by ~75-90%
+    std::string depth_suffix = result.geom_consistency ? "/depths_geom.cdmb" : "/depths.cdmb";
+    std::string depth_path = result_folder + depth_suffix;
+    std::string normal_path = result_folder + "/normals.cdmb";
+    std::string cost_path = result_folder + "/costs.cdmb";
     
-    writeDepthDmb(depth_path, result.depths);
-    writeNormalDmb(normal_path, result.normals);
-    writeDepthDmb(cost_path, result.costs);
+    // Write compressed files
+    CompressedDMB::writeDepthCompressed(depth_path, result.depths);
+    CompressedDMB::writeNormalCompressed(normal_path, result.normals);
+    CompressedDMB::writeCostCompressed(cost_path, result.costs);
 }
 
 void BatchACMMP::waitForGPUCompletion() {
