@@ -485,8 +485,8 @@ def process_images_optimized(imgs, depth_ranges, imgs_dir, out_img,
             missing.append((i, img.name))
             continue
         src = os.path.join(imgs_dir, img.name)
-        dst = os.path.join(out_img, f"{i:08d}.png")
-        needs_convert = not src.lower().endswith('.png')
+        dst = os.path.join(out_img, f"{i:08d}.jpg")
+        needs_convert = not src.lower().endswith('.jpg')
         tasks.append((i, src, dst, needs_convert, mode, relative_links))
     
     if missing:

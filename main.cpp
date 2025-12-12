@@ -409,7 +409,7 @@ void InitializeLUTsForAllResolutions(const std::string &dense_folder,
     std::string image_folder = dense_folder + std::string("/images");
     std::stringstream image_path;
     image_path << image_folder << "/" << std::setw(8) << std::setfill('0') 
-               << problems[0].ref_image_id << ".png";
+               << problems[0].ref_image_id << ".jpg";
     cv::Mat_<uint8_t> image_uint = cv::imread(image_path.str(), cv::IMREAD_GRAYSCALE);
     
     int base_width = image_uint.cols;
@@ -419,7 +419,7 @@ void InitializeLUTsForAllResolutions(const std::string &dense_folder,
     
     std::cout << "Base resolution: " << base_width << "x" << base_height 
               << " with principal point (" << base_cx << ", " << base_cy << ")" << std::endl;
-    
+
     // Calculate all possible resolutions based on downscaling
     std::set<ResolutionKey> unique_resolutions;
     
@@ -431,7 +431,7 @@ void InitializeLUTsForAllResolutions(const std::string &dense_folder,
         // Get image size for this problem
         std::stringstream img_path;
         img_path << image_folder << "/" << std::setw(8) << std::setfill('0') 
-                 << problem.ref_image_id << ".png";
+                 << problem.ref_image_id << ".jpg";
         cv::Mat_<uint8_t> img = cv::imread(img_path.str(), cv::IMREAD_GRAYSCALE);
         
         int width = img.cols;
@@ -492,7 +492,7 @@ int ComputeMultiScaleSettings(const std::string &dense_folder, std::vector<Probl
     for (size_t i = 0; i < num_images; ++i) {
         std::stringstream image_path;
         image_path << image_folder << "/" << std::setw(8) << std::setfill('0') 
-                   << problems[i].ref_image_id << ".png";
+                   << problems[i].ref_image_id << ".jpg";
         cv::Mat_<uint8_t> image_uint = cv::imread(image_path.str(), cv::IMREAD_GRAYSCALE);
 
         int rows = image_uint.rows;
@@ -530,7 +530,7 @@ void JointBilateralUpsampling(const std::string &dense_folder, const Problem &pr
 
     std::string image_folder = dense_folder + std::string("/images");
     std::stringstream image_path;
-    image_path << image_folder << "/" << std::setw(8) << std::setfill('0') << problem.ref_image_id << ".png";
+    image_path << image_folder << "/" << std::setw(8) << std::setfill('0') << problem.ref_image_id << ".jpg";
     cv::Mat_<uint8_t> image_uint = cv::imread(image_path.str(), cv::IMREAD_GRAYSCALE);
     cv::Mat image_float;
     image_uint.convertTo(image_float, CV_32FC1);
@@ -543,7 +543,7 @@ void JointBilateralUpsampling(const std::string &dense_folder, const Problem &pr
     cv::Mat scaled_image_float;
     cv::resize(image_float, scaled_image_float, cv::Size(new_cols,new_rows), 0, 0, cv::INTER_LINEAR);
 
-    // std::cout << "Run JBU for image " << problem.ref_image_id <<  ".png" << std::endl;
+    // std::cout << "Run JBU for image " << problem.ref_image_id <<  ".jpg" << std::endl;
     RunJBU(scaled_image_float, ref_depth, dense_folder, problem);
 }
 
@@ -662,10 +662,10 @@ int main(int argc, char** argv)
     std::cout << "There are " << num_images << " problems needed to be processed!" << std::endl;
 
     // // Compute multi-scale settings
-    // int max_num_downscale = ComputeMultiScaleSettings(dense_folder, problems);
+    int max_num_downscale = ComputeMultiScaleSettings(dense_folder, problems);
     
-    // // Initialize LUTs for all expected resolutions
-    // InitializeLUTsForAllResolutions(dense_folder, problems, max_num_downscale);
+    // Initialize LUTs for all expected resolutions
+    InitializeLUTsForAllResolutions(dense_folder, problems, max_num_downscale);
 
     int flag = 0;
     int geom_iterations = 2;

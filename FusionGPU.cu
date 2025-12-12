@@ -622,7 +622,7 @@ std::shared_ptr<ImageData> loadImageDataSync(int image_id) {
         }
         
         // Load image
-        ret = snprintf(buf, sizeof(buf), "%s/%08d.png", img_folder.c_str(), image_id);
+        ret = snprintf(buf, sizeof(buf), "%s/%08d.jpg", img_folder.c_str(), image_id);
         if (ret < 0 || ret >= static_cast<int>(sizeof(buf))) {
             return data;
         }
@@ -1617,7 +1617,7 @@ void RunFusionCuda(const std::string &dense_folder,
                 
                 // 3. Load image to calculate scale
                 char img_buf[512];
-                ret = snprintf(img_buf, sizeof(img_buf), "%s/images/%08d.png", 
+                ret = snprintf(img_buf, sizeof(img_buf), "%s/images/%08d.jpg", 
                             dense_folder.c_str(), image_id);
                 if (ret < 0 || ret >= static_cast<int>(sizeof(img_buf))) continue;
                 
