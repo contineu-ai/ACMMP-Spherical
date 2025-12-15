@@ -349,10 +349,10 @@ public:
         // Safe arithmetic with overflow checking
         size_t safe_max_textures, safe_max_problems, safe_max_src_images, safe_max_pixels;
         
-        if (!safe_multiply(est_max_textures, static_cast<size_t>(2), safe_max_textures) ||
-            !safe_multiply(est_max_problems, static_cast<size_t>(2), safe_max_problems) ||
-            !safe_multiply(est_max_src_images, static_cast<size_t>(2), safe_max_src_images) ||
-            !safe_multiply(est_max_pixels, static_cast<size_t>(2), safe_max_pixels)) {
+        if (!safe_multiply(est_max_textures, static_cast<size_t>(1.2), safe_max_textures) ||
+            !safe_multiply(est_max_problems, static_cast<size_t>(1.2), safe_max_problems) ||
+            !safe_multiply(est_max_src_images, static_cast<size_t>(1.2), safe_max_src_images) ||
+            !safe_multiply(est_max_pixels, static_cast<size_t>(1.2), safe_max_pixels)) {
             throw std::overflow_error("Buffer size calculation overflow");
         }
         
