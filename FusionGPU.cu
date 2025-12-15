@@ -1558,7 +1558,7 @@ void RunFusionCuda(const std::string &dense_folder,
             chunk_src_images += problem.src_image_ids.size();
             
             // Conservative pixel estimate
-            chunk_pixels += 1800 * 900;
+            chunk_pixels += 3200 * 1600;
         }
         
         est_max_src_images = std::max(est_max_src_images, chunk_src_images);
