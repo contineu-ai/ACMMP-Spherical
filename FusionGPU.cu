@@ -1,21 +1,20 @@
-// FULLY C++11 COMPATIBLE VERSION - All modern C++ features removed
-// FIXED: Mutex and atomic copy issues resolved
-// FIXED: Memory leaks with RAII wrappers
-// ADDED: Comprehensive warning system for failed chunks/images
+// FULLY C++11 COMPATIBLE VERSION - Memory Optimized
+// FIXED: Memory leaks and accumulation issues
+// FIXED: Limited async concurrency to prevent memory spikes
+// FIXED: Streaming point output to disk
+// FIXED: Reduced cache size and explicit deallocation
 
 #include "ACMMP.h"
 #include "ACMMP_device.cuh"
 #include "FusionGPU.h"
 
 #include "CompressedDMB.h"
-// CUDA headers must come first
 #include <cuda_runtime.h>
 #include <cuda.h>
 #include <device_launch_parameters.h>
 #include <curand_kernel.h>
 #include <math_constants.h>
 
-// C++ headers (C++11 compatible only)
 #include <memory>
 #include <unordered_set>
 #include <unordered_map>
@@ -39,7 +38,6 @@
 #include <condition_variable>
 #include <list>
 
-// Enhanced CUDA error checking macro
 #ifndef CUDA_SAFE_CALL
 #define CUDA_SAFE_CALL(call) do { \
     cudaError_t err = call; \
@@ -51,10 +49,49 @@
 #endif
 
 // ============================================================================
-// SECTION 1: RAII WRAPPERS FOR MEMORY SAFETY
+// SECTION 1: MEMORY MONITORING
 // ============================================================================
 
-// RAII wrapper for CUDA memory allocations
+class MemoryMonitor {
+public:
+    static void logUsage(const std::string& stage) {
+        std::ifstream status("/proc/self/status");
+        std::string line;
+        size_t vmrss = 0, vmhwm = 0;
+        
+        while (std::getline(status, line)) {
+            if (line.substr(0, 6) == "VmRSS:") {
+                std::istringstream iss(line.substr(6));
+                iss >> vmrss;
+            } else if (line.substr(0, 6) == "VmHWM:") {
+                std::istringstream iss(line.substr(6));
+                iss >> vmhwm;
+            }
+        }
+        
+        std::cout << "[Memory] " << stage << " - Current: " << (vmrss / 1024) 
+                  << " MB, Peak: " << (vmhwm / 1024) << " MB" << std::endl;
+    }
+    
+    static size_t getCurrentUsageMB() {
+        std::ifstream status("/proc/self/status");
+        std::string line;
+        while (std::getline(status, line)) {
+            if (line.substr(0, 6) == "VmRSS:") {
+                std::istringstream iss(line.substr(6));
+                size_t kb;
+                iss >> kb;
+                return kb / 1024;
+            }
+        }
+        return 0;
+    }
+};
+
+// ============================================================================
+// SECTION 2: RAII WRAPPERS FOR MEMORY SAFETY
+// ============================================================================
+
 template<typename T>
 class CudaMemoryGuard {
 private:
@@ -89,11 +126,9 @@ public:
     
     bool isAllocated() const { return ptr != nullptr; }
     
-    // Prevent copying
     CudaMemoryGuard(const CudaMemoryGuard&) = delete;
     CudaMemoryGuard& operator=(const CudaMemoryGuard&) = delete;
     
-    // Allow moving
     CudaMemoryGuard(CudaMemoryGuard&& other) : ptr(other.ptr), name(std::move(other.name)) { 
         other.ptr = nullptr; 
     }
@@ -108,7 +143,6 @@ public:
     }
 };
 
-// RAII wrapper for CUDA streams
 class CudaStreamGuard {
 private:
     cudaStream_t stream;
@@ -140,13 +174,12 @@ public:
         }
     }
     
-    // Prevent copying
     CudaStreamGuard(const CudaStreamGuard&) = delete;
     CudaStreamGuard& operator=(const CudaStreamGuard&) = delete;
 };
 
 // ============================================================================
-// SECTION 2: LOGGING AND FAILURE TRACKING
+// SECTION 3: LOGGING AND FAILURE TRACKING
 // ============================================================================
 
 enum class LogLevel { DEBUG, INFO, WARNING, ERROR };
@@ -280,7 +313,6 @@ public:
                 }
                 std::cout << std::endl;
                 
-                // Show first unique reason
                 if (!reasons_by_stage[pair.first].empty()) {
                     std::cout << "    Example reason: " << reasons_by_stage[pair.first][0] << std::endl;
                 }
@@ -313,7 +345,7 @@ public:
 };
 
 // ============================================================================
-// SECTION 3: SAFE ARITHMETIC AND UTILITY FUNCTIONS
+// SECTION 4: SAFE ARITHMETIC AND UTILITY FUNCTIONS
 // ============================================================================
 
 template<typename T>
@@ -329,7 +361,6 @@ bool safe_multiply(T a, T b, T& result) {
     return true;
 }
 
-// CUDA device function for efficient binary search
 __device__ int find_problem_id(int global_idx, int* problem_offsets, int num_problems) {
     int low = 0, high = num_problems;
     while (low < high) {
@@ -344,7 +375,128 @@ __device__ int find_problem_id(int global_idx, int* problem_offsets, int num_pro
 }
 
 // ============================================================================
-// SECTION 4: LOOKUP TABLES WITH EXCEPTION SAFETY
+// SECTION 5: STREAMING POINT WRITER
+// ============================================================================
+
+class StreamingPointWriter {
+private:
+    std::string temp_path;
+    std::ofstream temp_stream;
+    size_t point_count;
+    mutable std::mutex write_mutex;
+    
+public:
+    StreamingPointWriter(const std::string& output_folder) 
+        : point_count(0) {
+        temp_path = output_folder + "/ACMMP/points_temp.bin";
+        temp_stream.open(temp_path, std::ios::binary | std::ios::trunc);
+        if (!temp_stream.is_open()) {
+            throw std::runtime_error("Failed to open temp file: " + temp_path);
+        }
+        FusionLogger::info("StreamWriter", "Opened temp file: " + temp_path);
+    }
+    
+    ~StreamingPointWriter() {
+        if (temp_stream.is_open()) {
+            temp_stream.close();
+        }
+        // Clean up temp file if it exists
+        std::remove(temp_path.c_str());
+    }
+    
+    void writePoints(const std::vector<PointList>& points, const std::vector<int>& valid_flags) {
+        std::lock_guard<std::mutex> lock(write_mutex);
+        
+        for (size_t i = 0; i < points.size(); ++i) {
+            if (valid_flags[i]) {
+                temp_stream.write(reinterpret_cast<const char*>(&points[i]), sizeof(PointList));
+                point_count++;
+            }
+        }
+        temp_stream.flush();
+    }
+    
+    size_t getPointCount() const {
+        std::lock_guard<std::mutex> lock(write_mutex);
+        return point_count;
+    }
+    
+    void finalize(const std::string& output_path) {
+        std::lock_guard<std::mutex> lock(write_mutex);
+        
+        temp_stream.close();
+        
+        FusionLogger::info("StreamWriter", "Finalizing " + std::to_string(point_count) + " points to PLY");
+        
+        // Read back and write PLY
+        std::ifstream temp_read(temp_path, std::ios::binary);
+        if (!temp_read.is_open()) {
+            throw std::runtime_error("Failed to reopen temp file for reading");
+        }
+        
+        std::ofstream ply_file(output_path, std::ios::binary);
+        if (!ply_file.is_open()) {
+            throw std::runtime_error("Failed to open output PLY file: " + output_path);
+        }
+        
+        // Write PLY header
+        ply_file << "ply\n";
+        ply_file << "format binary_little_endian 1.0\n";
+        ply_file << "element vertex " << point_count << "\n";
+        ply_file << "property float x\n";
+        ply_file << "property float y\n";
+        ply_file << "property float z\n";
+        ply_file << "property float nx\n";
+        ply_file << "property float ny\n";
+        ply_file << "property float nz\n";
+        ply_file << "property uchar red\n";
+        ply_file << "property uchar green\n";
+        ply_file << "property uchar blue\n";
+        ply_file << "end_header\n";
+        
+        // Stream points from temp file to PLY
+        const size_t BATCH_SIZE = 100000;
+        std::vector<PointList> batch(BATCH_SIZE);
+        size_t written = 0;
+        
+        while (written < point_count) {
+            size_t to_read = std::min(BATCH_SIZE, point_count - written);
+            temp_read.read(reinterpret_cast<char*>(batch.data()), to_read * sizeof(PointList));
+            
+            for (size_t i = 0; i < to_read; ++i) {
+                const PointList& p = batch[i];
+                
+                ply_file.write(reinterpret_cast<const char*>(&p.coord.x), sizeof(float));
+                ply_file.write(reinterpret_cast<const char*>(&p.coord.y), sizeof(float));
+                ply_file.write(reinterpret_cast<const char*>(&p.coord.z), sizeof(float));
+                ply_file.write(reinterpret_cast<const char*>(&p.normal.x), sizeof(float));
+                ply_file.write(reinterpret_cast<const char*>(&p.normal.y), sizeof(float));
+                ply_file.write(reinterpret_cast<const char*>(&p.normal.z), sizeof(float));
+                
+                unsigned char r = static_cast<unsigned char>(std::min(255.0f, std::max(0.0f, p.color.x)));
+                unsigned char g = static_cast<unsigned char>(std::min(255.0f, std::max(0.0f, p.color.y)));
+                unsigned char b = static_cast<unsigned char>(std::min(255.0f, std::max(0.0f, p.color.z)));
+                
+                ply_file.write(reinterpret_cast<const char*>(&r), 1);
+                ply_file.write(reinterpret_cast<const char*>(&g), 1);
+                ply_file.write(reinterpret_cast<const char*>(&b), 1);
+            }
+            
+            written += to_read;
+        }
+        
+        temp_read.close();
+        ply_file.close();
+        
+        // Remove temp file
+        std::remove(temp_path.c_str());
+        
+        FusionLogger::info("StreamWriter", "Wrote " + std::to_string(point_count) + " points to " + output_path);
+    }
+};
+
+// ============================================================================
+// SECTION 6: LOOKUP TABLES WITH EXCEPTION SAFETY
 // ============================================================================
 
 struct ImageLookupTables {
@@ -381,7 +533,6 @@ struct ImageLookupTables {
     
     void buildTables(const std::vector<int>& camera_image_ids, 
                     const std::vector<int>& texture_image_ids) {
-        // Use temporary pointers for exception safety
         int* temp_camera_map = nullptr;
         int* temp_texture_map = nullptr;
         
@@ -421,7 +572,6 @@ struct ImageLookupTables {
             CUDA_SAFE_CALL(cudaMemcpy(temp_texture_map, texture_map.data(), 
                                       map_size, cudaMemcpyHostToDevice));
             
-            // Success - transfer ownership
             d_image_to_camera_map = temp_camera_map;
             d_image_to_texture_map = temp_texture_map;
             temp_camera_map = nullptr;
@@ -440,7 +590,7 @@ struct ImageLookupTables {
 };
 
 // ============================================================================
-// SECTION 5: THREAD POOL (C++11 COMPATIBLE)
+// SECTION 7: THREAD POOL (C++11 COMPATIBLE)
 // ============================================================================
 
 class EfficientThreadPool {
@@ -552,7 +702,7 @@ private:
 };
 
 // ============================================================================
-// SECTION 6: PERSISTENT GPU BUFFERS
+// SECTION 8: PERSISTENT GPU BUFFERS
 // ============================================================================
 
 class PersistentGPUBuffers {
@@ -763,7 +913,7 @@ public:
 };
 
 // ============================================================================
-// SECTION 7: IMAGE DATA AND OPTIMIZED DATA LOADER
+// SECTION 9: IMAGE DATA AND OPTIMIZED DATA LOADER
 // ============================================================================
 
 struct ImageData {
@@ -863,7 +1013,6 @@ private:
         bool depth_loaded = false;
         std::string depth_error;
         
-        // Try compressed format first
         ret = snprintf(buf, sizeof(buf), "%s/ACMMP/2333_%08d%s.cdmb", 
                       dense_folder.c_str(), image_id, depth_suffix.c_str());
         if (ret >= 0 && ret < static_cast<int>(sizeof(buf))) {
@@ -883,7 +1032,6 @@ private:
             }
         }
         
-        // Fall back to .dmb
         if (!depth_loaded) {
             ret = snprintf(buf, sizeof(buf), "%s/ACMMP/2333_%08d%s.dmb", 
                           dense_folder.c_str(), image_id, depth_suffix.c_str());
@@ -920,7 +1068,6 @@ private:
         bool normal_loaded = false;
         std::string normal_error;
         
-        // Try compressed format first
         ret = snprintf(buf, sizeof(buf), "%s/ACMMP/2333_%08d/normals.cdmb", dense_folder.c_str(), image_id);
         if (ret >= 0 && ret < static_cast<int>(sizeof(buf))) {
             std::string cdmb_path(buf);
@@ -939,7 +1086,6 @@ private:
             }
         }
         
-        // Fall back to .dmb
         if (!normal_loaded) {
             ret = snprintf(buf, sizeof(buf), "%s/ACMMP/2333_%08d/normals.dmb", dense_folder.c_str(), image_id);
             if (ret < 0 || ret >= static_cast<int>(sizeof(buf))) {
@@ -971,7 +1117,6 @@ private:
             return data;
         }
         
-        // Check dimension consistency
         if (data->depth.cols != data->normal.cols || data->depth.rows != data->normal.rows) {
             if (tracker) tracker->recordImageFailure(image_id, "normal", 
                 "Dimension mismatch with depth: depth=" + std::to_string(data->depth.cols) + "x" + 
@@ -991,15 +1136,14 @@ private:
         data->image = cv::imread(img_path, cv::IMREAD_COLOR);
         
         if (data->image.empty()) {
-            // Try PNG
-            ret = snprintf(buf, sizeof(buf), "%s/%08d.png", img_folder.c_str(), image_id);
+            ret = snprintf(buf, sizeof(buf), "%s/%08d.jpg", img_folder.c_str(), image_id);
             if (ret >= 0 && ret < static_cast<int>(sizeof(buf))) {
                 data->image = cv::imread(std::string(buf), cv::IMREAD_COLOR);
             }
             
             if (data->image.empty()) {
                 if (tracker) tracker->recordImageFailure(image_id, "image", 
-                    "Failed to load (tried .png and .png): " + img_path);
+                    "Failed to load (tried .png and .jpg): " + img_path);
                 return data;
             }
         }
@@ -1034,17 +1178,18 @@ private:
     }
 
 public:
-    OptimizedDataLoader(const std::string& folder, bool geom = false, size_t cache_size = 100) 
+    // REDUCED cache size from 200 to 50
+    OptimizedDataLoader(const std::string& folder, bool geom = false, size_t cache_size = 50) 
         : dense_folder(folder), geom_consistency(geom), max_cache_size(cache_size), tracker(nullptr) {
         img_folder = folder + "/images";
         cam_folder = folder + "/cams";
         
         unsigned int hw_threads = std::thread::hardware_concurrency();
-        size_t io_threads = std::min(static_cast<size_t>(16), std::max(static_cast<size_t>(4), static_cast<size_t>(hw_threads)));
+        size_t io_threads = std::min(static_cast<size_t>(8), std::max(static_cast<size_t>(4), static_cast<size_t>(hw_threads / 2)));
         
         thread_pool.reset(new EfficientThreadPool(io_threads));
         
-        std::cout << "[OptimizedLoader] Using " << io_threads << " threads for parallel I/O" << std::endl;
+        std::cout << "[OptimizedLoader] Using " << io_threads << " threads, cache size " << cache_size << std::endl;
     }
     
     void setFailureTracker(FailureTracker* t) {
@@ -1136,10 +1281,26 @@ public:
         lru_order.clear();
         lru_map.clear();
     }
+    
+    // Force eviction of specific images
+    void evictImages(const std::vector<int>& image_ids) {
+        std::unique_lock<std::mutex> lock(cache_mutex);
+        for (int id : image_ids) {
+            auto cache_it = cache.find(id);
+            if (cache_it != cache.end()) {
+                cache.erase(cache_it);
+            }
+            auto lru_it = lru_map.find(id);
+            if (lru_it != lru_map.end()) {
+                lru_order.erase(lru_it->second);
+                lru_map.erase(lru_it);
+            }
+        }
+    }
 };
 
 // ============================================================================
-// SECTION 8: TEXTURE MANAGER
+// SECTION 10: TEXTURE MANAGER (WITH LIMITED CONCURRENCY)
 // ============================================================================
 
 class OptimizedTextureManager {
@@ -1181,6 +1342,9 @@ private:
     
     FailureTracker* tracker;
     
+    // CRITICAL: Limit concurrent texture loading to prevent memory spikes
+    static const size_t MAX_CONCURRENT_TEXTURE_LOADS = 4;
+    
     void release() {
         std::lock_guard<std::mutex> lock(texture_mutex);
         
@@ -1202,6 +1366,183 @@ private:
         textures.clear();
         current_image_ids.clear();
         loaded.store(false);
+    }
+    
+    // Single texture load function
+    bool loadSingleTexture(size_t idx, int image_id, OptimizedDataLoader& loader, 
+                           std::atomic<size_t>& successful_textures) {
+        cudaStream_t stream = streams[idx % num_streams];
+        
+        Camera cam;
+        cv::Mat_<float> depth;
+        cv::Mat_<cv::Vec3f> normal;
+        cv::Mat image;
+        
+        if (!loader.getData(image_id, cam, depth, normal, image)) {
+            if (tracker) tracker->recordImageFailure(image_id, "texture_data", 
+                "Failed to retrieve cached data");
+            return false;
+        }
+        
+        TextureData& tex = *textures[idx];
+        
+        try {
+            // Create depth texture
+            cudaChannelFormatDesc depth_desc = cudaCreateChannelDesc<float>();
+            cudaError_t err = cudaMallocArray(&tex.depth_array, &depth_desc, cam.width, cam.height);
+            if (err != cudaSuccess) {
+                if (tracker) tracker->recordImageFailure(image_id, "texture_depth_alloc", 
+                    cudaGetErrorString(err));
+                return false;
+            }
+            
+            err = cudaMemcpy2DToArrayAsync(tex.depth_array, 0, 0, 
+                                           depth.ptr<float>(), depth.step[0], 
+                                           cam.width * sizeof(float), cam.height, 
+                                           cudaMemcpyHostToDevice, stream);
+            if (err != cudaSuccess) {
+                if (tracker) tracker->recordImageFailure(image_id, "texture_depth_copy", 
+                    cudaGetErrorString(err));
+                tex.cleanup();
+                return false;
+            }
+            
+            cudaResourceDesc depth_res_desc = {};
+            depth_res_desc.resType = cudaResourceTypeArray;
+            depth_res_desc.res.array.array = tex.depth_array;
+            
+            cudaTextureDesc depth_tex_desc = {};
+            depth_tex_desc.addressMode[0] = cudaAddressModeWrap;
+            depth_tex_desc.addressMode[1] = cudaAddressModeClamp;
+            depth_tex_desc.filterMode = cudaFilterModePoint;
+            depth_tex_desc.readMode = cudaReadModeElementType;
+            depth_tex_desc.normalizedCoords = false;
+            
+            err = cudaCreateTextureObject(&tex.depth_texture, &depth_res_desc, &depth_tex_desc, NULL);
+            if (err != cudaSuccess) {
+                if (tracker) tracker->recordImageFailure(image_id, "texture_depth_create", 
+                    cudaGetErrorString(err));
+                tex.cleanup();
+                return false;
+            }
+            
+            // Create normal texture - use scoped allocation to ensure cleanup
+            {
+                cv::Mat normal_rgba = cv::Mat(normal.rows, normal.cols, CV_32FC4, 
+                                              cv::Scalar(0.0f, 0.0f, 0.0f, 0.0f));
+                cv::Mat src_mats[1] = {normal};
+                cv::Mat dst_mats[1] = {normal_rgba};
+                int from_to[6] = {0, 0, 1, 1, 2, 2};
+                cv::mixChannels(src_mats, 1, dst_mats, 1, from_to, 3);
+                
+                cudaChannelFormatDesc normal_desc = cudaCreateChannelDesc<float4>();
+                err = cudaMallocArray(&tex.normal_array, &normal_desc, cam.width, cam.height);
+                if (err != cudaSuccess) {
+                    if (tracker) tracker->recordImageFailure(image_id, "texture_normal_alloc", 
+                        cudaGetErrorString(err));
+                    tex.cleanup();
+                    return false;
+                }
+                
+                err = cudaMemcpy2DToArrayAsync(tex.normal_array, 0, 0, 
+                                               normal_rgba.ptr<float>(), normal_rgba.step[0], 
+                                               cam.width * sizeof(float4), cam.height, 
+                                               cudaMemcpyHostToDevice, stream);
+                if (err != cudaSuccess) {
+                    if (tracker) tracker->recordImageFailure(image_id, "texture_normal_copy", 
+                        cudaGetErrorString(err));
+                    tex.cleanup();
+                    return false;
+                }
+            } // normal_rgba goes out of scope here, freeing memory
+            
+            cudaResourceDesc normal_res_desc = {};
+            normal_res_desc.resType = cudaResourceTypeArray;
+            normal_res_desc.res.array.array = tex.normal_array;
+            
+            cudaTextureDesc normal_tex_desc = {};
+            normal_tex_desc.addressMode[0] = cudaAddressModeWrap;
+            normal_tex_desc.addressMode[1] = cudaAddressModeClamp;
+            normal_tex_desc.filterMode = cudaFilterModePoint;
+            normal_tex_desc.readMode = cudaReadModeElementType;
+            normal_tex_desc.normalizedCoords = false;
+            
+            err = cudaCreateTextureObject(&tex.normal_texture, &normal_res_desc, &normal_tex_desc, NULL);
+            if (err != cudaSuccess) {
+                if (tracker) tracker->recordImageFailure(image_id, "texture_normal_create", 
+                    cudaGetErrorString(err));
+                tex.cleanup();
+                return false;
+            }
+            
+            // Create image texture - use scoped allocation
+            {
+                cv::Mat rgba, rgba_float;
+                cv::cvtColor(image, rgba, cv::COLOR_BGR2RGBA);
+                rgba.convertTo(rgba_float, CV_32FC4, 1.0/255.0);
+                rgba.release(); // Explicitly release intermediate
+                
+                cudaChannelFormatDesc image_desc = cudaCreateChannelDesc<float4>();
+                err = cudaMallocArray(&tex.image_array, &image_desc, cam.width, cam.height);
+                if (err != cudaSuccess) {
+                    if (tracker) tracker->recordImageFailure(image_id, "texture_image_alloc", 
+                        cudaGetErrorString(err));
+                    tex.cleanup();
+                    return false;
+                }
+                
+                err = cudaMemcpy2DToArrayAsync(tex.image_array, 0, 0, 
+                                               rgba_float.ptr<float>(), rgba_float.step[0], 
+                                               cam.width * sizeof(float4), cam.height, 
+                                               cudaMemcpyHostToDevice, stream);
+                if (err != cudaSuccess) {
+                    if (tracker) tracker->recordImageFailure(image_id, "texture_image_copy", 
+                        cudaGetErrorString(err));
+                    tex.cleanup();
+                    return false;
+                }
+            } // rgba_float goes out of scope here
+            
+            cudaResourceDesc image_res_desc = {};
+            image_res_desc.resType = cudaResourceTypeArray;
+            image_res_desc.res.array.array = tex.image_array;
+            
+            cudaTextureDesc image_tex_desc = {};
+            image_tex_desc.addressMode[0] = cudaAddressModeWrap;
+            image_tex_desc.addressMode[1] = cudaAddressModeClamp;
+            image_tex_desc.filterMode = cudaFilterModeLinear;
+            image_tex_desc.readMode = cudaReadModeElementType;
+            image_tex_desc.normalizedCoords = false;
+            
+            err = cudaCreateTextureObject(&tex.image_texture, &image_res_desc, &image_tex_desc, NULL);
+            if (err != cudaSuccess) {
+                if (tracker) tracker->recordImageFailure(image_id, "texture_image_create", 
+                    cudaGetErrorString(err));
+                tex.cleanup();
+                return false;
+            }
+            
+            err = cudaStreamSynchronize(stream);
+            if (err != cudaSuccess) {
+                if (tracker) tracker->recordImageFailure(image_id, "texture_sync", 
+                    cudaGetErrorString(err));
+                tex.cleanup();
+                return false;
+            }
+            
+            tex.is_valid = true;
+            successful_textures.fetch_add(1);
+            return true;
+            
+        } catch (const std::exception& e) {
+            if (tracker) tracker->recordImageFailure(image_id, "texture_exception", e.what());
+            tex.cleanup();
+            return false;
+        } catch (...) {
+            if (tracker) tracker->recordImageFailure(image_id, "texture_exception", "Unknown exception");
+            tex.cleanup();
+            return false;
+        }
     }
 
 public:
@@ -1243,191 +1584,30 @@ public:
         }
         
         std::atomic<size_t> successful_textures(0);
-        std::vector<std::future<bool>> texture_futures;
         
-        for (size_t i = 0; i < image_ids.size(); ++i) {
-            auto future = std::async(std::launch::async, 
-                [this, i, &image_ids, &loader, &successful_textures, chunk_idx]() {
-                
-                int image_id = image_ids[i];
-                cudaStream_t stream = streams[i % num_streams];
-                
-                Camera cam;
-                cv::Mat_<float> depth;
-                cv::Mat_<cv::Vec3f> normal;
-                cv::Mat image;
-                
-                if (!loader.getData(image_id, cam, depth, normal, image)) {
-                    if (tracker) tracker->recordImageFailure(image_id, "texture_data", 
-                        "Failed to retrieve cached data");
-                    return false;
-                }
-                
-                TextureData& tex = *textures[i];
-                
-                try {
-                    // Create depth texture
-                    cudaChannelFormatDesc depth_desc = cudaCreateChannelDesc<float>();
-                    cudaError_t err = cudaMallocArray(&tex.depth_array, &depth_desc, cam.width, cam.height);
-                    if (err != cudaSuccess) {
-                        if (tracker) tracker->recordImageFailure(image_id, "texture_depth_alloc", 
-                            cudaGetErrorString(err));
-                        return false;
-                    }
-                    
-                    err = cudaMemcpy2DToArrayAsync(tex.depth_array, 0, 0, 
-                                                   depth.ptr<float>(), depth.step[0], 
-                                                   cam.width * sizeof(float), cam.height, 
-                                                   cudaMemcpyHostToDevice, stream);
-                    if (err != cudaSuccess) {
-                        if (tracker) tracker->recordImageFailure(image_id, "texture_depth_copy", 
-                            cudaGetErrorString(err));
-                        tex.cleanup();
-                        return false;
-                    }
-                    
-                    cudaResourceDesc depth_res_desc = {};
-                    depth_res_desc.resType = cudaResourceTypeArray;
-                    depth_res_desc.res.array.array = tex.depth_array;
-                    
-                    cudaTextureDesc depth_tex_desc = {};
-                    depth_tex_desc.addressMode[0] = cudaAddressModeWrap;
-                    depth_tex_desc.addressMode[1] = cudaAddressModeClamp;
-                    depth_tex_desc.filterMode = cudaFilterModePoint;
-                    depth_tex_desc.readMode = cudaReadModeElementType;
-                    depth_tex_desc.normalizedCoords = false;
-                    
-                    err = cudaCreateTextureObject(&tex.depth_texture, &depth_res_desc, &depth_tex_desc, NULL);
-                    if (err != cudaSuccess) {
-                        if (tracker) tracker->recordImageFailure(image_id, "texture_depth_create", 
-                            cudaGetErrorString(err));
-                        tex.cleanup();
-                        return false;
-                    }
-                    
-                    // Create normal texture
-                    cv::Mat normal_rgba = cv::Mat(normal.rows, normal.cols, CV_32FC4, 
-                                                  cv::Scalar(0.0f, 0.0f, 0.0f, 0.0f));
-                    cv::Mat src_mats[1] = {normal};
-                    cv::Mat dst_mats[1] = {normal_rgba};
-                    int from_to[6] = {0, 0, 1, 1, 2, 2};
-                    cv::mixChannels(src_mats, 1, dst_mats, 1, from_to, 3);
-                    
-                    cudaChannelFormatDesc normal_desc = cudaCreateChannelDesc<float4>();
-                    err = cudaMallocArray(&tex.normal_array, &normal_desc, cam.width, cam.height);
-                    if (err != cudaSuccess) {
-                        if (tracker) tracker->recordImageFailure(image_id, "texture_normal_alloc", 
-                            cudaGetErrorString(err));
-                        tex.cleanup();
-                        return false;
-                    }
-                    
-                    err = cudaMemcpy2DToArrayAsync(tex.normal_array, 0, 0, 
-                                                   normal_rgba.ptr<float>(), normal_rgba.step[0], 
-                                                   cam.width * sizeof(float4), cam.height, 
-                                                   cudaMemcpyHostToDevice, stream);
-                    if (err != cudaSuccess) {
-                        if (tracker) tracker->recordImageFailure(image_id, "texture_normal_copy", 
-                            cudaGetErrorString(err));
-                        tex.cleanup();
-                        return false;
-                    }
-                    
-                    cudaResourceDesc normal_res_desc = {};
-                    normal_res_desc.resType = cudaResourceTypeArray;
-                    normal_res_desc.res.array.array = tex.normal_array;
-                    
-                    cudaTextureDesc normal_tex_desc = {};
-                    normal_tex_desc.addressMode[0] = cudaAddressModeWrap;
-                    normal_tex_desc.addressMode[1] = cudaAddressModeClamp;
-                    normal_tex_desc.filterMode = cudaFilterModePoint;
-                    normal_tex_desc.readMode = cudaReadModeElementType;
-                    normal_tex_desc.normalizedCoords = false;
-                    
-                    err = cudaCreateTextureObject(&tex.normal_texture, &normal_res_desc, &normal_tex_desc, NULL);
-                    if (err != cudaSuccess) {
-                        if (tracker) tracker->recordImageFailure(image_id, "texture_normal_create", 
-                            cudaGetErrorString(err));
-                        tex.cleanup();
-                        return false;
-                    }
-                    
-                    // Create image texture
-                    cv::Mat rgba, rgba_float;
-                    cv::cvtColor(image, rgba, cv::COLOR_BGR2RGBA);
-                    rgba.convertTo(rgba_float, CV_32FC4, 1.0/255.0);
-                    
-                    cudaChannelFormatDesc image_desc = cudaCreateChannelDesc<float4>();
-                    err = cudaMallocArray(&tex.image_array, &image_desc, cam.width, cam.height);
-                    if (err != cudaSuccess) {
-                        if (tracker) tracker->recordImageFailure(image_id, "texture_image_alloc", 
-                            cudaGetErrorString(err));
-                        tex.cleanup();
-                        return false;
-                    }
-                    
-                    err = cudaMemcpy2DToArrayAsync(tex.image_array, 0, 0, 
-                                                   rgba_float.ptr<float>(), rgba_float.step[0], 
-                                                   cam.width * sizeof(float4), cam.height, 
-                                                   cudaMemcpyHostToDevice, stream);
-                    if (err != cudaSuccess) {
-                        if (tracker) tracker->recordImageFailure(image_id, "texture_image_copy", 
-                            cudaGetErrorString(err));
-                        tex.cleanup();
-                        return false;
-                    }
-                    
-                    cudaResourceDesc image_res_desc = {};
-                    image_res_desc.resType = cudaResourceTypeArray;
-                    image_res_desc.res.array.array = tex.image_array;
-                    
-                    cudaTextureDesc image_tex_desc = {};
-                    image_tex_desc.addressMode[0] = cudaAddressModeWrap;
-                    image_tex_desc.addressMode[1] = cudaAddressModeClamp;
-                    image_tex_desc.filterMode = cudaFilterModeLinear;
-                    image_tex_desc.readMode = cudaReadModeElementType;
-                    image_tex_desc.normalizedCoords = false;
-                    
-                    err = cudaCreateTextureObject(&tex.image_texture, &image_res_desc, &image_tex_desc, NULL);
-                    if (err != cudaSuccess) {
-                        if (tracker) tracker->recordImageFailure(image_id, "texture_image_create", 
-                            cudaGetErrorString(err));
-                        tex.cleanup();
-                        return false;
-                    }
-                    
-                    err = cudaStreamSynchronize(stream);
-                    if (err != cudaSuccess) {
-                        if (tracker) tracker->recordImageFailure(image_id, "texture_sync", 
-                            cudaGetErrorString(err));
-                        tex.cleanup();
-                        return false;
-                    }
-                    
-                    tex.is_valid = true;
-                    successful_textures.fetch_add(1);
-                    return true;
-                    
-                } catch (const std::exception& e) {
-                    if (tracker) tracker->recordImageFailure(image_id, "texture_exception", e.what());
-                    tex.cleanup();
-                    return false;
-                } catch (...) {
-                    if (tracker) tracker->recordImageFailure(image_id, "texture_exception", "Unknown exception");
-                    tex.cleanup();
-                    return false;
-                }
-            });
+        // CRITICAL FIX: Process in batches to limit memory usage
+        for (size_t batch_start = 0; batch_start < image_ids.size(); batch_start += MAX_CONCURRENT_TEXTURE_LOADS) {
+            size_t batch_end = std::min(batch_start + MAX_CONCURRENT_TEXTURE_LOADS, image_ids.size());
             
-            texture_futures.push_back(std::move(future));
-        }
-        
-        for (auto& future : texture_futures) {
-            future.get();
-        }
-        
-        for (int i = 0; i < num_streams; ++i) {
-            cudaStreamSynchronize(streams[i]);
+            std::vector<std::future<bool>> batch_futures;
+            
+            for (size_t i = batch_start; i < batch_end; ++i) {
+                auto future = std::async(std::launch::async, 
+                    [this, i, &image_ids, &loader, &successful_textures]() {
+                        return loadSingleTexture(i, image_ids[i], loader, successful_textures);
+                    });
+                batch_futures.push_back(std::move(future));
+            }
+            
+            // Wait for this batch to complete before starting next
+            for (auto& future : batch_futures) {
+                future.get();
+            }
+            
+            // Sync streams after each batch
+            for (int s = 0; s < num_streams; ++s) {
+                cudaStreamSynchronize(streams[s]);
+            }
         }
         
         size_t final_count = successful_textures.load();
@@ -1491,7 +1671,7 @@ public:
 };
 
 // ============================================================================
-// SECTION 9: CUDA KERNEL
+// SECTION 11: CUDA KERNEL
 // ============================================================================
 
 __global__ void CorrectedChunkBatchKernel(
@@ -1712,7 +1892,7 @@ __global__ void CorrectedChunkBatchKernel(
 }
 
 // ============================================================================
-// SECTION 10: CHUNKING STRATEGY
+// SECTION 12: CHUNKING STRATEGY
 // ============================================================================
 
 std::vector<std::vector<size_t>> createSmartChunks(const std::vector<Problem>& problems, 
@@ -1749,7 +1929,7 @@ std::vector<std::vector<size_t>> createSmartChunks(const std::vector<Problem>& p
 }
 
 // ============================================================================
-// SECTION 11: MAIN FUSION FUNCTION
+// SECTION 13: MAIN FUSION FUNCTION
 // ============================================================================
 
 void RunFusionCuda(const std::string &dense_folder,
@@ -1758,8 +1938,8 @@ void RunFusionCuda(const std::string &dense_folder,
                    size_t max_images_per_chunk)
 {
     FusionLogger::info("Fusion", "Starting with " + std::to_string(problems.size()) + " problems...");
+    MemoryMonitor::logUsage("Start");
     
-    // Create failure tracker
     FailureTracker tracker;
     
     if (problems.empty()) {
@@ -1771,7 +1951,6 @@ void RunFusionCuda(const std::string &dense_folder,
         max_images_per_chunk = 50;
     }
     
-    // Estimate buffer sizes
     size_t est_max_textures = max_images_per_chunk;
     size_t est_max_problems = 0;
     size_t est_max_src_images = 0;
@@ -1801,8 +1980,8 @@ void RunFusionCuda(const std::string &dense_folder,
                       + std::to_string(est_max_problems) + " problems, " 
                       + std::to_string(est_max_pixels) + " pixels");
     
-    // Initialize managers
-    OptimizedDataLoader loader(dense_folder, geom_consistency, 200);
+    // REDUCED cache size from 200 to 50
+    OptimizedDataLoader loader(dense_folder, geom_consistency, 50);
     loader.setFailureTracker(&tracker);
     
     OptimizedTextureManager texture_manager;
@@ -1811,14 +1990,17 @@ void RunFusionCuda(const std::string &dense_folder,
     PersistentGPUBuffers gpu_buffers;
     ImageLookupTables lookup_tables;
     
-    // RAII guards for persistent GPU memory
     CudaMemoryGuard<Camera> cameras_cuda_guard("cameras");
     CudaMemoryGuard<int> camera_image_ids_cuda_guard("camera_ids");
     
+    // Initialize streaming point writer
+    std::unique_ptr<StreamingPointWriter> point_writer;
+    
     try {
+        point_writer.reset(new StreamingPointWriter(dense_folder));
+        
         gpu_buffers.allocateBuffers(est_max_textures, est_max_problems, est_max_src_images, est_max_pixels);
         
-        // Collect all unique image IDs
         std::unordered_set<int> all_image_ids;
         for (const auto& problem : problems) {
             all_image_ids.insert(problem.ref_image_id);
@@ -1849,7 +2031,6 @@ void RunFusionCuda(const std::string &dense_folder,
                     continue;
                 }
                 
-                // Load depth to get true resolution
                 std::string depth_suffix = geom_consistency ? "/depths_geom.dmb" : "/depths.dmb";
                 char depth_buf[512];
                 ret = snprintf(depth_buf, sizeof(depth_buf), "%s/ACMMP/2333_%08d%s", 
@@ -1860,7 +2041,6 @@ void RunFusionCuda(const std::string &dense_folder,
                 if (readDepthDmb(std::string(depth_buf), depth) != 0) continue;
                 if (depth.cols <= 0 || depth.rows <= 0) continue;
                 
-                // Load image to calculate scale
                 char img_buf[512];
                 ret = snprintf(img_buf, sizeof(img_buf), "%s/images/%08d.png", 
                             dense_folder.c_str(), image_id);
@@ -1869,7 +2049,6 @@ void RunFusionCuda(const std::string &dense_folder,
                 cv::Mat image = cv::imread(std::string(img_buf), cv::IMREAD_COLOR);
                 if (image.empty()) continue;
                 
-                // Calculate scale factors and adjust camera
                 float scale_x = (float)depth.cols / (float)image.cols;
                 float scale_y = (float)depth.rows / (float)image.rows;
                 
@@ -1898,13 +2077,14 @@ void RunFusionCuda(const std::string &dense_folder,
         FusionLogger::info("CameraLoad", "Loaded " + std::to_string(all_cameras.size()) + 
                           "/" + std::to_string(all_image_ids.size()) + " cameras successfully");
         
+        MemoryMonitor::logUsage("After camera load");
+        
         if (all_cameras.empty()) {
             FusionLogger::error("Fusion", "No valid cameras found - cannot proceed");
             tracker.printSummary();
             return;
         }
         
-        // Copy cameras to GPU using RAII guards
         cameras_cuda_guard.alloc(all_cameras.size());
         camera_image_ids_cuda_guard.alloc(camera_image_ids.size());
         
@@ -1913,10 +2093,8 @@ void RunFusionCuda(const std::string &dense_folder,
         CUDA_SAFE_CALL(cudaMemcpy(camera_image_ids_cuda_guard.get(), camera_image_ids.data(), 
                                    camera_image_ids.size() * sizeof(int), cudaMemcpyHostToDevice));
         
-        std::vector<PointList> all_points;
         auto total_start = std::chrono::high_resolution_clock::now();
         
-        // Process each chunk
         for (size_t chunk_idx = 0; chunk_idx < chunks.size(); ++chunk_idx) {
             const auto& chunk = chunks[chunk_idx];
             
@@ -1924,7 +2102,8 @@ void RunFusionCuda(const std::string &dense_folder,
                               "/" + std::to_string(chunks.size()) + 
                               " (" + std::to_string(chunk.size()) + " problems)");
             
-            // Get unique images for this chunk
+            MemoryMonitor::logUsage("Chunk " + std::to_string(chunk_idx) + " start");
+            
             std::unordered_set<int> chunk_images;
             for (size_t prob_idx : chunk) {
                 if (prob_idx >= problems.size()) {
@@ -1941,17 +2120,18 @@ void RunFusionCuda(const std::string &dense_folder,
             std::vector<int> chunk_image_ids(chunk_images.begin(), chunk_images.end());
             FusionLogger::info("Chunk", "  Unique images: " + std::to_string(chunk_image_ids.size()));
             
-            // Preload chunk data
             loader.preloadChunkParallel(chunk_image_ids);
             
-            // Load chunk textures
+            MemoryMonitor::logUsage("Chunk " + std::to_string(chunk_idx) + " after preload");
+            
             if (!texture_manager.loadChunk(chunk_image_ids, loader, chunk_idx)) {
                 tracker.recordChunkFailure(chunk_idx, "texture_load", 
                     "No textures successfully loaded", chunk_image_ids, chunk.size());
                 continue;
             }
             
-            // Build lookup tables
+            MemoryMonitor::logUsage("Chunk " + std::to_string(chunk_idx) + " after texture load");
+            
             const auto& texture_image_ids = texture_manager.getValidImageIds();
             if (texture_image_ids.empty()) {
                 tracker.recordChunkFailure(chunk_idx, "lookup_tables", 
@@ -1961,7 +2141,6 @@ void RunFusionCuda(const std::string &dense_folder,
             
             lookup_tables.buildTables(camera_image_ids, texture_image_ids);
             
-            // Prepare batch data
             std::vector<int> ref_image_ids;
             std::vector<int> all_src_image_ids;
             std::vector<int> src_counts;
@@ -2027,7 +2206,6 @@ void RunFusionCuda(const std::string &dense_folder,
                 continue;
             }
             
-            // Get texture data
             const auto& depth_textures = texture_manager.getDepthTextures();
             const auto& normal_textures = texture_manager.getNormalTextures();
             const auto& image_textures = texture_manager.getImageTextures();
@@ -2041,7 +2219,6 @@ void RunFusionCuda(const std::string &dense_folder,
                 continue;
             }
             
-            // Get persistent buffers
             auto depth_textures_cuda = gpu_buffers.getDepthTexturesBuffer(depth_textures.size());
             auto normal_textures_cuda = gpu_buffers.getNormalTexturesBuffer(normal_textures.size());
             auto image_textures_cuda = gpu_buffers.getImageTexturesBuffer(image_textures.size());
@@ -2056,7 +2233,6 @@ void RunFusionCuda(const std::string &dense_folder,
             auto output_points_cuda = gpu_buffers.getOutputPointsBuffer(total_pixels);
             auto valid_flags_cuda = gpu_buffers.getValidFlagsBuffer(total_pixels);
             
-            // Use RAII stream guard for async copies
             {
                 CudaStreamGuard copy_stream;
                 if (!copy_stream.isValid()) {
@@ -2102,9 +2278,8 @@ void RunFusionCuda(const std::string &dense_folder,
                 CUDA_SAFE_CALL(cudaMemsetAsync(valid_flags_cuda, 0, total_pixels * sizeof(int), copy_stream.get()));
                 
                 copy_stream.synchronize();
-            }  // Stream automatically destroyed here
+            }
             
-            // Launch kernel
             int block_size = 256;
             int grid_size = (total_pixels + block_size - 1) / block_size;
             
@@ -2137,7 +2312,6 @@ void RunFusionCuda(const std::string &dense_folder,
                 pole_exclusion_degrees
             );
             
-            // Check for kernel errors
             cudaError_t kernel_err = cudaGetLastError();
             if (kernel_err != cudaSuccess) {
                 tracker.recordChunkFailure(chunk_idx, "kernel_launch", 
@@ -2157,7 +2331,7 @@ void RunFusionCuda(const std::string &dense_folder,
             auto chunk_end = std::chrono::high_resolution_clock::now();
             auto chunk_duration = std::chrono::duration_cast<std::chrono::milliseconds>(chunk_end - chunk_start);
             
-            // Copy results back
+            // Copy results and stream to disk immediately
             std::vector<PointList> chunk_points(total_pixels);
             std::vector<int> valid_flags_host(total_pixels);
             
@@ -2166,14 +2340,17 @@ void RunFusionCuda(const std::string &dense_folder,
             CUDA_SAFE_CALL(cudaMemcpy(valid_flags_host.data(), valid_flags_cuda, 
                                       total_pixels * sizeof(int), cudaMemcpyDeviceToHost));
             
-            // Collect valid points
+            // Stream points to disk instead of accumulating in memory
             size_t chunk_valid_count = 0;
             for (int i = 0; i < total_pixels; ++i) {
-                if (valid_flags_host[i]) {
-                    all_points.push_back(chunk_points[i]);
-                    chunk_valid_count++;
-                }
+                if (valid_flags_host[i]) chunk_valid_count++;
             }
+            
+            point_writer->writePoints(chunk_points, valid_flags_host);
+            
+            // CRITICAL: Force deallocation of chunk vectors
+            std::vector<PointList>().swap(chunk_points);
+            std::vector<int>().swap(valid_flags_host);
             
             float valid_ratio = (float)chunk_valid_count / total_pixels * 100.0f;
             
@@ -2184,28 +2361,30 @@ void RunFusionCuda(const std::string &dense_folder,
             if (valid_ratio < 1.0f) {
                 FusionLogger::warning("Chunk", "  Very low valid point ratio - possible data issue");
             }
+            
+            MemoryMonitor::logUsage("Chunk " + std::to_string(chunk_idx) + " end");
         }
         
         auto total_end = std::chrono::high_resolution_clock::now();
         auto total_duration = std::chrono::duration_cast<std::chrono::seconds>(total_end - total_start);
         
-        FusionLogger::info("Fusion", "Generated " + std::to_string(all_points.size()) + 
+        size_t total_points = point_writer->getPointCount();
+        FusionLogger::info("Fusion", "Generated " + std::to_string(total_points) + 
                           " points total in " + std::to_string(total_duration.count()) + " seconds");
         
-        // Write output
+        // Finalize output
         std::string output_path = dense_folder + "/ACMMP/ACMM_model.ply";
-        StoreColorPlyFileBinaryPointCloud(output_path, all_points);
+        point_writer->finalize(output_path);
         
         FusionLogger::info("Fusion", "Output written to: " + output_path);
         FusionLogger::info("Fusion", "Final cache size: " + std::to_string(loader.getCacheSize()) + " images");
         
-        // Print failure summary
+        MemoryMonitor::logUsage("Final");
         tracker.printSummary();
-        
-        // No manual cleanup needed - RAII guards handle everything
         
     } catch (const std::exception& e) {
         FusionLogger::error("Fusion", std::string("Fatal error: ") + e.what());
+        MemoryMonitor::logUsage("Error state");
         tracker.printSummary();
         throw;
     }
