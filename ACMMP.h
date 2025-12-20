@@ -74,6 +74,8 @@ public:
     int GetReferenceImageWidth();
     int GetReferenceImageHeight();
     cv::Mat GetReferenceImage();
+    cv::Mat GetReferenceMask();  // Get reference mask for filtering
+    bool HasMasks() const { return has_masks_; }  // Check if masks available
     float4 GetPlaneHypothesis(const int index);
     float GetCost(const int index);
     void GetSupportPoints(std::vector<cv::Point>& support2DPoints);
@@ -88,7 +90,10 @@ private:
     int num_images;
     std::vector<cv::Mat> images;
     std::vector<cv::Mat> depths;
+    std::vector<cv::Mat> masks;  // Mask images (0=masked, 255=valid)
+    bool has_masks_ = false;     // Flag indicating masks are available
     std::vector<Camera> cameras;
+
     cudaTextureObjects texture_objects_host;
     cudaTextureObjects texture_depths_host;
     float4 *plane_hypotheses_host;
@@ -102,7 +107,9 @@ private:
     Camera *cameras_cuda;
     cudaArray *cuArray[MAX_IMAGES];
     cudaArray *cuDepthArray[MAX_IMAGES];
+    cudaArray *cuMaskArray[MAX_IMAGES];  // CUDA arrays for masks
     cudaTextureObjects *texture_objects_cuda;
+    cudaTextureObjects *texture_masks_cuda;  // Mask textures on GPU
     cudaTextureObjects *texture_depths_cuda;
     float4 *plane_hypotheses_cuda;
     float4 *scaled_plane_hypotheses_cuda;

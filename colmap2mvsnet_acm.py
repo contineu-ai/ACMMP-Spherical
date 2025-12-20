@@ -553,7 +553,94 @@ def process_images_optimized(imgs, depth_ranges, imgs_dir, out_img,
     return successes, failures
 
 # ───────────────────────────────────────────────────────────────────────────────
-# 9.  Camera file writing
+# 9.  Mask file processing (for MVS masking support)
+# ───────────────────────────────────────────────────────────────────────────────
+def process_masks_optimized(imgs, depth_ranges, masks_dir, out_mask,
+                            mode='copy', relative_links=False, max_workers=None,
+                            skip_missing=True):
+    """
+    Process mask files with configurable mode (same as image processing).
+    Masks are expected to be pre-generated in masks_dir with same filenames as images.
+    Output: masks/00000001.png, masks/00000002.png, etc.
+    
+    If masks_dir doesn't exist or is empty, silently returns (masks are optional).
+    """
+    if max_workers is None:
+        max_workers = min(64, mp.cpu_count() * 4)
+    
+    # Check if masks directory exists
+    if not os.path.isdir(masks_dir):
+        print(f"[INFO] No masks directory found at {masks_dir} - skipping mask processing")
+        return [], []
+    
+    # Scan existing mask files
+    print("[INFO] Scanning masks directory...")
+    existing_files = set()
+    try:
+        with os.scandir(masks_dir) as entries:
+            for entry in entries:
+                if entry.is_file():
+                    existing_files.add(entry.name)
+    except OSError as e:
+        print(f"[WARN] Cannot read masks directory: {e}")
+        return [], []
+    
+    if not existing_files:
+        print("[INFO] Masks directory is empty - skipping mask processing")
+        return [], []
+    
+    print(f"[INFO] Found {len(existing_files)} mask files")
+    
+    # Build task list - match masks to images by filename
+    tasks = []
+    missing = []
+    for i in sorted(depth_ranges.keys()):
+        img = imgs[i]
+        # Try exact filename match first, then try .png extension
+        mask_name = img.name
+        if mask_name not in existing_files:
+            # Try with .png extension if original wasn't png
+            base = os.path.splitext(mask_name)[0]
+            mask_name = base + '.png'
+        if mask_name not in existing_files:
+            missing.append((i, img.name))
+            continue
+        src = os.path.join(masks_dir, mask_name)
+        dst = os.path.join(out_mask, f"{i:08d}.png")
+        needs_convert = not src.lower().endswith('.png')
+        tasks.append((i, src, dst, needs_convert, mode, relative_links))
+    
+    if not tasks:
+        print(f"[INFO] No matching masks found for {len(missing)} images")
+        return [], missing
+    
+    print(f"[INFO] Processing {len(tasks)} masks ({len(missing)} without masks)")
+    
+    # Use same processing logic as images
+    results = {'copied': 0, 'converted': 0, 'symlinked': 0,
+               'hardlinked': 0, 'reflinked': 0, 'failed': 0}
+    successes = []
+    failures = []
+    
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(process_single_image, task): task[0] for task in tasks}
+        
+        with tqdm(total=len(tasks), desc="Processing masks", unit="mask") as pbar:
+            for future in as_completed(futures):
+                idx, success, error, action = future.result()
+                if success:
+                    successes.append(idx)
+                    if action in results: results[action] += 1
+                else:
+                    failures.append((idx, error))
+                    results['failed'] += 1
+                pbar.update(1)
+    
+    print(f"[INFO] Masks: {len(successes)} processed, {len(failures)} failed")
+    return successes, failures
+
+# ───────────────────────────────────────────────────────────────────────────────
+# 10. Camera file writing
 # ───────────────────────────────────────────────────────────────────────────────
 def write_camera_file(item, cam_dir, use_sphere_tag=True):
     """
@@ -630,10 +717,15 @@ def process_scene(args):
     dense = args.dense_folder
     sparse = os.path.join(dense, "sparse")
     imgs_dir = os.path.join(dense, "images")
+    masks_dir = args.masks_folder if args.masks_folder else os.path.join(dense, "masks")
     out_img = os.path.join(args.save_folder, "images")
+    out_mask = os.path.join(args.save_folder, "masks")
     cam_dir = os.path.join(args.save_folder, "cams")
     os.makedirs(out_img, exist_ok=True)
     os.makedirs(cam_dir, exist_ok=True)
+    # Create masks output dir only if source masks exist
+    if os.path.isdir(masks_dir):
+        os.makedirs(out_mask, exist_ok=True)
 
     # Load model
     print("[INFO] Loading COLMAP model...")
@@ -812,17 +904,28 @@ def process_scene(args):
         if len(failures) > 5:
             print(f"  ... and {len(failures) - 5} more")
     
+    # Process masks if available
+    mask_successes, mask_failures = process_masks_optimized(
+        imgs, depth_ranges, masks_dir, out_mask,
+        mode=args.image_mode,
+        relative_links=args.relative_links,
+        max_workers=args.copy_workers,
+        skip_missing=True
+    )
+    
     print(f"\n{'='*70}")
     print(f"[SUCCESS] Processing complete! Output: {args.save_folder}")
     print(f"{'='*70}")
     print(f"  Total images: {N}")
     print(f"  Valid images: {len(depth_ranges)}")
     print(f"  Processed: {len(successes)}, Failed: {len(failures)}")
+    if mask_successes:
+        print(f"  Masks: {len(mask_successes)} processed")
     print(f"  Avg neighbors: {avg_neighbors:.1f}")
     print(f"{'='*70}")
 
 # ───────────────────────────────────────────────────────────────────────────────
-# 12.  CLI
+# 13. CLI
 # ───────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(
@@ -876,6 +979,9 @@ Examples:
                           help="Threads for image processing (default: auto)")
     img_group.add_argument("--skip_images", "--no-images", action="store_true",
                           help="Continue even if images folder is missing/empty")
+    img_group.add_argument("--masks_folder", default=None,
+                          help="Path to pre-generated masks (default: dense_folder/masks)")
+    
     
     args = ap.parse_args()
     

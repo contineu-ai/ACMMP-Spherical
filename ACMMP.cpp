@@ -657,10 +657,17 @@ void ACMMP::InuputInitialization(const std::string &dense_folder, const std::vec
 {
     images.clear();
     cameras.clear();
+    masks.clear();  // Clear masks
+    has_masks_ = false;  // Reset mask flag
     const Problem problem = problems[idx];
 
     std::string image_folder = dense_folder + std::string("/images");
     std::string cam_folder = dense_folder + std::string("/cams");
+    std::string mask_folder = dense_folder + std::string("/masks");  // Mask folder
+    
+    // Check if mask folder exists
+    struct stat mask_stat;
+    bool mask_folder_exists = (stat(mask_folder.c_str(), &mask_stat) == 0 && S_ISDIR(mask_stat.st_mode));
 
     std::stringstream image_path;
     image_path << image_folder << "/" << std::setw(8) << std::setfill('0') << problem.ref_image_id << ".png";
@@ -668,7 +675,26 @@ void ACMMP::InuputInitialization(const std::string &dense_folder, const std::vec
     cv::Mat image_float;
     image_uint.convertTo(image_float, CV_32FC1);
     images.push_back(image_float);
+    
+    // Load reference mask if available
+    if (mask_folder_exists) {
+        std::stringstream mask_path;
+        mask_path << mask_folder << "/" << std::setw(8) << std::setfill('0') << problem.ref_image_id << ".png";
+        cv::Mat mask_img = cv::imread(mask_path.str(), cv::IMREAD_GRAYSCALE);
+        if (!mask_img.empty()) {
+            cv::Mat mask_float;
+            mask_img.convertTo(mask_float, CV_32FC1, 1.0 / 255.0);  // Normalize to 0-1
+            masks.push_back(mask_float);
+            has_masks_ = true;
+        } else {
+            // Create all-ones mask if file not found
+            cv::Mat mask_float = cv::Mat::ones(image_float.rows, image_float.cols, CV_32FC1);
+            masks.push_back(mask_float);
+        }
+    }
+    
     std::stringstream cam_path;
+
     cam_path << cam_folder << "/" << std::setw(8) << std::setfill('0') << problem.ref_image_id << "_cam.txt";
     Camera camera = ReadCamera(cam_path.str());
     camera.height = image_float.rows;
@@ -683,6 +709,22 @@ void ACMMP::InuputInitialization(const std::string &dense_folder, const std::vec
         cv::Mat image_float;
         image_uint.convertTo(image_float, CV_32FC1);
         images.push_back(image_float);
+        
+        // Load source mask if available
+        if (mask_folder_exists) {
+            std::stringstream mask_path;
+            mask_path << mask_folder << "/" << std::setw(8) << std::setfill('0') << problem.src_image_ids[i] << ".png";
+            cv::Mat mask_img = cv::imread(mask_path.str(), cv::IMREAD_GRAYSCALE);
+            if (!mask_img.empty()) {
+                cv::Mat mask_float;
+                mask_img.convertTo(mask_float, CV_32FC1, 1.0 / 255.0);
+                masks.push_back(mask_float);
+            } else {
+                cv::Mat mask_float = cv::Mat::ones(image_float.rows, image_float.cols, CV_32FC1);
+                masks.push_back(mask_float);
+            }
+        }
+        
         std::stringstream cam_path;
         cam_path << cam_folder << "/" << std::setw(8) << std::setfill('0') << problem.src_image_ids[i] << "_cam.txt";
         Camera camera = ReadCamera(cam_path.str());
@@ -691,7 +733,8 @@ void ACMMP::InuputInitialization(const std::string &dense_folder, const std::vec
         cameras.push_back(camera);
     }
 
-    // Scale cameras and images
+
+    // Scale cameras and images (and masks if present)
     int max_image_size = problems[idx].cur_image_size;
     for (size_t i = 0; i < images.size(); ++i) {
         if (i > 0) {
@@ -716,6 +759,13 @@ void ACMMP::InuputInitialization(const std::string &dense_folder, const std::vec
         cv::resize(images[i], scaled_image_float, cv::Size(new_cols,new_rows), 0, 0, cv::INTER_LINEAR);
         images[i] = scaled_image_float.clone();
 
+        // Scale mask if present (use INTER_NEAREST to preserve binary values)
+        if (has_masks_ && i < masks.size()) {
+            cv::Mat scaled_mask;
+            cv::resize(masks[i], scaled_mask, cv::Size(new_cols, new_rows), 0, 0, cv::INTER_NEAREST);
+            masks[i] = scaled_mask.clone();
+        }
+
         if (cameras[i].model == SPHERE) {
             cameras[i].params[1] *= scale_x;
             cameras[i].params[2] *= scale_y;
@@ -728,6 +778,7 @@ void ACMMP::InuputInitialization(const std::string &dense_folder, const std::vec
         cameras[i].height = scaled_image_float.rows;
         cameras[i].width = scaled_image_float.cols;
     }
+
 
     params.depth_min = cameras[0].depth_min * 0.6f;
     params.depth_max = cameras[0].depth_max * 1.2f;
@@ -963,6 +1014,15 @@ int ACMMP::GetReferenceImageHeight()
 cv::Mat ACMMP::GetReferenceImage()
 {
     return images[0];
+}
+
+cv::Mat ACMMP::GetReferenceMask()
+{
+    if (has_masks_ && !masks.empty()) {
+        return masks[0];
+    }
+    // Return all-ones mask if no masks available
+    return cv::Mat::ones(cameras[0].height, cameras[0].width, CV_32FC1);
 }
 
 float4 ACMMP::GetPlaneHypothesis(const int index)

@@ -489,16 +489,33 @@ void BatchACMMP::processProblemOnStream(int problem_idx, ProblemGPUResources* re
             cv::Mat_<float> depths(height, width);
             cv::Mat_<cv::Vec3f> normals(height, width);
             cv::Mat_<float> costs(height, width);
+            
+            // Get reference mask for filtering (mask values: 0=masked, 1=valid)
+            cv::Mat ref_mask = acmmp.GetReferenceMask();
+            bool has_mask = acmmp.HasMasks() && !ref_mask.empty();
 
             for (int y = 0; y < height; ++y) {
                 for (int x = 0; x < width; ++x) {
                     const int c = y * width + x;
                     const float4 plane_hypothesis = acmmp.GetPlaneHypothesis(c);
-                    depths(y, x) = plane_hypothesis.w;
+                    
+                    // Apply mask: set depth to 0 for masked pixels
+                    // Mask semantics: 1 (white) = masked (skip), 0 (black) = valid (keep)
+                    float depth_value = plane_hypothesis.w;
+                    if (has_mask) {
+                        float mask_val = ref_mask.at<float>(y, x);
+                        if (mask_val > 0.5f) {
+                            depth_value = 0.0f;  // Masked - set to 0 so fusion ignores it
+                        }
+                    }
+
+                    
+                    depths(y, x) = depth_value;
                     normals(y, x) = cv::Vec3f(plane_hypothesis.x, plane_hypothesis.y, plane_hypothesis.z);
                     costs(y, x) = acmmp.GetCost(c);
                 }
             }
+
 
             // Queue for disk writing (compressed format will be used)
             {

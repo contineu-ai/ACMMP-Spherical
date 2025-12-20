@@ -921,11 +921,14 @@ struct ImageData {
     cv::Mat_<float> depth;
     cv::Mat_<cv::Vec3f> normal;
     cv::Mat image;
+    cv::Mat_<float> mask;  // Mask image: 0=masked, 1=valid
+    bool has_mask = false;  // Flag indicating if mask was loaded
     std::atomic<bool> valid;
     std::chrono::steady_clock::time_point last_accessed;
     
-    ImageData() : valid(false), last_accessed(std::chrono::steady_clock::now()) {}
+    ImageData() : has_mask(false), valid(false), last_accessed(std::chrono::steady_clock::now()) {}
 };
+
 
 class OptimizedDataLoader {
 private:
@@ -1148,7 +1151,19 @@ private:
             }
         }
         
-        // Stage 5: Rescale Image
+        // Stage 4.5: Load Mask (optional) - mask folder is at same level as images
+        std::string mask_folder = dense_folder + "/masks";
+        ret = snprintf(buf, sizeof(buf), "%s/%08d.png", mask_folder.c_str(), image_id);
+        if (ret >= 0 && ret < static_cast<int>(sizeof(buf))) {
+            std::string mask_path(buf);
+            cv::Mat mask_img = cv::imread(mask_path, cv::IMREAD_GRAYSCALE);
+            if (!mask_img.empty()) {
+                mask_img.convertTo(data->mask, CV_32FC1, 1.0 / 255.0);  // Normalize to 0-1
+                data->has_mask = true;
+            }
+        }
+        
+        // Stage 5: Rescale Image (and Mask)
         try {
             cv::Mat_<cv::Vec3b> img_color;
             if (data->image.channels() == 3) {
@@ -1161,15 +1176,28 @@ private:
                 return data;
             }
             
+            int old_width = img_color.cols;
+            int old_height = img_color.rows;
             cv::Mat_<cv::Vec3b> scaled_color;
             RescaleImageAndCamera(img_color, scaled_color, data->depth, data->camera);
             data->image = cv::Mat(scaled_color);
+            
+            // Rescale mask if present
+            if (data->has_mask && !data->mask.empty()) {
+                if (scaled_color.cols != old_width || scaled_color.rows != old_height) {
+                    cv::Mat scaled_mask;
+                    cv::resize(data->mask, scaled_mask, cv::Size(scaled_color.cols, scaled_color.rows), 
+                               0, 0, cv::INTER_NEAREST);
+                    data->mask = scaled_mask;
+                }
+            }
             
         } catch (const std::exception& e) {
             if (tracker) tracker->recordImageFailure(image_id, "rescale", 
                 "Rescale failed: " + std::string(e.what()));
             return data;
         }
+
         
         data->valid.store(true);
         data->last_accessed = std::chrono::steady_clock::now();
