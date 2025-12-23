@@ -2373,7 +2373,7 @@ void RunFusionCuda(const std::string &dense_folder,
                           " points total in " + std::to_string(total_duration.count()) + " seconds");
         
         // Finalize output
-        std::string output_path = dense_folder + "/ACMMP/ACMM_model.ply";
+        std::string output_path = dense_folder + "/ACMMP/final.ply";
         point_writer->finalize(output_path);
         
         FusionLogger::info("Fusion", "Output written to: " + output_path);
