@@ -117,6 +117,8 @@ ACMMP::~ACMMP()
     if (params.planar_prior) {
         delete[] prior_planes_host;
         delete[] plane_masks_host;
+        cudaFree(prior_planes_cuda);
+        cudaFree(plane_masks_cuda);
     }
 
 }

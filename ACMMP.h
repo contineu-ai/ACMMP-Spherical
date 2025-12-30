@@ -96,12 +96,12 @@ private:
 
     cudaTextureObjects texture_objects_host;
     cudaTextureObjects texture_depths_host;
-    float4 *plane_hypotheses_host;
-    float4 *scaled_plane_hypotheses_host;
-    float *costs_host;
-    float *pre_costs_host;
-    float4 *prior_planes_host;
-    unsigned int *plane_masks_host;
+    float4 *plane_hypotheses_host = nullptr;
+    float4 *scaled_plane_hypotheses_host = nullptr;
+    float *costs_host = nullptr;
+    float *pre_costs_host = nullptr;
+    float4 *prior_planes_host = nullptr;
+    unsigned int *plane_masks_host = nullptr;
     PatchMatchParams params;
 
     Camera *cameras_cuda;
@@ -118,8 +118,8 @@ private:
     curandState *rand_states_cuda;
     unsigned int *selected_views_cuda;
     float *depths_cuda;
-    float4 *prior_planes_cuda;
-    unsigned int *plane_masks_cuda;
+    float4 *prior_planes_cuda = nullptr;
+    unsigned int *plane_masks_cuda = nullptr;
 };
 
 struct TexObj {

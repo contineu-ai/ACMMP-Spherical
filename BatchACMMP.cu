@@ -32,6 +32,8 @@ ProblemGPUResources::ProblemGPUResources() {
     for (int i = 0; i < MAX_IMAGES; ++i) {
         cuArray[i] = nullptr;
         cuDepthArray[i] = nullptr;
+        texture_objects_host.images[i] = 0;
+        texture_depths_host.images[i] = 0;
     }
 }
 
@@ -126,6 +128,18 @@ ProblemGPUResources::~ProblemGPUResources() {
 void ProblemGPUResources::cleanup() {
     // Don't synchronize the stream here - it's owned by BatchACMMP
     // Just clean up the resources allocated by this object
+    
+    // IMPORTANT: Destroy texture objects BEFORE freeing their backing arrays
+    for (int i = 0; i < MAX_IMAGES; ++i) {
+        if (texture_objects_host.images[i] != 0) {
+            cudaDestroyTextureObject(texture_objects_host.images[i]);
+            texture_objects_host.images[i] = 0;
+        }
+        if (texture_depths_host.images[i] != 0) {
+            cudaDestroyTextureObject(texture_depths_host.images[i]);
+            texture_depths_host.images[i] = 0;
+        }
+    }
     
     for (int i = 0; i < MAX_IMAGES; ++i) {
         if (cuArray[i]) { 
