@@ -455,6 +455,57 @@ __device__ __forceinline__ bool IsNearPole(
     return abs_lat > pole_threshold;
 }
 // ============================================================================
+// TANGENT PLANE NCC HELPERS (Pole-safe spherical matching)
+// ============================================================================
+
+// 1a. Tangent basis from unit direction vector
+__device__ __forceinline__ void ComputeTangentBasis(
+    const float3& d, float3& right, float3& up) {
+    float3 ref = (fabsf(d.y) < 0.99f)
+        ? make_float3(0.f, -1.f, 0.f)    // world up (non-pole)
+        : make_float3(0.f, 0.f, 1.f);    // forward (at pole)
+    float3 r = make_float3(
+        d.y*ref.z - d.z*ref.y, d.z*ref.x - d.x*ref.z, d.x*ref.y - d.y*ref.x);
+    float inv = rsqrtf(fmaf(r.x,r.x, fmaf(r.y,r.y, r.z*r.z)));
+    right = make_float3(r.x*inv, r.y*inv, r.z*inv);
+    up = make_float3(right.y*d.z - right.z*d.y,
+                     right.z*d.x - right.x*d.z,
+                     right.x*d.y - right.y*d.x);
+}
+
+// 1b. Direction → equirectangular pixel (uses existing FastAsin/FastAtan2 LUTs)
+__device__ __forceinline__ float2 DirectionToPixelSpherical(
+    const Camera& cam, const float3& dir) {
+    float lat, lon;
+#if USE_INVERSE_TRIG_LUTS
+    if (d_inverse_trig_lut != nullptr) {
+        lat = FastAsin(fmaxf(-1.f, fminf(1.f, dir.y)), d_inverse_trig_lut);
+        lon = FastAtan2(dir.x, dir.z, d_inverse_trig_lut);
+    } else
+#endif
+    { lat = asinf(fmaxf(-1.f, fminf(1.f, dir.y))); lon = atan2f(dir.x, dir.z); }
+    return make_float2(
+        fmaf(lon / (2.f * CUDART_PI_F), static_cast<float>(cam.width), cam.params[1]),
+        fmaf(lat / CUDART_PI_F, static_cast<float>(cam.height), cam.params[2]));
+}
+
+// 1c. Depth from plane + arbitrary direction
+__device__ __forceinline__ float ComputeDepthFromDirection(
+    const float4& plane, const float3& dir) {
+    float d = fmaf(plane.x, dir.x, fmaf(plane.y, dir.y, plane.z * dir.z));
+    return (fabsf(d) >= 1e-6f) ? __fdividef(-plane.w, d) : 1e6f;
+}
+
+// 1d. Precomputed tangent patch struct (source-independent data)
+struct TangentPatch {
+    static constexpr int MAX_SAMPLES = 25;
+    float ref_pix[MAX_SAMPLES];
+    float3 world_pt[MAX_SAMPLES];
+    float bw[MAX_SAMPLES];
+    int n;
+};
+
+// ============================================================================
 // MACRO DEFINITIONS FOR COMPATIBILITY
 // ============================================================================
 

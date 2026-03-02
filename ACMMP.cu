@@ -407,6 +407,105 @@ __device__ float ComputeBilateralNCC(
     return fmaxf(0.0f, fminf(cost_max, ncc_cost));
 }
 
+// ============================================================================
+// TANGENT PLANE NCC (Pole-safe spherical matching)
+// ============================================================================
+
+// Precompute reference patch on tangent plane — source-independent, computed once.
+__device__ void PrecomputeTangentPatch(
+    const cudaTextureObject_t ref_image, const Camera& ref_cam,
+    const int2 p, const float4& plane, const PatchMatchParams& params,
+    TangentPatch& patch)
+{
+    float3 cd; PixelToDir(ref_cam, p, &cd);
+    float3 right, up; ComputeTangentBasis(cd, right, up);
+    const float delta = 2.f * CUDART_PI_F / static_cast<float>(ref_cam.width);
+    const int radius = params.patch_size / 2;
+    const float inv_ss = 1.f / (2.f * params.sigma_spatial * params.sigma_spatial);
+    const float inv_cs = 1.f / (2.f * params.sigma_color * params.sigma_color);
+    const float center_pix = tex2D<float>(ref_image, p.x + 0.5f, p.y + 0.5f);
+    const float3 C = make_float3(
+        -fmaf(ref_cam.R[0],ref_cam.t[0], fmaf(ref_cam.R[3],ref_cam.t[1], ref_cam.R[6]*ref_cam.t[2])),
+        -fmaf(ref_cam.R[1],ref_cam.t[0], fmaf(ref_cam.R[4],ref_cam.t[1], ref_cam.R[7]*ref_cam.t[2])),
+        -fmaf(ref_cam.R[2],ref_cam.t[0], fmaf(ref_cam.R[5],ref_cam.t[1], ref_cam.R[8]*ref_cam.t[2])));
+    const float w_img = static_cast<float>(ref_cam.width);
+
+    patch.n = 0;
+    for (int i = -radius; i <= radius; i += params.radius_increment) {
+        for (int j = -radius; j <= radius; j += params.radius_increment) {
+            float3 sd = make_float3(
+                fmaf(i*delta, right.x, fmaf(j*delta, up.x, cd.x)),
+                fmaf(i*delta, right.y, fmaf(j*delta, up.y, cd.y)),
+                fmaf(i*delta, right.z, fmaf(j*delta, up.z, cd.z)));
+            float inv_len = rsqrtf(fmaf(sd.x,sd.x, fmaf(sd.y,sd.y, sd.z*sd.z)));
+            sd.x *= inv_len; sd.y *= inv_len; sd.z *= inv_len;
+
+            float2 rp = DirectionToPixelSpherical(ref_cam, sd);
+            if (rp.x < 0.f) rp.x += w_img; else if (rp.x >= w_img) rp.x -= w_img;
+            if (rp.y < 0.f || rp.y >= ref_cam.height) continue;
+            float ref_val = tex2D<float>(ref_image, rp.x + 0.5f, rp.y + 0.5f);
+
+            float depth = ComputeDepthFromDirection(plane, sd);
+            if (depth <= 0.f || depth > 1000.f) continue;
+            float3 pc = make_float3(sd.x*depth, sd.y*depth, sd.z*depth);
+            float3 wp = make_float3(
+                fmaf(ref_cam.R[0],pc.x, fmaf(ref_cam.R[3],pc.y, ref_cam.R[6]*pc.z)) + C.x,
+                fmaf(ref_cam.R[1],pc.x, fmaf(ref_cam.R[4],pc.y, ref_cam.R[7]*pc.z)) + C.y,
+                fmaf(ref_cam.R[2],pc.x, fmaf(ref_cam.R[5],pc.y, ref_cam.R[8]*pc.z)) + C.z);
+
+            float sp_sq = static_cast<float>(i*i + j*j);
+            float c_dist = fabsf(ref_val - center_pix);
+            float w = expf(-sp_sq * inv_ss - c_dist * inv_cs);
+
+            int k = patch.n++;
+            if (k >= TangentPatch::MAX_SAMPLES) { patch.n = TangentPatch::MAX_SAMPLES; break; }
+            patch.ref_pix[k] = ref_val;
+            patch.world_pt[k] = wp;
+            patch.bw[k] = w;
+        }
+        if (patch.n >= TangentPatch::MAX_SAMPLES) break;
+    }
+}
+
+// Per-source NCC using precomputed reference patch.
+__device__ float ComputeNCC_Tangent(
+    const TangentPatch& patch,
+    const cudaTextureObject_t src_image, const Camera& src_cam,
+    const PatchMatchParams& params)
+{
+    const float cost_max = 2.f, kMinVar = 1e-5f;
+    float sum_bw=0, sum_r=0, sum_rr=0, sum_s=0, sum_ss=0, sum_rs=0;
+    const float src_w = static_cast<float>(src_cam.width);
+    const float pole_rows = (src_cam.model == SPHERE)
+        ? src_w * 0.5f * (5.f / 180.f) : 0.f;
+
+    for (int k = 0; k < patch.n; ++k) {
+        float2 sp; float sd;
+        ProjectonCamera_cu(patch.world_pt[k], src_cam, sp, sd);
+        if (src_cam.model == SPHERE) {
+            if (sp.x < 0.f) sp.x += src_w; else if (sp.x >= src_w) sp.x -= src_w;
+            if (sp.y < pole_rows || sp.y >= src_cam.height - pole_rows) continue;
+        }
+        if (sp.y < 0.f || sp.y >= src_cam.height) continue;
+        if (src_cam.model != SPHERE && (sp.x < 0.f || sp.x >= src_cam.width)) continue;
+
+        float sv = tex2D<float>(src_image, sp.x + 0.5f, sp.y + 0.5f);
+        float rv = patch.ref_pix[k], w = patch.bw[k];
+        sum_bw += w;
+        sum_r += w*rv; sum_rr += w*rv*rv;
+        sum_s += w*sv; sum_ss += w*sv*sv;
+        sum_rs += w*rv*sv;
+    }
+    if (sum_bw < 1e-6f) return cost_max;
+    float ib = 1.f / sum_bw;
+    float mr = sum_r*ib, ms = sum_s*ib;
+    float vr = sum_rr*ib - mr*mr, vs = sum_ss*ib - ms*ms;
+    if (vr < kMinVar || vs < kMinVar) return cost_max;
+    return fmaxf(0.f, fminf(cost_max, 1.f - (sum_rs*ib - mr*ms) / sqrtf(vr*vs)));
+}
+
+// ============================================================================
+
 __device__ float ComputeMultiViewInitialCostandSelectedViews(const cudaTextureObject_t *images, const Camera *cameras, const int2 p, const float4 plane_hypothesis, unsigned int *selected_views, const PatchMatchParams params)
 {
     float cost_max = 2.0f;
@@ -415,13 +514,27 @@ __device__ float ComputeMultiViewInitialCostandSelectedViews(const cudaTextureOb
     int cost_count = 0;
     int num_valid_views = 0;
 
-    for (int i = 1; i < params.num_images; ++i) {
-        float c = ComputeBilateralNCC(images[0], cameras[0], images[i], cameras[i], p, plane_hypothesis, params);
-        cost_vector[i - 1] = c;
-        cost_vector_copy[i - 1] = c;
-        cost_count++;
-        if (c < cost_max) {
-            num_valid_views++;
+    if (cameras[0].model == SPHERE) {
+        TangentPatch patch;
+        PrecomputeTangentPatch(images[0], cameras[0], p, plane_hypothesis, params, patch);
+        for (int i = 1; i < params.num_images; ++i) {
+            float c = ComputeNCC_Tangent(patch, images[i], cameras[i], params);
+            cost_vector[i - 1] = c;
+            cost_vector_copy[i - 1] = c;
+            cost_count++;
+            if (c < cost_max) {
+                num_valid_views++;
+            }
+        }
+    } else {
+        for (int i = 1; i < params.num_images; ++i) {
+            float c = ComputeBilateralNCC(images[0], cameras[0], images[i], cameras[i], p, plane_hypothesis, params);
+            cost_vector[i - 1] = c;
+            cost_vector_copy[i - 1] = c;
+            cost_count++;
+            if (c < cost_max) {
+                num_valid_views++;
+            }
         }
     }
 
@@ -448,8 +561,14 @@ __device__ float ComputeMultiViewInitialCostandSelectedViews(const cudaTextureOb
 
 __device__ void ComputeMultiViewCostVector(const cudaTextureObject_t *images, const Camera *cameras, const int2 p, const float4 plane_hypothesis, float *cost_vector, const PatchMatchParams params)
 {
-    for (int i = 1; i < params.num_images; ++i) {
-        cost_vector[i - 1] = ComputeBilateralNCC(images[0], cameras[0], images[i], cameras[i], p, plane_hypothesis, params);
+    if (cameras[0].model == SPHERE) {
+        TangentPatch patch;
+        PrecomputeTangentPatch(images[0], cameras[0], p, plane_hypothesis, params, patch);
+        for (int i = 1; i < params.num_images; ++i)
+            cost_vector[i-1] = ComputeNCC_Tangent(patch, images[i], cameras[i], params);
+    } else {
+        for (int i = 1; i < params.num_images; ++i)
+            cost_vector[i - 1] = ComputeBilateralNCC(images[0], cameras[0], images[i], cameras[i], p, plane_hypothesis, params);
     }
 }
 
@@ -497,6 +616,14 @@ __global__ void RandomInitialization(cudaTextureObjects *texture_objects, Camera
 
     const int center = p.y * width + p.x;
     curand_init(clock64(), p.y, p.x, &rand_states[center]);
+
+    // Pole guard: exclude extreme pole pixels for spherical cameras
+    if (cameras[0].model == SPHERE && IsNearPole(cameras[0], p.x, p.y, 5.0f)) {
+        plane_hypotheses[center] = make_float4(0.f, 0.f, 1.f, 0.f);
+        costs[center] = 2.0f;
+        selected_views[center] = 0;
+        return;
+    }
 
     if (!params.geom_consistency && !params.hierarchy ) {
         plane_hypotheses[center] = GenerateRandomPlaneHypothesis(cameras[0], p, &rand_states[center], params.depth_min, params.depth_max);
@@ -1004,13 +1131,18 @@ __device__ void CheckerboardPropagation(
         return;
     }
 
+    // Pole guard: skip propagation at extreme poles for spherical cameras
+    if (cameras[0].model == SPHERE && IsNearPole(cameras[0], p.x, p.y, 5.0f)) {
+        return;
+    }
+
     const int center = p.y * width + p.x;
-    
+
     // Validate center index
     if (center < 0 || center >= width * height) {
         return;
     }
-    
+
     // Calculate neighbor positions with bounds checking
     // For spherical cameras, horizontal neighbors wrap around the seam
     const bool is_sphere = (cameras[0].model == SPHERE);
@@ -1304,6 +1436,13 @@ __global__ void GetDepthandNormal(Camera *cameras, float4 *plane_hypotheses, con
     }
 
     const int center = p.y * width + p.x;
+
+    // Pole guard: output depth=0 at extreme poles for spherical cameras
+    if (cameras[0].model == SPHERE && IsNearPole(cameras[0], p.x, p.y, 5.0f)) {
+        plane_hypotheses[center].w = 0.f;
+        return;
+    }
+
     plane_hypotheses[center].w = ComputeDepthfromPlaneHypothesis(cameras[0], plane_hypotheses[center], p);
     plane_hypotheses[center] = TransformNormal(cameras[0], plane_hypotheses[center]);
 }
@@ -1399,19 +1538,24 @@ __device__ void CheckerboardFilter(const Camera *cameras, float4 *plane_hypothes
 {
     const int width = cameras[0].width;
     const int height = cameras[0].height;
-    
+
     // Early exits with bounds checking
     if (p.x >= width || p.y >= height || p.x < 0 || p.y < 0) {
         return;
     }
-    
+
+    // Pole guard: skip filtering at extreme poles for spherical cameras
+    if (cameras[0].model == SPHERE && IsNearPole(cameras[0], p.x, p.y, 5.0f)) {
+        return;
+    }
+
     const int center = p.y * width + p.x;
-    
+
     // Validate center index
     if (center < 0 || center >= width * height) {
         return;
     }
-    
+
     // Early exit for very low cost (unchanged from original)
     if (costs[center] < 0.001f) {
         return;
