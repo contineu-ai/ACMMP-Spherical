@@ -32,6 +32,12 @@ struct cudaTextureObjects {
     cudaTextureObject_t images[MAX_IMAGES];
 };
 
+// Lightweight counter-based RNG state (4 bytes vs curandState's 48 bytes).
+// Uses Philox4x32-10 as a hash function: hash(counter++, pixel_key) → random uint32.
+struct RNGState {
+    unsigned int counter;
+};
+
 struct PatchMatchParams {
     int max_iterations = 4;
     int patch_size = 5;
@@ -115,7 +121,7 @@ private:
     float4 *scaled_plane_hypotheses_cuda;
     float *costs_cuda;
     float *pre_costs_cuda;
-    curandState *rand_states_cuda;
+    RNGState *rand_states_cuda;
     unsigned int *selected_views_cuda;
     float *depths_cuda;
     float4 *prior_planes_cuda = nullptr;

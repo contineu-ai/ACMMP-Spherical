@@ -581,7 +581,7 @@ void ProcessProblemsInParallel(const std::string &dense_folder,
         auto last_report = std::chrono::steady_clock::now();
         
         while (!done) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
             
             size_t gpu_completed = batch_processor.getCompletedGPUProblems();
             size_t disk_completed = batch_processor.getCompletedDiskWrites();
@@ -707,6 +707,7 @@ int main(int argc, char** argv)
         else {
             // Joint Bilateral Upsampling phase
             std::cout << "Scale: " << max_num_downscale << std::endl;
+            #pragma omp parallel for schedule(dynamic)
             for (size_t i = 0; i < num_images; ++i) {
                JointBilateralUpsampling(dense_folder, problems[i], problems[i].cur_image_size);
             }

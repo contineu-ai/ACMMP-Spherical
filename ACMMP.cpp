@@ -798,7 +798,7 @@ void ACMMP::InuputInitialization(const std::string &dense_folder, const std::vec
         }
         std::string depth_path = result_folder + suffix;
         cv::Mat_<float> ref_depth;
-        
+
         // Use auto-detection function
         readDepthAuto(depth_path, ref_depth);
         depths.push_back(ref_depth);
@@ -810,7 +810,7 @@ void ACMMP::InuputInitialization(const std::string &dense_folder, const std::vec
             std::string result_folder = result_path.str();
             std::string depth_path = result_folder + suffix;
             cv::Mat_<float> depth;
-            
+
             // Use auto-detection function
             readDepthAuto(depth_path, depth);
             depths.push_back(depth);

@@ -87,7 +87,7 @@ inline float dequantizeFloat8(uint8_t value, float minVal, float maxVal) {
 // ZLIB COMPRESSION
 // ============================================================================
 
-inline std::vector<uint8_t> compressZlib(const void* data, size_t size, int level = 6) {
+inline std::vector<uint8_t> compressZlib(const void* data, size_t size, int level = 3) {
     uLongf compressedSize = compressBound(size);
     std::vector<uint8_t> compressed(compressedSize + sizeof(uint32_t));
     

@@ -54,7 +54,7 @@ public:
     float4* scaled_plane_hypotheses_cuda = nullptr;
     float* costs_cuda = nullptr;
     float* pre_costs_cuda = nullptr;
-    curandState* rand_states_cuda = nullptr;
+    RNGState* rand_states_cuda = nullptr;
     unsigned int* selected_views_cuda = nullptr;
     float* depths_cuda = nullptr;
     float4* prior_planes_cuda = nullptr;

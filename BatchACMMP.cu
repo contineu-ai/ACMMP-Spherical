@@ -55,7 +55,7 @@ void ProblemGPUResources::allocate(int max_width, int max_height, int max_images
     CUDA_CHECK(cudaMalloc(&scaled_plane_hypotheses_cuda, sizeof(float4) * max_width * max_height));
     CUDA_CHECK(cudaMalloc(&costs_cuda, sizeof(float) * max_width * max_height));
     CUDA_CHECK(cudaMalloc(&pre_costs_cuda, sizeof(float) * max_width * max_height));
-    CUDA_CHECK(cudaMalloc(&rand_states_cuda, sizeof(curandState) * max_width * max_height));
+    CUDA_CHECK(cudaMalloc(&rand_states_cuda, sizeof(RNGState) * max_width * max_height));
     CUDA_CHECK(cudaMalloc(&selected_views_cuda, sizeof(unsigned int) * max_width * max_height));
     CUDA_CHECK(cudaMalloc(&depths_cuda, sizeof(float) * max_width * max_height));
     CUDA_CHECK(cudaMalloc(&prior_planes_cuda, sizeof(float4) * max_width * max_height));
@@ -214,14 +214,12 @@ BatchACMMP::BatchACMMP(const std::string& dense_folder_,
     size_t usable_gpu = size_t(double(available_gpu_memory) * 0.75);
     size_t by_gpu_mem = std::max<size_t>(1, usable_gpu / memory_per_problem);
     
-    // Hardware-based limits
+    // Hardware-based limits: ~6 SMs per concurrent problem for good occupancy
     size_t hardware_threads = std::thread::hardware_concurrency();
-    size_t by_sm = (prop.multiProcessorCount >= 20) ? 8 :
-                   (prop.multiProcessorCount >= 10) ? 6 :
-                   (prop.multiProcessorCount >= 5)  ? 4 : 2;
-    
-    max_concurrent_problems = std::min({by_gpu_mem, by_sm, size_t(12)});
-    max_concurrent_problems = std::max<size_t>(1, 12);
+    size_t by_sm = std::max<size_t>(2, prop.multiProcessorCount / 6);
+
+    max_concurrent_problems = std::min({by_gpu_mem, by_sm, size_t(24)});
+    max_concurrent_problems = std::max<size_t>(1, max_concurrent_problems);
     
     // Separate disk writer threads - optimize for disk I/O
     num_disk_writers = std::min<size_t>(4, std::max<size_t>(2, hardware_threads / 4));
@@ -315,7 +313,7 @@ size_t BatchACMMP::estimateMemoryPerProblem(const Problem& problem) {
 
     size_t textures = N * W * H * (sizeof(float) + sizeof(float)); // images + depths
     size_t working = W * H * (2*sizeof(float4) + 3*sizeof(float)); // hypotheses + costs
-    size_t misc = W * H * (sizeof(curandState) + sizeof(unsigned int));
+    size_t misc = W * H * (sizeof(RNGState) + sizeof(unsigned int));
     
     return (textures + working + misc) * 130 / 100; // 30% overhead
 }

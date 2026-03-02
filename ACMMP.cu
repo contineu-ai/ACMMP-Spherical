@@ -6,12 +6,23 @@
 // extern __constant__ SphericalLUT* d_lut_array_const[10];
 // extern __constant__ int d_num_luts;
 
-__device__ __forceinline__ float SampleDepthInv(curandState* rs, float dmin, float dmax) {
+// Lightweight counter-based RNG using Philox4x32-10 as a hash function.
+// Each call increments the counter and produces a uniform float in (0,1].
+// pixel_key should be a unique value per pixel (e.g., p.y * width + p.x).
+__device__ __forceinline__ float rng_uniform(RNGState* state, unsigned int pixel_key) {
+    uint4 ctr = make_uint4(state->counter++, pixel_key, 0, 0);
+    uint2 key = make_uint2(0xD2511F53u, 0xCD9E8D57u);
+    uint4 result = curand_Philox4x32_10(ctr, key);
+    // Map to (0, 1] float with 24-bit mantissa precision
+    return (result.x >> 8) * (1.0f / 16777215.0f) + (1.0f / 16777216.0f);
+}
+
+__device__ __forceinline__ float SampleDepthInv(RNGState* rs, unsigned int pixel_key, float dmin, float dmax) {
     dmin = fmaxf(dmin, 1e-6f);
     dmax = fmaxf(dmax, dmin + 1e-6f);
     const float inv_min = __fdividef(1.0f, dmax);
     const float inv_max = __fdividef(1.0f, dmin);
-    const float u = curand_uniform(rs);
+    const float u = rng_uniform(rs, pixel_key);
     const float inv = fmaf(u, inv_max - inv_min, inv_min);
     return __fdividef(1.0f, inv);
 }
@@ -147,15 +158,15 @@ __device__  float RangeGauss(float x, float sigma, float mu = 0.0)
     return exp(-1.0 * (x_p * x_p) / (2 * sigma * sigma));
 }
 
-__device__ float4 GenerateRandomNormal(const Camera camera, const int2 p, curandState *rand_state, const float depth)
+__device__ float4 GenerateRandomNormal(const Camera camera, const int2 p, RNGState *rand_state, unsigned int pixel_key, const float depth)
 {
     float4 normal;
     float q1 = 1.0f;
     float q2 = 1.0f;
     float s = 2.0f;
     while (s >= 1.0f) {
-        q1 = 2.0f * curand_uniform(rand_state) -1.0f;
-        q2 = 2.0f * curand_uniform(rand_state) - 1.0f;
+        q1 = 2.0f * rng_uniform(rand_state, pixel_key) -1.0f;
+        q2 = 2.0f * rng_uniform(rand_state, pixel_key) - 1.0f;
         s = q1 * q1 + q2 * q2;
     }
     const float sq = sqrt(1.0f - s);
@@ -175,13 +186,13 @@ __device__ float4 GenerateRandomNormal(const Camera camera, const int2 p, curand
     return normal;
 }
 
-__device__ float4 GeneratePerturbedNormal(const Camera camera, const int2 p, const float4 normal, curandState *rand_state, const float perturbation)
+__device__ float4 GeneratePerturbedNormal(const Camera camera, const int2 p, const float4 normal, RNGState *rand_state, unsigned int pixel_key, const float perturbation)
 {
     float4 view_direction = GetViewDirection(camera, p, 1.0f);
 
-    const float a1 = (curand_uniform(rand_state) - 0.5f) * perturbation;
-    const float a2 = (curand_uniform(rand_state) - 0.5f) * perturbation;
-    const float a3 = (curand_uniform(rand_state) - 0.5f) * perturbation;
+    const float a1 = (rng_uniform(rand_state, pixel_key) - 0.5f) * perturbation;
+    const float a2 = (rng_uniform(rand_state, pixel_key) - 0.5f) * perturbation;
+    const float a3 = (rng_uniform(rand_state, pixel_key) - 0.5f) * perturbation;
 
     const float sin_a1 = sin(a1);
     const float sin_a2 = sin(a2);
@@ -212,16 +223,16 @@ __device__ float4 GeneratePerturbedNormal(const Camera camera, const int2 p, con
     return normal_perturbed;
 }
 
-__device__ float4 GenerateRandomPlaneHypothesis(const Camera camera, const int2 p, curandState *rand_state, const float depth_min, const float depth_max)
+__device__ float4 GenerateRandomPlaneHypothesis(const Camera camera, const int2 p, RNGState *rand_state, unsigned int pixel_key, const float depth_min, const float depth_max)
 {
-    float depth = curand_uniform(rand_state) * (depth_max - depth_min) + depth_min;
-    float4 plane_hypothesis = GenerateRandomNormal(camera, p, rand_state, depth);
+    float depth = rng_uniform(rand_state, pixel_key) * (depth_max - depth_min) + depth_min;
+    float4 plane_hypothesis = GenerateRandomNormal(camera, p, rand_state, pixel_key, depth);
     plane_hypothesis.w = GetDistance2Origin(camera, p, depth, plane_hypothesis);
     return plane_hypothesis;
 }
 
 __device__ float4 GeneratePertubedPlaneHypothesis(const Camera camera, const int2 p,
-                                                  curandState *rand_state, const float perturbation,
+                                                  RNGState *rand_state, unsigned int pixel_key, const float perturbation,
                                                   const float4 plane_hypothesis_now,
                                                   const float depth_now,
                                                   const float depth_min, const float depth_max)
@@ -236,11 +247,11 @@ __device__ float4 GeneratePertubedPlaneHypothesis(const Camera camera, const int
 
     // Try a bounded number of candidates; occasionally jitter the normal
     for (int k = 0; k < 64; ++k) {
-        const float cand_depth = SampleDepthInv(rand_state, lo, hi);
+        const float cand_depth = SampleDepthInv(rand_state, pixel_key, lo, hi);
 
         // Every 8th try: perturb the normal a bit, otherwise keep current normal
         float4 n_try = ((k % 8) == 0)
-            ? GeneratePerturbedNormal(camera, p, plane_hypothesis_now, rand_state, 0.1f * CUDART_PI_F)
+            ? GeneratePerturbedNormal(camera, p, plane_hypothesis_now, rand_state, pixel_key, 0.1f * CUDART_PI_F)
             : plane_hypothesis_now;
 
         float4 ph = n_try;
@@ -255,7 +266,7 @@ __device__ float4 GeneratePertubedPlaneHypothesis(const Camera camera, const int
     }
 
     // Final slight normal jitter around the accepted one
-    float4 out = GeneratePerturbedNormal(camera, p, best_ph, rand_state, perturbation * CUDART_PI_F);
+    float4 out = GeneratePerturbedNormal(camera, p, best_ph, rand_state, pixel_key, perturbation * CUDART_PI_F);
     out.w = GetDistance2Origin(camera, p, best_depth, out);
     return out;
 }
@@ -604,7 +615,7 @@ __device__ float ComputeGeomConsistencyCost(const cudaTextureObject_t depth_imag
     return min(max_cost, sqrt(diff_col * diff_col + diff_row * diff_row));
 }
 
-__global__ void RandomInitialization(cudaTextureObjects *texture_objects, Camera *cameras, float4 *plane_hypotheses,  float4 *scaled_plane_hypotheses, float *costs,  float *pre_costs,  curandState *rand_states, unsigned int *selected_views, float4 *prior_planes, unsigned int *plane_masks, const PatchMatchParams params)
+__global__ void RandomInitialization(cudaTextureObjects *texture_objects, Camera *cameras, float4 *plane_hypotheses,  float4 *scaled_plane_hypotheses, float *costs,  float *pre_costs,  RNGState *rand_states, unsigned int *selected_views, float4 *prior_planes, unsigned int *plane_masks, const PatchMatchParams params)
 {
     const int2 p = make_int2(blockIdx.x * blockDim.x + threadIdx.x, blockIdx.y * blockDim.y + threadIdx.y);
     int width = cameras[0].width;
@@ -615,7 +626,8 @@ __global__ void RandomInitialization(cudaTextureObjects *texture_objects, Camera
     }
 
     const int center = p.y * width + p.x;
-    curand_init(clock64(), p.y, p.x, &rand_states[center]);
+    rand_states[center].counter = 0;  // Initialize counter-based RNG
+    const unsigned int pixel_key = (unsigned int)center;
 
     // Pole guard: exclude extreme pole pixels for spherical cameras
     if (cameras[0].model == SPHERE && IsNearPole(cameras[0], p.x, p.y, 5.0f)) {
@@ -626,7 +638,7 @@ __global__ void RandomInitialization(cudaTextureObjects *texture_objects, Camera
     }
 
     if (!params.geom_consistency && !params.hierarchy ) {
-        plane_hypotheses[center] = GenerateRandomPlaneHypothesis(cameras[0], p, &rand_states[center], params.depth_min, params.depth_max);
+        plane_hypotheses[center] = GenerateRandomPlaneHypothesis(cameras[0], p, &rand_states[center], pixel_key, params.depth_min, params.depth_max);
         costs[center] = ComputeMultiViewInitialCostandSelectedViews(texture_objects[0].images, cameras, p, plane_hypotheses[center], &selected_views[center], params);
     }
     else if (params.planar_prior) {
@@ -637,8 +649,8 @@ __global__ void RandomInitialization(cudaTextureObjects *texture_objects, Camera
             float depth_perturbed = plane_hypothesis.w;
             const float depth_min_perturbed = (1 - 3 * perturbation) * depth_perturbed;
             const float depth_max_perturbed = (1 + 3 * perturbation) * depth_perturbed;
-            depth_perturbed = curand_uniform(&rand_states[center]) * (depth_max_perturbed - depth_min_perturbed) + depth_min_perturbed;
-            float4 plane_hypothesis_perturbed = GeneratePerturbedNormal(cameras[0], p, plane_hypothesis, &rand_states[center], 3 * perturbation * M_PI);
+            depth_perturbed = rng_uniform(&rand_states[center], pixel_key) * (depth_max_perturbed - depth_min_perturbed) + depth_min_perturbed;
+            float4 plane_hypothesis_perturbed = GeneratePerturbedNormal(cameras[0], p, plane_hypothesis, &rand_states[center], pixel_key, 3 * perturbation * M_PI);
             plane_hypothesis_perturbed.w = depth_perturbed;
             plane_hypotheses[center] = plane_hypothesis_perturbed;
             costs[center] = ComputeMultiViewInitialCostandSelectedViews(texture_objects[0].images, cameras, p, plane_hypotheses[center], &selected_views[center], params);
@@ -742,7 +754,8 @@ __device__ void PlaneHypothesisRefinement(const cudaTextureObject_t *images,
                                           float4 *plane_hypothesis,
                                           float *depth,
                                           float *cost,
-                                          curandState *rand_state,
+                                          RNGState *rand_state,
+                                          unsigned int pixel_key,
                                           const float *view_weights,
                                           const float weight_norm,
                                           float4 *prior_planes,
@@ -772,14 +785,14 @@ __device__ void PlaneHypothesisRefinement(const cudaTextureObject_t *images,
     if (params.planar_prior && plane_masks[center] > 0) {
         // Use prior-based sampling
         float depth_prior = ComputeDepthfromPlaneHypothesis(cameras[0], prior_planes[center], p);
-        depth_rand = SampleDepthInv(rand_state, 
+        depth_rand = SampleDepthInv(rand_state, pixel_key,
                                    fmaxf(depth_prior - 3 * depth_sigma, params.depth_min),
                                    fminf(depth_prior + 3 * depth_sigma, params.depth_max));
-        plane_hypothesis_rand = GeneratePerturbedNormal(cameras[0], p, prior_planes[center], rand_state, angle_sigma);
+        plane_hypothesis_rand = GeneratePerturbedNormal(cameras[0], p, prior_planes[center], rand_state, pixel_key, angle_sigma);
     } else {
         // Standard random sampling
-        depth_rand = SampleDepthInv(rand_state, params.depth_min, params.depth_max);
-        plane_hypothesis_rand = GenerateRandomNormal(cameras[0], p, rand_state, depth_rand);
+        depth_rand = SampleDepthInv(rand_state, pixel_key, params.depth_min, params.depth_max);
+        plane_hypothesis_rand = GenerateRandomNormal(cameras[0], p, rand_state, pixel_key, depth_rand);
     }
 
     // 2) Local window around current depth (ACMH's bounded + healed approach)
@@ -793,7 +806,7 @@ __device__ void PlaneHypothesisRefinement(const cudaTextureObject_t *images,
     float depth_perturbed = *depth;
     bool ok = false;
     for (int k = 0; k < 32; ++k) {
-        float cand = SampleDepthInv(rand_state, lo, hi);
+        float cand = SampleDepthInv(rand_state, pixel_key, lo, hi);
         if (cand >= params.depth_min && cand <= params.depth_max) {
             depth_perturbed = cand;
             ok = true;
@@ -806,7 +819,7 @@ __device__ void PlaneHypothesisRefinement(const cudaTextureObject_t *images,
 
     // 3) Slightly perturbed normal around current one
     float4 plane_hypothesis_perturbed = 
-        GeneratePerturbedNormal(cameras[0], p, *plane_hypothesis, rand_state, perturbation * CUDART_PI_F);
+        GeneratePerturbedNormal(cameras[0], p, *plane_hypothesis, rand_state, pixel_key, perturbation * CUDART_PI_F);
 
     // 4) Evaluate candidates
     const int num_planes = 5;
@@ -1109,18 +1122,18 @@ __device__ __forceinline__ void ComputeFinalCosts(
 
 // Main function with same signature - SAFE VERSION
 __device__ void CheckerboardPropagation(
-    const cudaTextureObject_t *images, 
-    const cudaTextureObject_t *depths, 
-    const Camera *cameras, 
-    float4 *plane_hypotheses, 
-    float *costs, 
-    float *pre_costs, 
-    curandState *rand_states, 
-    unsigned int *selected_views, 
-    float4 *prior_planes, 
-    unsigned int *plane_masks, 
-    const int2 p, 
-    const PatchMatchParams params, 
+    const cudaTextureObject_t *images,
+    const cudaTextureObject_t *depths,
+    const Camera *cameras,
+    float4 *plane_hypotheses,
+    float *costs,
+    float *pre_costs,
+    RNGState *rand_states,
+    unsigned int *selected_views,
+    float4 *prior_planes,
+    unsigned int *plane_masks,
+    const int2 p,
+    const PatchMatchParams params,
     const int iter)
 {
     const int width = cameras[0].width;
@@ -1141,6 +1154,15 @@ __device__ void CheckerboardPropagation(
     // Validate center index
     if (center < 0 || center >= width * height) {
         return;
+    }
+
+    // Early termination: skip pixels that have already converged
+    if (iter > 0) {
+        float current_cost = costs[center];
+        float prev_cost = pre_costs[center];
+        if (current_cost < 0.1f && fabsf(current_cost - prev_cost) < 0.002f) {
+            return;  // Already converged
+        }
     }
 
     // Calculate neighbor positions with bounds checking
@@ -1264,7 +1286,7 @@ __device__ void CheckerboardPropagation(
     
     // Safe random sampling
     for (int sample = 0; sample < 15; ++sample) {
-        const float rand_prob = curand_uniform(&rand_states[center]) - FLT_EPSILON;
+        const float rand_prob = rng_uniform(&rand_states[center], (unsigned int)center) - FLT_EPSILON;
 
         for (int image_id = 0; image_id < params.num_images - 1 && image_id < 32; ++image_id) {
             const float prob = sampling_probs[image_id];
@@ -1388,7 +1410,7 @@ __device__ void CheckerboardPropagation(
         }
     }
 
-    PlaneHypothesisRefinement(images, depths, cameras, &plane_hypotheses_now, &depth_now, &cost_now, &rand_states[center], view_weights, weight_norm, prior_planes, plane_masks, &restricted_cost, p, params);
+    PlaneHypothesisRefinement(images, depths, cameras, &plane_hypotheses_now, &depth_now, &cost_now, &rand_states[center], (unsigned int)center, view_weights, weight_norm, prior_planes, plane_masks, &restricted_cost, p, params);
 
     if (params.hierarchy) {
         if (cost_now < pre_costs[center] - 0.1f) {
@@ -1401,7 +1423,7 @@ __device__ void CheckerboardPropagation(
         plane_hypotheses[center] = plane_hypotheses_now;
     }
 }
-__global__ void BlackPixelUpdate(cudaTextureObjects *texture_objects, cudaTextureObjects *texture_depths, Camera *cameras, float4 *plane_hypotheses, float *costs,  float *pre_costs,  curandState *rand_states, unsigned int *selected_views, float4 *prior_planes, unsigned int *plane_masks, const PatchMatchParams params, const int iter)
+__global__ void BlackPixelUpdate(cudaTextureObjects *texture_objects, cudaTextureObjects *texture_depths, Camera *cameras, float4 *plane_hypotheses, float *costs,  float *pre_costs,  RNGState *rand_states, unsigned int *selected_views, float4 *prior_planes, unsigned int *plane_masks, const PatchMatchParams params, const int iter)
 {
     int2 p = make_int2(blockIdx.x * blockDim.x + threadIdx.x, blockIdx.y * blockDim.y + threadIdx.y);
     if (threadIdx.x % 2 == 0) {
@@ -1413,7 +1435,7 @@ __global__ void BlackPixelUpdate(cudaTextureObjects *texture_objects, cudaTextur
     CheckerboardPropagation(texture_objects[0].images, texture_depths[0].images, cameras, plane_hypotheses, costs, pre_costs,  rand_states, selected_views, prior_planes, plane_masks, p, params, iter);
 }
 
-__global__ void RedPixelUpdate(cudaTextureObjects *texture_objects, cudaTextureObjects *texture_depths, Camera *cameras, float4 *plane_hypotheses, float *costs,  float *pre_costs, curandState *rand_states, unsigned int *selected_views, float4 *prior_planes, unsigned int *plane_masks, const PatchMatchParams params, const int iter)
+__global__ void RedPixelUpdate(cudaTextureObjects *texture_objects, cudaTextureObjects *texture_depths, Camera *cameras, float4 *plane_hypotheses, float *costs,  float *pre_costs, RNGState *rand_states, unsigned int *selected_views, float4 *prior_planes, unsigned int *plane_masks, const PatchMatchParams params, const int iter)
 {
     int2 p = make_int2(blockIdx.x * blockDim.x + threadIdx.x, blockIdx.y * blockDim.y + threadIdx.y);
     if (threadIdx.x % 2 == 0) {
@@ -1681,6 +1703,35 @@ __device__ void CheckerboardFilter(const Camera *cameras, float4 *plane_hypothes
     const float median_value = FindMedianFast(filter, index);
     plane_hypotheses[center].w = median_value;
 }
+// Fused depth+normal+filter: GetDepthandNormal + median filter in one kernel
+__global__ void PostProcessKernel(Camera *cameras, float4 *plane_hypotheses, float *costs, const PatchMatchParams params)
+{
+    const int2 p = make_int2(blockIdx.x * blockDim.x + threadIdx.x, blockIdx.y * blockDim.y + threadIdx.y);
+    const int width = cameras[0].width;
+    const int height = cameras[0].height;
+
+    if (p.x >= width || p.y >= height) return;
+
+    const int center = p.y * width + p.x;
+
+    // Pole guard
+    if (cameras[0].model == SPHERE && IsNearPole(cameras[0], p.x, p.y, 5.0f)) {
+        plane_hypotheses[center].w = 0.f;
+        return;
+    }
+
+    // Step 1: Compute depth from plane hypothesis and transform normal
+    plane_hypotheses[center].w = ComputeDepthfromPlaneHypothesis(cameras[0], plane_hypotheses[center], p);
+    plane_hypotheses[center] = TransformNormal(cameras[0], plane_hypotheses[center]);
+}
+
+// All-pixel filter: processes both black and red pixels in one launch
+__global__ void AllPixelFilter(const Camera *cameras, float4 *plane_hypotheses, float *costs)
+{
+    const int2 p = make_int2(blockIdx.x * blockDim.x + threadIdx.x, blockIdx.y * blockDim.y + threadIdx.y);
+    CheckerboardFilter(cameras, plane_hypotheses, costs, p);
+}
+
 __global__ void BlackPixelFilter(const Camera *cameras, float4 *plane_hypotheses, float *costs)
 {
     int2 p = make_int2(blockIdx.x * blockDim.x + threadIdx.x, blockIdx.y * blockDim.y + threadIdx.y);
@@ -1747,13 +1798,11 @@ void ACMMP::RunPatchMatch(ProblemGPUResources* res) {
         CUDA_CHECK(cudaPeekAtLastError());
     }
 
-    GetDepthandNormal<<<grid_init, blk_init, 0, s>>>(res->cameras_cuda, res->plane_hypotheses_cuda, params);
+    // Fused post-processing: depth+normal computation then all-pixel filter (2 launches instead of 3)
+    PostProcessKernel<<<grid_init, blk_init, 0, s>>>(res->cameras_cuda, res->plane_hypotheses_cuda, res->costs_cuda, params);
     CUDA_CHECK(cudaPeekAtLastError());
-    
-    BlackPixelFilter<<<grid_cb, blk_cb, 0, s>>>(res->cameras_cuda, res->plane_hypotheses_cuda, res->costs_cuda);
-    CUDA_CHECK(cudaPeekAtLastError());
-    
-    RedPixelFilter<<<grid_cb, blk_cb, 0, s>>>(res->cameras_cuda, res->plane_hypotheses_cuda, res->costs_cuda);
+
+    AllPixelFilter<<<grid_init, blk_init, 0, s>>>(res->cameras_cuda, res->plane_hypotheses_cuda, res->costs_cuda);
     CUDA_CHECK(cudaPeekAtLastError());
 
     // Asynchronously copy results from device to the resource's pinned host memory.
