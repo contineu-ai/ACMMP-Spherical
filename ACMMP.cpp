@@ -331,10 +331,8 @@ void ProjectonCamera(const float3 PointX,
 float GetAngle( const cv::Vec3f &v1, const cv::Vec3f &v2 )
 {
     float dot_product = v1[0] * v2[0] + v1[1] * v2[1] + v1[2] * v2[2];
+    dot_product = std::fmax(-1.0f, std::fmin(1.0f, dot_product));
     float angle = acosf(dot_product);
-    //if angle is not a number the dot product was 1 and thus the two vectors should be identical --> return 0
-    if ( angle != angle )
-        return 0.0f;
 
     return angle;
 }
@@ -839,7 +837,7 @@ void ACMMP::CudaSpaceInitialization(const std::string &dense_folder, const Probl
 
         struct cudaTextureDesc texDesc;
         memset(&texDesc, 0, sizeof(cudaTextureDesc));
-        texDesc.addressMode[0] = cudaAddressModeWrap;
+        texDesc.addressMode[0] = cudaAddressModeClamp;
         texDesc.addressMode[1] = cudaAddressModeClamp;
         texDesc.filterMode = cudaFilterModeLinear;
         texDesc.readMode = cudaReadModeElementType;
@@ -871,7 +869,7 @@ void ACMMP::CudaSpaceInitialization(const std::string &dense_folder, const Probl
 
             struct cudaTextureDesc texDesc;
             memset(&texDesc, 0, sizeof(cudaTextureDesc));
-            texDesc.addressMode[0] = cudaAddressModeWrap;
+            texDesc.addressMode[0] = cudaAddressModeClamp;
             texDesc.addressMode[1] = cudaAddressModeClamp;
             texDesc.filterMode = cudaFilterModeLinear;
             texDesc.readMode  = cudaReadModeElementType;

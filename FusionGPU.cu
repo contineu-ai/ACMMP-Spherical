@@ -1440,7 +1440,7 @@ private:
             depth_res_desc.res.array.array = tex.depth_array;
             
             cudaTextureDesc depth_tex_desc = {};
-            depth_tex_desc.addressMode[0] = cudaAddressModeWrap;
+            depth_tex_desc.addressMode[0] = cudaAddressModeClamp;
             depth_tex_desc.addressMode[1] = cudaAddressModeClamp;
             depth_tex_desc.filterMode = cudaFilterModePoint;
             depth_tex_desc.readMode = cudaReadModeElementType;
@@ -1489,7 +1489,7 @@ private:
             normal_res_desc.res.array.array = tex.normal_array;
             
             cudaTextureDesc normal_tex_desc = {};
-            normal_tex_desc.addressMode[0] = cudaAddressModeWrap;
+            normal_tex_desc.addressMode[0] = cudaAddressModeClamp;
             normal_tex_desc.addressMode[1] = cudaAddressModeClamp;
             normal_tex_desc.filterMode = cudaFilterModePoint;
             normal_tex_desc.readMode = cudaReadModeElementType;
@@ -1536,7 +1536,7 @@ private:
             image_res_desc.res.array.array = tex.image_array;
             
             cudaTextureDesc image_tex_desc = {};
-            image_tex_desc.addressMode[0] = cudaAddressModeWrap;
+            image_tex_desc.addressMode[0] = cudaAddressModeClamp;
             image_tex_desc.addressMode[1] = cudaAddressModeClamp;
             image_tex_desc.filterMode = cudaFilterModeLinear;
             image_tex_desc.readMode = cudaReadModeElementType;
@@ -1816,8 +1816,13 @@ __global__ void CorrectedChunkBatchKernel(
         
         int src_c = static_cast<int>(proj_point.x + 0.5f);
         int src_r = static_cast<int>(proj_point.y + 0.5f);
-        
-        if (src_c < 0 || src_c >= src_cam.width || src_r < 0 || src_r >= src_cam.height) 
+
+        // Wrap x-coordinate for spherical source cameras
+        if (src_cam.model == SPHERE) {
+            src_c = ((src_c % src_cam.width) + src_cam.width) % src_cam.width;
+        }
+
+        if (src_c < 0 || src_c >= src_cam.width || src_r < 0 || src_r >= src_cam.height)
             continue;
         
         if (IsNearPole(src_cam, src_c, src_r, pole_exclusion_degrees)) {
@@ -1833,7 +1838,13 @@ __global__ void CorrectedChunkBatchKernel(
         float dummy_depth;
         ProjectonCamera_cu(PointX_src, ref_cam, reproj_point_in_ref, dummy_depth);
         
-        float reproj_error = hypotf(c - reproj_point_in_ref.x, r - reproj_point_in_ref.y);
+        float diff_x = c - reproj_point_in_ref.x;
+        if (ref_cam.model == SPHERE) {
+            const float w = static_cast<float>(ref_cam.width);
+            if (diff_x > w * 0.5f) diff_x -= w;
+            else if (diff_x < -w * 0.5f) diff_x += w;
+        }
+        float reproj_error = hypotf(diff_x, r - reproj_point_in_ref.y);
         float relative_depth_diff = fabsf(proj_depth_in_src - src_depth) / src_depth;
         
         float4 src_normal_tex = tex2D<float4>(normal_textures[src_tex_idx], src_c + 0.5f, src_r + 0.5f);

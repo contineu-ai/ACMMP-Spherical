@@ -10,9 +10,6 @@ extern __constant__ SphericalLUT* d_lut_array_const[10];
 extern __constant__ int d_num_luts;
 extern __constant__ InverseTrigLUT* d_inverse_trig_lut;
 
-// Shared memory cache for frequently accessed LUT data
-__shared__ float3 shared_dir_cache[256];
-
 // ============================================================================
 // FAST INVERSE TRIGONOMETRIC LOOKUP FUNCTIONS
 // ============================================================================
@@ -469,4 +466,4 @@ __device__ __forceinline__ bool IsNearPole(
 #define Get3DPointonRefCam_cu Get3DPointonRefCam_MultiRes
 #define ProjectonCamera_cu ProjectonCamera_MultiRes
 
-#endif // ACMMP_DEVICE_CUHsssss
+#endif // ACMMP_DEVICE_CUH

@@ -312,9 +312,16 @@ __device__ float ComputeBilateralNCC(
     ProjectonCamera_cu(Pw_center, src_camera, pt_center, dummy_depth);
     
     // Expanded early exit - check if patch will be mostly out of bounds
-    if (pt_center.x < radius || pt_center.x >= src_camera.width - radius ||
-        pt_center.y < radius || pt_center.y >= src_camera.height - radius) {
-        return cost_max;
+    // For spherical cameras, x wraps around so skip the x-bounds check
+    if (src_camera.model == SPHERE) {
+        if (pt_center.y < radius || pt_center.y >= src_camera.height - radius) {
+            return cost_max;
+        }
+    } else {
+        if (pt_center.x < radius || pt_center.x >= src_camera.width - radius ||
+            pt_center.y < radius || pt_center.y >= src_camera.height - radius) {
+            return cost_max;
+        }
     }
 
     // Precompute constants (unchanged from original optimization)
@@ -346,9 +353,18 @@ __device__ float ComputeBilateralNCC(
             float src_d;
             ProjectonCamera_cu(Pw_n, src_camera, src_pt, src_d);
             
-            // Quick bounds check - continue instead of complex conditionals
-            if (src_pt.x < 0.0f || src_pt.x >= src_camera.width ||
-                src_pt.y < 0.0f || src_pt.y >= src_camera.height) {
+            // Wrap x-coordinate for spherical cameras before bounds check
+            if (src_camera.model == SPHERE) {
+                const float w = static_cast<float>(src_camera.width);
+                if (src_pt.x < 0.0f) src_pt.x += w;
+                else if (src_pt.x >= w) src_pt.x -= w;
+            }
+
+            // Bounds check (y always checked; x checked for non-spherical)
+            if (src_pt.y < 0.0f || src_pt.y >= src_camera.height) {
+                continue;
+            }
+            if (src_camera.model != SPHERE && (src_pt.x < 0.0f || src_pt.x >= src_camera.width)) {
                 continue;
             }
 
@@ -459,7 +475,12 @@ __device__ float ComputeGeomConsistencyCost(const cudaTextureObject_t depth_imag
     float ref_d;
     ProjectonCamera_cu(src_3D_pt, ref_camera, backward_point, ref_d);
 
-    const float diff_col = p.x - backward_point.x;
+    float diff_col = p.x - backward_point.x;
+    if (ref_camera.model == SPHERE) {
+        const float w = static_cast<float>(ref_camera.width);
+        if (diff_col > w * 0.5f) diff_col -= w;
+        else if (diff_col < -w * 0.5f) diff_col += w;
+    }
     const float diff_row = p.y - backward_point.y;
     return min(max_cost, sqrt(diff_col * diff_col + diff_row * diff_row));
 }
@@ -991,10 +1012,18 @@ __device__ void CheckerboardPropagation(
     }
     
     // Calculate neighbor positions with bounds checking
-    int left_near = center - 1;
-    int left_far = center - 3;
-    int right_near = center + 1;
-    int right_far = center + 3;
+    // For spherical cameras, horizontal neighbors wrap around the seam
+    const bool is_sphere = (cameras[0].model == SPHERE);
+
+    int left_near_x  = is_sphere ? ((p.x - 1 + width) % width) : (p.x - 1);
+    int left_far_x   = is_sphere ? ((p.x - 3 + width) % width) : (p.x - 3);
+    int right_near_x = is_sphere ? ((p.x + 1) % width) : (p.x + 1);
+    int right_far_x  = is_sphere ? ((p.x + 3) % width) : (p.x + 3);
+
+    int left_near = p.y * width + left_near_x;
+    int left_far = p.y * width + left_far_x;
+    int right_near = p.y * width + right_near_x;
+    int right_far = p.y * width + right_far_x;
     int up_near = center - width;
     int up_far = center - 3 * width;
     int down_near = center + width;
@@ -1029,19 +1058,23 @@ __device__ void CheckerboardPropagation(
         ComputeMultiViewCostVector(images, cameras, p, plane_hypotheses[down_far], cost_array[3], params);
     }
 
-    // left_far - safe version
-    if (p.x > 2) {
+    // left_far - safe version (always valid for spherical cameras due to wrapping)
+    if (p.x > 2 || is_sphere) {
         flag[5] = true;
         num_valid_pixels++;
-        left_far = FindBestNeighborInDirection(costs, center, width, height, p, 5, left_far);
+        if (p.x > 2) {
+            left_far = FindBestNeighborInDirection(costs, center, width, height, p, 5, left_far);
+        }
         ComputeMultiViewCostVector(images, cameras, p, plane_hypotheses[left_far], cost_array[5], params);
     }
 
-    // right_far - safe version
-    if (p.x < width - 3) {
+    // right_far - safe version (always valid for spherical cameras due to wrapping)
+    if (p.x < width - 3 || is_sphere) {
         flag[7] = true;
         num_valid_pixels++;
-        right_far = FindBestNeighborInDirection(costs, center, width, height, p, 7, right_far);
+        if (p.x < width - 3) {
+            right_far = FindBestNeighborInDirection(costs, center, width, height, p, 7, right_far);
+        }
         ComputeMultiViewCostVector(images, cameras, p, plane_hypotheses[right_far], cost_array[7], params);
     }
 
@@ -1061,19 +1094,23 @@ __device__ void CheckerboardPropagation(
         ComputeMultiViewCostVector(images, cameras, p, plane_hypotheses[down_near], cost_array[2], params);
     }
 
-    // left_near - safe version
-    if (p.x > 0) {
+    // left_near - safe version (always valid for spherical cameras due to wrapping)
+    if (p.x > 0 || is_sphere) {
         flag[4] = true;
         num_valid_pixels++;
-        left_near = FindBestNeighborInDirection(costs, center, width, height, p, 4, left_near);
+        if (p.x > 0) {
+            left_near = FindBestNeighborInDirection(costs, center, width, height, p, 4, left_near);
+        }
         ComputeMultiViewCostVector(images, cameras, p, plane_hypotheses[left_near], cost_array[4], params);
     }
 
-    // right_near - safe version
-    if (p.x < width - 1) {
+    // right_near - safe version (always valid for spherical cameras due to wrapping)
+    if (p.x < width - 1 || is_sphere) {
         flag[6] = true;
         num_valid_pixels++;
-        right_near = FindBestNeighborInDirection(costs, center, width, height, p, 6, right_near);
+        if (p.x < width - 1) {
+            right_near = FindBestNeighborInDirection(costs, center, width, height, p, 6, right_near);
+        }
         ComputeMultiViewCostVector(images, cameras, p, plane_hypotheses[right_near], cost_array[6], params);
     }
 
@@ -1167,6 +1204,7 @@ __device__ void CheckerboardPropagation(
                     float depth_now_temp = ComputeDepthfromPlaneHypothesis(cameras[0], plane_hypotheses[final_positions[i]], p);
                     float depth_diff = depth_now_temp - depth_prior;
                     float angle_cos = Vec3DotVec3(prior_planes[center], plane_hypotheses[final_positions[i]]);
+                    angle_cos = fminf(fmaxf(angle_cos, -1.0f), 1.0f);
                     float angle_diff = acosf(angle_cos);
                     float prior = gamma + expf(- depth_diff * depth_diff / two_depth_sigma_squared) * expf(- angle_diff * angle_diff / two_angle_sigma_squared);
                     restricted_final_costs[i] = expf(-final_costs[i] * final_costs[i] / beta) * prior;
@@ -1178,6 +1216,7 @@ __device__ void CheckerboardPropagation(
             float depth_now_temp = ComputeDepthfromPlaneHypothesis(cameras[0], plane_hypotheses[center], p);
             float depth_diff = depth_now_temp - depth_prior;
             float angle_cos = Vec3DotVec3(prior_planes[center], plane_hypotheses[center]);
+            angle_cos = fminf(fmaxf(angle_cos, -1.0f), 1.0f);
             float angle_diff = acosf(angle_cos);
             float prior = gamma + expf(- depth_diff * depth_diff / two_depth_sigma_squared) * expf(- angle_diff * angle_diff / two_angle_sigma_squared);
             restricted_cost_now = expf(-cost_now * cost_now / beta) * prior;
@@ -1389,106 +1428,111 @@ __device__ void CheckerboardFilter(const Camera *cameras, float4 *plane_hypothes
     const int width_1 = width;
     const int width_3 = 3 * width;
     const int width_5 = 5 * width;
-    
+    const bool is_sphere = (cameras[0].model == SPHERE);
+
+    // Helper macro: compute index for pixel at (dx, dy) offset from p
+    // For spherical cameras, wraps x horizontally
+    #define WRAPPED_IDX(dx, dy) \
+        ((p.y + (dy)) * width + (is_sphere ? (((p.x + (dx)) % width + width) % width) : (p.x + (dx))))
+
     // Optimized neighbor collection using precomputed patterns
     // Vertical neighbors (up/down directions)
     if (p.y > 0) {
         const int up = center - width_1;
         filter[index++] = plane_hypotheses[up].w;
-        
+
         if (p.y > 2) {
             const int upup = center - width_3;
             filter[index++] = plane_hypotheses[upup].w;
-            
+
             if (p.y > 4) {
                 filter[index++] = plane_hypotheses[upup - 2 * width_1].w;
             }
         }
     }
-    
+
     if (p.y < height - 1) {
         const int down = center + width_1;
         filter[index++] = plane_hypotheses[down].w;
-        
+
         if (p.y < height - 3) {
             const int downdown = center + width_3;
             filter[index++] = plane_hypotheses[downdown].w;
-            
+
             if (p.y < height - 5) {
                 filter[index++] = plane_hypotheses[downdown + 2 * width_1].w;
             }
         }
     }
-    
+
     // Horizontal neighbors (left/right directions)
-    if (p.x > 0) {
-        const int left = center - 1;
-        filter[index++] = plane_hypotheses[left].w;
-        
-        if (p.x > 2) {
-            const int leftleft = center - 3;
-            filter[index++] = plane_hypotheses[leftleft].w;
-            
-            if (p.x > 4) {
-                filter[index++] = plane_hypotheses[leftleft - 2].w;
+    // For spherical cameras, x always wraps so neighbors are always valid
+    if (p.x > 0 || is_sphere) {
+        filter[index++] = plane_hypotheses[WRAPPED_IDX(-1, 0)].w;
+
+        if (p.x > 2 || is_sphere) {
+            filter[index++] = plane_hypotheses[WRAPPED_IDX(-3, 0)].w;
+
+            if (p.x > 4 || is_sphere) {
+                filter[index++] = plane_hypotheses[WRAPPED_IDX(-5, 0)].w;
             }
         }
     }
-    
-    if (p.x < width - 1) {
-        const int right = center + 1;
-        filter[index++] = plane_hypotheses[right].w;
-        
-        if (p.x < width - 3) {
-            const int rightright = center + 3;
-            filter[index++] = plane_hypotheses[rightright].w;
-            
-            if (p.x < width - 5) {
-                filter[index++] = plane_hypotheses[rightright + 2].w;
+
+    if (p.x < width - 1 || is_sphere) {
+        filter[index++] = plane_hypotheses[WRAPPED_IDX(1, 0)].w;
+
+        if (p.x < width - 3 || is_sphere) {
+            filter[index++] = plane_hypotheses[WRAPPED_IDX(3, 0)].w;
+
+            if (p.x < width - 5 || is_sphere) {
+                filter[index++] = plane_hypotheses[WRAPPED_IDX(5, 0)].w;
             }
         }
     }
-    
+
     // Diagonal neighbors - optimized with combined conditions
     // Upper-right and upper-left
     if (p.y > 0) {
-        if (p.x < width - 2) {
-            filter[index++] = plane_hypotheses[center - width_1 + 2].w;
+        if (p.x < width - 2 || is_sphere) {
+            filter[index++] = plane_hypotheses[WRAPPED_IDX(2, -1)].w;
         }
-        if (p.x > 1) {
-            filter[index++] = plane_hypotheses[center - width_1 - 2].w;
+        if (p.x > 1 || is_sphere) {
+            filter[index++] = plane_hypotheses[WRAPPED_IDX(-2, -1)].w;
         }
     }
-    
-    // Lower-right and lower-left  
+
+    // Lower-right and lower-left
     if (p.y < height - 1) {
-        if (p.x < width - 2) {
-            filter[index++] = plane_hypotheses[center + width_1 + 2].w;
+        if (p.x < width - 2 || is_sphere) {
+            filter[index++] = plane_hypotheses[WRAPPED_IDX(2, 1)].w;
         }
-        if (p.x > 1) {
-            filter[index++] = plane_hypotheses[center + width_1 - 2].w;
+        if (p.x > 1 || is_sphere) {
+            filter[index++] = plane_hypotheses[WRAPPED_IDX(-2, 1)].w;
         }
     }
-    
+
     // Far diagonal neighbors
     if (p.y > 2) {
-        if (p.x > 0) {
-            filter[index++] = plane_hypotheses[center - 1 - 2 * width_1].w;
+        if (p.x > 0 || is_sphere) {
+            filter[index++] = plane_hypotheses[WRAPPED_IDX(-1, -2)].w;
         }
-        if (p.x < width - 1) {
-            filter[index++] = plane_hypotheses[center + 1 - 2 * width_1].w;
+        if (p.x < width - 1 || is_sphere) {
+            filter[index++] = plane_hypotheses[WRAPPED_IDX(1, -2)].w;
         }
     }
-    
+
     if (p.y < height - 2) {
-        if (p.x > 0) {
-            filter[index++] = plane_hypotheses[center - 1 + 2 * width_1].w;
+        if (p.x > 0 || is_sphere) {
+            filter[index++] = plane_hypotheses[WRAPPED_IDX(-1, 2)].w;
         }
-        if (p.x < width - 1) {
-            filter[index++] = plane_hypotheses[center + 1 + 2 * width_1].w;
+        if (p.x < width - 1 || is_sphere) {
+            filter[index++] = plane_hypotheses[WRAPPED_IDX(1, 2)].w;
         }
     }
     
+    #undef WRAPPED_IDX
+
     // Fast median computation and assignment
     const float median_value = FindMedianFast(filter, index);
     plane_hypotheses[center].w = median_value;
