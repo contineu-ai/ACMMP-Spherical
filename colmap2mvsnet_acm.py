@@ -12,7 +12,7 @@ import numpy as np
 import cv2
 from tqdm import tqdm
 from scipy.spatial import cKDTree
-from collections import defaultdict
+from collections import Counter, defaultdict
 
 # ───────────────────────────────────────────────────────────────────────────────
 # 1.  Named-tuple data structures
@@ -243,6 +243,54 @@ def calc_score_enhanced_fast(pair, images, points3d_xyz, theta0, cam_centers, mi
     
     return i, j, base_score * btd_score * angle_score
 
+def calc_score_v2(pair, images, points3d_xyz, cam_centers, scene_btd_mu, scene_btd_sigma,
+                  min_shared=5, min_frame_gap=0):
+    """Scale-invariant scoring: sqrt(shared) * Gaussian BTD * continuous angle."""
+    i, j = pair
+    shared_pids = set(images[i].point3D_ids) & set(images[j].point3D_ids)
+    shared_pids = [pid for pid in shared_pids if pid != -1 and pid in points3d_xyz]
+
+    if len(shared_pids) < min_shared:
+        return i, j, 0.0
+
+    # Temporal filter (frame-index based, scale-free)
+    if min_frame_gap > 0 and abs(i - j) < min_frame_gap:
+        return i, j, 0.0
+
+    ci, cj = cam_centers[i], cam_centers[j]
+    shared_xyz = np.array([points3d_xyz[pid] for pid in shared_pids])
+
+    # Baseline/depth ratio (scale-invariant)
+    baseline = np.linalg.norm(ci - cj)
+    depths = np.linalg.norm(shared_xyz - ci, axis=1)
+    median_depth = np.median(depths)
+    if median_depth < 1e-6:
+        return i, j, 0.0
+    ratio = baseline / median_depth
+
+    # Scale-invariant baseline floor
+    if ratio < 1e-4:
+        return i, j, 0.0
+
+    # Adaptive Gaussian BTD (per-scene mu/sigma)
+    btd_score = np.exp(-0.5 * ((ratio - scene_btd_mu) / scene_btd_sigma) ** 2)
+
+    # Triangulation angle — continuous
+    vi, vj = shared_xyz - ci, shared_xyz - cj
+    norms_i, norms_j = np.linalg.norm(vi, axis=1), np.linalg.norm(vj, axis=1)
+    valid_mask = (norms_i > 1e-6) & (norms_j > 1e-6)
+    if not np.any(valid_mask):
+        return i, j, 0.0
+    dots = np.sum(vi[valid_mask] * vj[valid_mask], axis=1)
+    cos_angles = np.clip(dots / (norms_i[valid_mask] * norms_j[valid_mask]), -1.0, 1.0)
+    median_angle = np.median(np.degrees(np.arccos(cos_angles)))
+    angle_score = np.clip(median_angle / 5.0, 0.0, 1.5)
+
+    # sqrt(shared) compresses count dominance
+    base_score = np.sqrt(float(len(shared_pids)))
+
+    return i, j, base_score * btd_score * angle_score
+
 # ───────────────────────────────────────────────────────────────────────────────
 # 7.  Neighbor selection
 # ───────────────────────────────────────────────────────────────────────────────
@@ -303,6 +351,103 @@ def select_diverse_multiscale_neighbors_fast(ref_idx, candidates, cam_centers, t
             if len(selected) >= top_k: break
     
     return selected
+
+def select_neighbors_angular_coverage(ref_idx, candidates, cam_centers,
+                                      min_views=8, max_views=20,
+                                      novelty_boost=2.0, stop_ratio=0.15,
+                                      min_novelty=0.10, novelty_floor=0.05):
+    """Greedy selection maximising angular + baseline diversity (vectorized)."""
+    if not candidates:
+        return []
+
+    ci = cam_centers[ref_idx]
+    n = len(candidates)
+
+    # Pre-compute everything as contiguous arrays
+    cand_idx   = np.array([idx for idx, _ in candidates])
+    cand_score = np.array([sc  for _, sc  in candidates], dtype=np.float64)
+    cand_pos   = np.array([cam_centers[idx] for idx, _ in candidates])
+    bearings   = cand_pos - ci                                  # (n, 3)
+    dists      = np.linalg.norm(bearings, axis=1)               # (n,)
+    safe       = dists > 1e-12
+    bearings[safe] /= dists[safe, np.newaxis]
+    log_dists  = np.log(dists + 1e-12)                          # (n,)
+
+    max_score = cand_score.max()
+    if max_score <= 0:
+        return []
+    norm_scores = cand_score / max_score                        # [0, 1]
+
+    # Tracking arrays — avoid Python lists for selected bearings/log_dists
+    sel_bearings  = np.empty((max_views, 3), dtype=np.float64)
+    sel_log_dists = np.empty(max_views, dtype=np.float64)
+    alive         = norm_scores > 0                             # mask of usable candidates
+    n_sel         = 0
+    initial_metric = None
+    result = []
+
+    pi_over_4 = np.pi / 4.0
+    log_3     = np.log(3.0)
+    novelty_floor = float(np.clip(novelty_floor, 0.0, 1.0))
+    min_novelty = float(np.clip(min_novelty, 0.0, 1.0))
+
+    for pick in range(max_views):
+        if not np.any(alive):
+            break
+
+        if n_sel == 0:
+            # First pick: pure quality, full novelty
+            metrics = np.where(alive, norm_scores * (1.0 + novelty_boost), -1.0)
+        else:
+            # Batch angular novelty: bearings[alive] @ sel_bearings[:n_sel].T → (n_alive, n_sel)
+            cos_mat = bearings @ sel_bearings[:n_sel].T         # (n, n_sel)
+            max_cos = cos_mat.max(axis=1)                       # (n,) best cosine to any selected
+            np.clip(max_cos, -1.0, 1.0, out=max_cos)
+            ang_nov = np.arccos(max_cos)                        # min angle = arccos(max_cos)
+            ang_nov /= pi_over_4
+            np.clip(ang_nov, 0.0, 1.0, out=ang_nov)
+
+            # Batch baseline novelty
+            log_diff = np.abs(log_dists[:, np.newaxis] - sel_log_dists[:n_sel])  # (n, n_sel)
+            min_log_diff = log_diff.min(axis=1)                 # (n,)
+            bl_nov = min_log_diff / log_3
+            np.clip(bl_nov, 0.0, 1.0, out=bl_nov)
+
+            novelty = ang_nov + 0.3 * bl_nov
+            np.clip(novelty, 0.0, 1.0, out=novelty)
+            # Penalize near-duplicates directly in the metric so high-quality clones
+            # do not dominate solely due to score.
+            novelty_weight = novelty_floor + (1.0 - novelty_floor) * novelty
+            metrics = np.where(
+                alive,
+                norm_scores * novelty_weight * (1.0 + novelty_boost * novelty),
+                -1.0
+            )
+
+        best_local = int(metrics.argmax())
+        best_metric = metrics[best_local]
+        if best_metric <= 0:
+            break
+
+        if pick == 1:
+            initial_metric = best_metric
+
+        if pick >= min_views and initial_metric is not None:
+            if best_metric < initial_metric * stop_ratio:
+                break
+
+        # Redundancy check: stop if best candidate is a near-duplicate of a selected view
+        if pick >= min_views and n_sel > 0:
+            if novelty[best_local] < min_novelty:
+                break
+
+        alive[best_local] = False
+        sel_bearings[n_sel]  = bearings[best_local]
+        sel_log_dists[n_sel] = log_dists[best_local]
+        n_sel += 1
+        result.append((int(cand_idx[best_local]), float(cand_score[best_local])))
+
+    return result
 
 # ───────────────────────────────────────────────────────────────────────────────
 # 8.  OPTIMIZED IMAGE COPYING/LINKING
@@ -775,55 +920,163 @@ def process_scene(args):
         print(f"[INFO] Sample depth range (image {sample_idx}): min={dmin:.2f}, max={dmax:.2f}, planes={dnum}")
 
     # Spatial filtering
-    print("[INFO] Building spatial index...")
+    use_v2 = getattr(args, 'view_selection', 'v2') == 'v2'
+    print(f"[INFO] View selection: {'v2 (angular coverage)' if use_v2 else 'legacy'}")
     valid_keys = sorted(depth_ranges.keys())
-    centers = np.array([cam_centers[i] for i in valid_keys])
-    tree = cKDTree(centers)
-    
-    k_factor = 5 if N < 100 else (3 if N < 1000 else 2)
-    k_search = min(args.top_k * k_factor, len(valid_keys))
-    
-    print(f"[INFO] Querying {k_search} nearest neighbors...")
-    _, nnidx = tree.query(centers, k=k_search)
-    
-    candidate_pairs = set()
-    for src_idx, neighs in enumerate(nnidx):
-        src = valid_keys[src_idx]
-        for n in neighs:
-            if n == src_idx: continue
-            dst = valid_keys[n]
-            a, b = min(src, dst), max(src, dst)
-            candidate_pairs.add((a, b))
-    
-    print(f"[INFO] {len(candidate_pairs)} candidate pairs (from {N*(N-1)//2} possible)")
+    valid_keys_set = set(valid_keys)
 
-    # Pre-filter by shared points
-    print("[INFO] Pre-filtering pairs...")
-    filtered_pairs = []
-    min_shared = max(5, args.min_shared // 2)
-    
-    for pair in tqdm(candidate_pairs, desc="Pre-filtering"):
-        i, j = pair
-        shared = len(set(imgs[i].point3D_ids) & set(imgs[j].point3D_ids))
-        if shared >= min_shared:
-            filtered_pairs.append(pair)
-    
-    print(f"[INFO] {len(filtered_pairs)} pairs after pre-filter")
+    # Pre-compute per-image point ID sets (once, reused by filter + scoring)
+    print("[INFO] Pre-computing point sets...")
+    valid_pids_set = set(points3d_xyz.keys())
+    img_pid_sets = {}
+    for i in valid_keys:
+        raw = imgs[i].point3D_ids
+        img_pid_sets[i] = set(pid for pid in raw if pid != -1 and pid in valid_pids_set)
 
-    # Score pairs
-    print("[INFO] Scoring pairs...")
-    func = partial(calc_score_enhanced_fast, images=imgs, points3d_xyz=points3d_xyz,
-                   theta0=args.theta0, cam_centers=cam_centers, min_shared=args.min_shared)
-    
-    score_dict = {}
-    with mp.Pool(processes=mp.cpu_count()) as pool:
-        results = pool.imap_unordered(func, filtered_pairs, chunksize=args.chunksize)
-        for i, j, s in tqdm(results, total=len(filtered_pairs), desc="Scoring"):
+    min_shared_pre = max(5, args.min_shared // 2)
+    min_shared_score = args.min_shared
+    min_frame_gap = args.min_frame_gap if use_v2 else 0
+
+    if use_v2:
+        # ── Co-visibility graph from 3D points ──────────────────────────────
+        print("[INFO] Building co-visibility graph...")
+        orig_to_new = {k: i for i, k in enumerate(sorted(imgs_raw))}
+        pair_counts = Counter()
+        for pid, pt in pts.items():
+            obs = set()
+            for oid in pt.image_ids:
+                new_id = orig_to_new.get(oid, -1)
+                if new_id in valid_keys_set:
+                    obs.add(new_id)
+            obs = sorted(obs)
+            n = len(obs)
+            if n < 2:
+                continue
+            for a in range(n):
+                for b in range(a + 1, n):
+                    pair_counts[(obs[a], obs[b])] += 1
+
+        candidate_pairs = [pair for pair, cnt in pair_counts.items()
+                           if cnt >= min_shared_pre]
+        print(f"[INFO] {len(candidate_pairs)} co-visible pairs "
+              f"(from {N*(N-1)//2} possible)")
+
+        # ── BTD sampling ────────────────────────────────────────────────────
+        btd_samples = []
+        btd_sample_limit = 2000
+        btd_sample_step = max(1, len(candidate_pairs) // btd_sample_limit)
+        for idx, pair in enumerate(candidate_pairs):
+            if idx % btd_sample_step != 0 or len(btd_samples) >= btd_sample_limit:
+                continue
+            i, j = pair
+            if pair_counts[pair] < 5:
+                continue
+            shared = list(img_pid_sets[i] & img_pid_sets[j])
+            ci_s, cj_s = cam_centers[i], cam_centers[j]
+            bl = np.linalg.norm(ci_s - cj_s)
+            xyz = np.array([points3d_xyz[pid] for pid in shared[:50]])
+            md = np.median(np.linalg.norm(xyz - ci_s, axis=1))
+            if md > 1e-6:
+                btd_samples.append(bl / md)
+
+        if btd_samples:
+            btd_arr = np.array(btd_samples)
+            scene_btd_mu = float(np.median(btd_arr))
+            mad = float(np.median(np.abs(btd_arr - scene_btd_mu)))
+            scene_btd_sigma = max(mad * 1.4826, scene_btd_mu * 0.2)
+            scene_btd_sigma = min(scene_btd_sigma, scene_btd_mu * 2.0)
+        else:
+            scene_btd_mu, scene_btd_sigma = 0.06, 0.03
+        print(f"[INFO] Scene BTD: mu={scene_btd_mu:.4f}, sigma={scene_btd_sigma:.4f} "
+              f"(from {len(btd_samples)} samples)")
+
+        # ── Scoring ─────────────────────────────────────────────────────────
+        print(f"[INFO] Scoring {len(candidate_pairs)} pairs...")
+        inv_sigma = 1.0 / scene_btd_sigma
+        score_dict = {}
+        for pair in tqdm(candidate_pairs, desc="Scoring", mininterval=0.5):
+            i, j = pair
+            if min_frame_gap > 0 and abs(i - j) < min_frame_gap:
+                continue
+            n_shared = pair_counts[pair]
+            if n_shared < min_shared_score:
+                continue
+            ci, cj = cam_centers[i], cam_centers[j]
+            baseline_vec = ci - cj
+            baseline = np.sqrt(baseline_vec @ baseline_vec)
+            # Get actual shared points for xyz lookup
+            shared = img_pid_sets[i] & img_pid_sets[j]
+            shared_list = list(shared)
+            if len(shared_list) > 60:
+                shared_list = shared_list[:60]
+            xyz = np.array([points3d_xyz[pid] for pid in shared_list])
+            d_vecs = xyz - ci
+            depths = np.sqrt(np.sum(d_vecs * d_vecs, axis=1))
+            median_depth = np.median(depths)
+            if median_depth < 1e-6:
+                continue
+            ratio = baseline / median_depth
+            if ratio < 1e-4:
+                continue
+            btd_score = np.exp(-0.5 * ((ratio - scene_btd_mu) * inv_sigma) ** 2)
+            # Triangulation angle
+            vj = xyz - cj
+            norms_j = np.sqrt(np.sum(vj * vj, axis=1))
+            valid = (depths > 1e-6) & (norms_j > 1e-6)
+            if not np.any(valid):
+                continue
+            dots = np.sum(d_vecs[valid] * vj[valid], axis=1)
+            cos_a = dots / (depths[valid] * norms_j[valid])
+            np.clip(cos_a, -1.0, 1.0, out=cos_a)
+            median_angle = np.degrees(np.median(np.arccos(cos_a)))
+            angle_score = min(median_angle / 5.0, 1.5)
+            s = np.sqrt(float(n_shared)) * btd_score * angle_score
             if s > 0:
                 score_dict[(i, j)] = s
                 score_dict[(j, i)] = s
-    
-    print(f"[INFO] {len(score_dict) // 2} scored pairs")
+
+        print(f"[INFO] {len(score_dict) // 2} scored pairs")
+    else:
+        # ── Legacy path: KD-tree + multiprocess scoring ─────────────────────
+        print("[INFO] Building spatial index...")
+        centers = np.array([cam_centers[i] for i in valid_keys])
+        tree = cKDTree(centers)
+        k_factor = 5 if N < 100 else (3 if N < 1000 else 2)
+        k_search = min(args.top_k * k_factor, len(valid_keys))
+
+        print(f"[INFO] Querying {k_search} nearest neighbors...")
+        _, nnidx = tree.query(centers, k=k_search)
+
+        candidate_pairs = set()
+        for src_idx, neighs in enumerate(nnidx):
+            src = valid_keys[src_idx]
+            for n in neighs:
+                if n == src_idx: continue
+                dst = valid_keys[n]
+                a, b = min(src, dst), max(src, dst)
+                candidate_pairs.add((a, b))
+
+        print(f"[INFO] {len(candidate_pairs)} candidate pairs (from {N*(N-1)//2} possible)")
+
+        print("[INFO] Pre-filtering pairs...")
+        filtered_pairs = []
+        for pair in tqdm(candidate_pairs, desc="Pre-filtering"):
+            i, j = pair
+            if len(img_pid_sets[i] & img_pid_sets[j]) >= min_shared_pre:
+                filtered_pairs.append(pair)
+        print(f"[INFO] {len(filtered_pairs)} pairs after pre-filter")
+
+        print("[INFO] Scoring pairs...")
+        func = partial(calc_score_enhanced_fast, images=imgs, points3d_xyz=points3d_xyz,
+                       theta0=args.theta0, cam_centers=cam_centers, min_shared=min_shared_score)
+        score_dict = {}
+        with mp.Pool(processes=mp.cpu_count()) as pool:
+            results = pool.imap_unordered(func, filtered_pairs, chunksize=args.chunksize)
+            for i, j, s in tqdm(results, total=len(filtered_pairs), desc="Scoring"):
+                if s > 0:
+                    score_dict[(i, j)] = s
+                    score_dict[(j, i)] = s
+        print(f"[INFO] {len(score_dict) // 2} scored pairs")
 
     # Select neighbors
     print("[INFO] Selecting neighbors...")
@@ -832,24 +1085,71 @@ def process_scene(args):
     for (i, j), score in score_dict.items():
         if i in depth_ranges and j in depth_ranges:
             img_candidates[i].append((j, score))
-    
-    if N > 500:
-        worker_func = partial(_select_for_image_worker, depth_ranges=depth_ranges,
-                             img_candidates=img_candidates, cam_centers=cam_centers,
-                             top_k=args.top_k, diversity_threshold=args.diversity_threshold)
-        with mp.Pool(processes=mp.cpu_count()) as pool:
-            results = pool.map(worker_func, range(N), chunksize=10)
-            for img_idx, selected in results:
-                view_sel[img_idx] = selected
+
+    if use_v2:
+        for i in tqdm(range(N), desc="Neighbor selection (v2)"):
+            if i not in depth_ranges:
+                continue
+            view_sel[i] = select_neighbors_angular_coverage(
+                i, img_candidates[i], cam_centers,
+                min_views=args.min_views, max_views=args.top_k,
+                novelty_boost=args.novelty_boost, stop_ratio=args.stop_ratio,
+                min_novelty=args.min_novelty, novelty_floor=args.novelty_floor)
     else:
-        for i in tqdm(range(N), desc="Neighbor selection"):
-            if i not in depth_ranges: continue
-            view_sel[i] = select_diverse_multiscale_neighbors_fast(
-                i, img_candidates[i], cam_centers, top_k=args.top_k,
-                diversity_threshold=args.diversity_threshold)
-    
-    avg_neighbors = np.mean([len(v) for v in view_sel if v])
-    print(f"[INFO] Average neighbors: {avg_neighbors:.1f}")
+        if N > 500:
+            worker_func = partial(_select_for_image_worker, depth_ranges=depth_ranges,
+                                 img_candidates=img_candidates, cam_centers=cam_centers,
+                                 top_k=args.top_k, diversity_threshold=args.diversity_threshold)
+            with mp.Pool(processes=mp.cpu_count()) as pool:
+                results = pool.map(worker_func, range(N), chunksize=10)
+                for img_idx, selected in results:
+                    view_sel[img_idx] = selected
+        else:
+            for i in tqdm(range(N), desc="Neighbor selection"):
+                if i not in depth_ranges:
+                    continue
+                view_sel[i] = select_diverse_multiscale_neighbors_fast(
+                    i, img_candidates[i], cam_centers, top_k=args.top_k,
+                    diversity_threshold=args.diversity_threshold)
+
+    # ── Diagnostics ─────────────────────────────────────────────────────────
+    counts = [len(v) for v in view_sel if v]
+    if counts:
+        avg_neighbors = np.mean(counts)
+        print(f"[INFO] View counts: min={min(counts)}, max={max(counts)}, "
+              f"mean={avg_neighbors:.1f}, median={int(np.median(counts))}")
+    else:
+        avg_neighbors = 0.0
+        print("[WARN] No neighbors selected for any image")
+
+    if use_v2 and counts:
+        # Vectorized diagnostics — sample up to 200 images for speed
+        diag_refs = [i for i in range(N) if len(view_sel[i]) >= 2]
+        if len(diag_refs) > 200:
+            diag_refs = [diag_refs[k] for k in
+                         np.random.RandomState(0).choice(len(diag_refs), 200, replace=False)]
+        ang_coverages, temporal_gaps = [], []
+        for ref_i in diag_refs:
+            ci_d = cam_centers[ref_i]
+            sel_ids = np.array([j for j, _ in view_sel[ref_i]])
+            sel_pos = np.array([cam_centers[j] for j in sel_ids])
+            vecs = sel_pos - ci_d
+            norms = np.linalg.norm(vecs, axis=1)
+            good = norms > 1e-12
+            if good.sum() < 2:
+                continue
+            bd = vecs[good] / norms[good, np.newaxis]
+            dots_d = np.clip(bd @ bd.T, -1.0, 1.0)
+            ii, jj = np.triu_indices(len(bd), k=1)
+            ang_coverages.append(np.degrees(np.arccos(dots_d[ii, jj])).mean())
+            temporal_gaps.extend(np.abs(sel_ids - ref_i).tolist())
+        # BTD ratio: reuse scene samples already computed above
+        if ang_coverages:
+            print(f"[INFO] Angular coverage: mean={np.mean(ang_coverages):.1f}deg")
+        if scene_btd_mu > 0:
+            print(f"[INFO] BTD ratio spread: mu={scene_btd_mu:.4f}, sigma={scene_btd_sigma:.4f}")
+        if temporal_gaps:
+            print(f"[INFO] Temporal spread: mean={np.mean(temporal_gaps):.1f} frames")
 
     # Write camera files
     print("[INFO] Writing camera files...")
@@ -880,7 +1180,7 @@ def process_scene(args):
         valid_img_to_seq = {img_id: seq_idx for seq_idx, img_id in enumerate(valid_images)}
         
         for seq_idx, i in enumerate(valid_images):
-            neighbors = [(j, int(score_val)) for j, score_val in view_sel[i]
+            neighbors = [(j, round(score_val, 2)) for j, score_val in view_sel[i]
                         if j in valid_images and score_val > 0]
             f.write(f"{seq_idx}\n{len(neighbors)} ")
             for j, s in neighbors:
@@ -960,6 +1260,24 @@ Examples:
     ap.add_argument("--min_shared", type=int, default=10)
     ap.add_argument("--chunksize", type=int, default=512)
     ap.add_argument("--diversity_threshold", type=float, default=0.3)
+
+    # View selection v2 options
+    vs_group = ap.add_argument_group('View selection')
+    vs_group.add_argument("--view_selection", default="v2", choices=["legacy", "v2"],
+                          help="View selection algorithm (default: v2)")
+    vs_group.add_argument("--min_views", type=int, default=8,
+                          help="Minimum source views per reference (default: 8)")
+    vs_group.add_argument("--min_frame_gap", type=int, default=0,
+                          help="Skip candidates within N frames of reference (default: 0)")
+    vs_group.add_argument("--novelty_boost", type=float, default=2.0,
+                          help="Novelty multiplier in selection metric (default: 2.0)")
+    vs_group.add_argument("--novelty_floor", type=float, default=0.05,
+                          help="Minimum novelty weight in metric [0..1] (default: 0.05)")
+    vs_group.add_argument("--stop_ratio", type=float, default=0.15,
+                          help="Auto-stop: fraction of initial gain (default: 0.15)")
+    vs_group.add_argument("--min_novelty", type=float, default=0.10,
+                          help="Stop if best remaining candidate novelty is below this (default: 0.10)")
+
     ap.add_argument("--sphere_tag", action="store_true", default=True,
                     help="Write 'SPHERE' tag in cam files (default: True for spherical cameras)")
     ap.add_argument("--no_sphere_tag", action="store_true",
