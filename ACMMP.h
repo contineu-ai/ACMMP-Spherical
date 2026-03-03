@@ -61,6 +61,7 @@ struct PatchMatchParams {
     bool multi_geometry = false;
     bool hierarchy = false;
     bool upsample = false;
+    bool has_mask = false;
 };
 
 class ACMMP {
@@ -68,11 +69,13 @@ public:
     ACMMP();
     ~ACMMP();
     void SetStream(cudaStream_t s) { stream_ = s; }
-    cudaStream_t GetStream() const { return stream_; }   // <-- add this
+    cudaStream_t GetStream() const { return stream_; }
 
-    void InuputInitialization(const std::string &dense_folder, const std::vector<Problem> &problems, const int idx);
+    void InputInitialization(const std::string &dense_folder, const std::vector<Problem> &problems, const int idx);
+    void InputInitialization(const std::string &dense_folder, const std::vector<Problem> &problems, const int idx, class ImageCache& cache);
     void CudaSpaceInitialization(const std::string &dense_folder, const Problem &problem, ProblemGPUResources* res);
-    void RunPatchMatch(ProblemGPUResources* res);    void Colmap2MVS(const std::string &dense_folder, std::vector<Problem> &problems);
+    void RunPatchMatch(ProblemGPUResources* res, bool skip_host_download = false);
+    void Colmap2MVS(const std::string &dense_folder, std::vector<Problem> &problems);
     void SetGeomConsistencyParams(bool multi_geometry);
     void SetPlanarPriorParams();
     void SetHierarchyParams();
@@ -82,6 +85,7 @@ public:
     cv::Mat GetReferenceImage();
     cv::Mat GetReferenceMask();  // Get reference mask for filtering
     bool HasMasks() const { return has_masks_; }  // Check if masks available
+    void SetBatchMode() { batch_mode_ = true; }
     float4 GetPlaneHypothesis(const int index);
     float GetCost(const int index);
     void GetSupportPoints(std::vector<cv::Point>& support2DPoints);
@@ -90,13 +94,14 @@ public:
     float GetDepthFromPlaneParam(const float4 plane_hypothesis, const int x, const int y);
     float GetMinDepth();
     float GetMaxDepth();
-    void CudaPlanarPriorInitialization(const std::vector<float4> &PlaneParams, const cv::Mat_<float> &masks);
+    void CudaPlanarPriorInitialization(const std::vector<float4> &PlaneParams, const cv::Mat_<float> &masks, ProblemGPUResources* res = nullptr);
 private:
     cudaStream_t stream_ = 0; // default stream
+    bool batch_mode_ = false;
     int num_images;
     std::vector<cv::Mat> images;
     std::vector<cv::Mat> depths;
-    std::vector<cv::Mat> masks;  // Mask images (0=masked, 255=valid)
+    std::vector<cv::Mat> masks;  // Mask images: >0.5 = masked (white/skip), <=0.5 = valid (black/keep)
     bool has_masks_ = false;     // Flag indicating masks are available
     std::vector<Camera> cameras;
 

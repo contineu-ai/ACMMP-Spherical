@@ -12,6 +12,7 @@
 #include <queue>
 #include <atomic>
 #include <unordered_map>
+#include <list>
 #include <functional>
 #include <cuda_runtime.h>
 #include "main.h"
@@ -27,6 +28,35 @@
 
 // Forward declarations
 struct Problem;
+
+// ── LRU Image Cache ──────────────────────────────────────────────────────────
+struct ImageCacheEntry {
+    cv::Mat image_float;   // grayscale float32 full-res
+    Camera camera;
+    cv::Mat mask_float;    // normalized 0-1, empty if no mask
+    bool has_mask = false;
+};
+
+class ImageCache {
+public:
+    ImageCache(size_t max_entries, const std::string& dense_folder, bool has_masks);
+    std::shared_ptr<const ImageCacheEntry> get(int image_id);  // thread-safe
+    size_t hits() const { std::lock_guard<std::mutex> lk(mutex_); return hits_; }
+    size_t misses() const { std::lock_guard<std::mutex> lk(mutex_); return misses_; }
+private:
+    mutable std::mutex mutex_;
+    size_t max_entries_;
+    std::string dense_folder_;
+    bool has_masks_;
+    std::unordered_map<int, std::shared_ptr<ImageCacheEntry>> cache_;
+    std::list<int> lru_order_;
+    size_t hits_ = 0;
+    size_t misses_ = 0;
+    void evict_if_needed();  // under lock
+    std::shared_ptr<ImageCacheEntry> load(int image_id);
+};
+
+// ── ProblemGPUResources ──────────────────────────────────────────────────────
 class ProblemGPUResources {
 public:
     ProblemGPUResources();
@@ -59,6 +89,16 @@ public:
     float* depths_cuda = nullptr;
     float4* prior_planes_cuda = nullptr;
     unsigned int* plane_masks_cuda = nullptr;
+    uint8_t* ref_mask_cuda = nullptr;  // Item 4: 1=masked, 0=valid
+
+    // Item 5: Batch planar prior buffers
+    int2* support_points_cuda = nullptr;
+    int* num_support_points_cuda = nullptr;   // device atomic counter
+    int2* triangle_vertices_cuda = nullptr;   // packed [v1,v2,v3,...], 3 per triangle
+
+    // Pinned host counterparts for planar prior
+    int2* support_points_pinned = nullptr;
+    int* num_support_points_pinned = nullptr;
 
     // === HOST-SIDE HELPERS (Owned by this object) ===
     // Host-side structs that hold the CUDA texture object handles.
@@ -69,6 +109,10 @@ public:
     // Pinned host memory for fast, asynchronous DMA transfers
     float4* planes_host_pinned = nullptr;
     float* costs_host_pinned = nullptr;
+
+    // Texture reuse tracking
+    int allocated_images = 0;       // how many array slots were allocated
+    bool textures_created = false;  // texture objects created once in allocate()
 };
 
 // Structure to hold completed results for disk writing
@@ -195,6 +239,9 @@ private:
     // Memory estimation
     size_t available_gpu_memory;
     size_t memory_per_problem;
+
+    // Image/camera/mask cache
+    std::unique_ptr<ImageCache> image_cache_;
     
     // Internal methods
     void initializeResourcePool();

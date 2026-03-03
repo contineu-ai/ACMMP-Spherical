@@ -1,9 +1,3 @@
-// FULLY C++11 COMPATIBLE VERSION - Memory Optimized
-// FIXED: Memory leaks and accumulation issues
-// FIXED: Limited async concurrency to prevent memory spikes
-// FIXED: Streaming point output to disk
-// FIXED: Reduced cache size and explicit deallocation
-
 #include "ACMMP.h"
 #include "ACMMP_device.cuh"
 #include "FusionGPU.h"
@@ -89,7 +83,7 @@ public:
 };
 
 // ============================================================================
-// SECTION 2: RAII WRAPPERS FOR MEMORY SAFETY
+// SECTION 2: RAII MEMORY WRAPPERS
 // ============================================================================
 
 template<typename T>
@@ -345,7 +339,7 @@ public:
 };
 
 // ============================================================================
-// SECTION 4: SAFE ARITHMETIC AND UTILITY FUNCTIONS
+// SECTION 4: ARITHMETIC AND UTILITY FUNCTIONS
 // ============================================================================
 
 template<typename T>
@@ -496,7 +490,7 @@ public:
 };
 
 // ============================================================================
-// SECTION 6: LOOKUP TABLES WITH EXCEPTION SAFETY
+// SECTION 6: LOOKUP TABLES
 // ============================================================================
 
 struct ImageLookupTables {

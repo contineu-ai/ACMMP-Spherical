@@ -1,10 +1,9 @@
 #include "ACMMP.h"
-#include "BatchACMMP.h" 
+#include "BatchACMMP.h"
 #include "ACMMP_device.cuh"  // Include the device functions header
 #include <math_constants.h>  // for CUDART_PI_F
 #include <memory>
-// extern __constant__ SphericalLUT* d_lut_array_const[10];
-// extern __constant__ int d_num_luts;
+
 
 // Lightweight counter-based RNG using Philox4x32-10 as a hash function.
 // Each call increments the counter and produces a uniform float in (0,1].
@@ -27,16 +26,16 @@ __device__ __forceinline__ float SampleDepthInv(RNGState* rs, unsigned int pixel
     return __fdividef(1.0f, inv);
 }
 
-#define mul4(v,k) { \
-    v->x = v->x * k; \
-    v->y = v->y * k; \
-    v->z = v->z * k;\
+__device__ __forceinline__ void ScaleVec3(float4* v, float k) {
+    v->x *= k;
+    v->y *= k;
+    v->z *= k;
 }
 
-#define vecdiv4(v,k) { \
-    v->x = v->x / k; \
-    v->y = v->y / k; \
-    v->z = v->z / k;\
+__device__ __forceinline__ void DivVec3(float4* v, float k) {
+    v->x /= k;
+    v->y /= k;
+    v->z /= k;
 }
 
 __device__  void sort_small(float *d, const int n)
@@ -231,7 +230,7 @@ __device__ float4 GenerateRandomPlaneHypothesis(const Camera camera, const int2 
     return plane_hypothesis;
 }
 
-__device__ float4 GeneratePertubedPlaneHypothesis(const Camera camera, const int2 p,
+__device__ float4 GeneratePerturbedPlaneHypothesis(const Camera camera, const int2 p,
                                                   RNGState *rand_state, unsigned int pixel_key, const float perturbation,
                                                   const float4 plane_hypothesis_now,
                                                   const float depth_now,
@@ -615,7 +614,8 @@ __device__ float ComputeGeomConsistencyCost(const cudaTextureObject_t depth_imag
     return min(max_cost, sqrt(diff_col * diff_col + diff_row * diff_row));
 }
 
-__global__ void RandomInitialization(cudaTextureObjects *texture_objects, Camera *cameras, float4 *plane_hypotheses,  float4 *scaled_plane_hypotheses, float *costs,  float *pre_costs,  RNGState *rand_states, unsigned int *selected_views, float4 *prior_planes, unsigned int *plane_masks, const PatchMatchParams params)
+template<bool UseMask>
+__global__ void RandomInitialization(cudaTextureObjects *texture_objects, Camera *cameras, float4 *plane_hypotheses,  float4 *scaled_plane_hypotheses, float *costs,  float *pre_costs,  RNGState *rand_states, unsigned int *selected_views, float4 *prior_planes, unsigned int *plane_masks, const uint8_t *ref_mask, const PatchMatchParams params)
 {
     const int2 p = make_int2(blockIdx.x * blockDim.x + threadIdx.x, blockIdx.y * blockDim.y + threadIdx.y);
     int width = cameras[0].width;
@@ -637,11 +637,16 @@ __global__ void RandomInitialization(cudaTextureObjects *texture_objects, Camera
         return;
     }
 
-    if (!params.geom_consistency && !params.hierarchy ) {
-        plane_hypotheses[center] = GenerateRandomPlaneHypothesis(cameras[0], p, &rand_states[center], pixel_key, params.depth_min, params.depth_max);
-        costs[center] = ComputeMultiViewInitialCostandSelectedViews(texture_objects[0].images, cameras, p, plane_hypotheses[center], &selected_views[center], params);
+    // Skip masked pixels (compiled out when UseMask=false)
+    if (UseMask && ref_mask[center]) {
+        plane_hypotheses[center] = make_float4(0.f, 0.f, 1.f, 0.f);
+        costs[center] = 2.0f;
+        selected_views[center] = 0;
+        return;
     }
-    else if (params.planar_prior) {
+
+    if (params.planar_prior) {
+        // Prior-assisted init: must be checked BEFORE the default random init
         if (plane_masks[center] > 0 && costs[center] >= 0.1f) {
             float perturbation = 0.02f;
 
@@ -662,6 +667,11 @@ __global__ void RandomInitialization(cudaTextureObjects *texture_objects, Camera
             plane_hypotheses[center] = plane_hypothesis;
             costs[center] = ComputeMultiViewInitialCostandSelectedViews(texture_objects[0].images, cameras, p, plane_hypotheses[center], &selected_views[center], params);
         }
+    }
+    else if (!params.geom_consistency && !params.hierarchy) {
+        // Default random init
+        plane_hypotheses[center] = GenerateRandomPlaneHypothesis(cameras[0], p, &rand_states[center], pixel_key, params.depth_min, params.depth_max);
+        costs[center] = ComputeMultiViewInitialCostandSelectedViews(texture_objects[0].images, cameras, p, plane_hypotheses[center], &selected_views[center], params);
     }
     else {
         if(params.upsample) {
@@ -711,14 +721,14 @@ __global__ void RandomInitialization(cudaTextureObjects *texture_objects, Camera
                     totalgauss = sgauss * rgauss;
                     normalizing_factor += totalgauss;
                     c_total_val += srcPix * totalgauss;
-                    mul4((&srcNorm), totalgauss);
+                    ScaleVec3(&srcNorm, totalgauss);
                     n_total_val.x  = n_total_val.x + srcNorm.x;
                     n_total_val.y  = n_total_val.y + srcNorm.y;
                     n_total_val.z  = n_total_val.z + srcNorm.z;
                 }
             }
             costs[center] = c_total_val / normalizing_factor;
-            vecdiv4((&n_total_val), normalizing_factor);
+            DivVec3(&n_total_val, normalizing_factor);
             NormalizeVec3(&n_total_val);
 
              costs[center] = ComputeMultiViewInitialCostandSelectedViews(texture_objects[0].images, cameras, p, plane_hypotheses[center], &selected_views[center], params);
@@ -851,7 +861,7 @@ __device__ void PlaneHypothesisRefinement(const cudaTextureObject_t *images,
             }
         }
         if (weight_norm > 0.0f) {
-            temp_cost /= weight_norm;  // Safe divide
+            temp_cost /= weight_norm;
         }
 
         // Validate depth
@@ -890,7 +900,7 @@ __device__ void PlaneHypothesisRefinement(const cudaTextureObject_t *images,
     }
 }
 
-// Safe helper function for optimized neighbor search with proper bounds checking
+// Find best neighbor along a checkerboard direction with bounds checking
 __device__ __forceinline__ int FindBestNeighborInDirection(
     const float* costs, 
     const int center, 
@@ -1007,7 +1017,7 @@ __device__ __forceinline__ int FindBestNeighborInDirection(
     return cost_min_point;
 }
 
-// Safe helper function for view selection computation
+// Accumulate view selection priors from near neighbors
 __device__ __forceinline__ void ComputeViewSelectionPriors(
     float* view_selection_priors,
     const unsigned int* selected_views,
@@ -1040,7 +1050,7 @@ __device__ __forceinline__ void ComputeViewSelectionPriors(
     }
 }
 
-// Safe helper function for sampling probability computation
+// Compute per-view sampling probabilities from neighbor costs
 __device__ __forceinline__ void ComputeSamplingProbabilities(
     float* sampling_probs,
     const float cost_array[8][32],
@@ -1082,7 +1092,7 @@ __device__ __forceinline__ void ComputeSamplingProbabilities(
     }
 }
 
-// Safe helper function for computing final costs
+// Compute weighted multi-view costs for each neighbor direction
 __device__ __forceinline__ void ComputeFinalCosts(
     float* final_costs,
     const float cost_array[8][32],
@@ -1120,7 +1130,7 @@ __device__ __forceinline__ void ComputeFinalCosts(
     }
 }
 
-// Main function with same signature - SAFE VERSION
+template<bool UseMask>
 __device__ void CheckerboardPropagation(
     const cudaTextureObject_t *images,
     const cudaTextureObject_t *depths,
@@ -1132,13 +1142,14 @@ __device__ void CheckerboardPropagation(
     unsigned int *selected_views,
     float4 *prior_planes,
     unsigned int *plane_masks,
+    const uint8_t *ref_mask,
     const int2 p,
     const PatchMatchParams params,
     const int iter)
 {
     const int width = cameras[0].width;
     const int height = cameras[0].height;
-    
+
     // Early exit for out-of-bounds
     if (p.x >= width || p.y >= height || p.x < 0 || p.y < 0) {
         return;
@@ -1150,6 +1161,11 @@ __device__ void CheckerboardPropagation(
     }
 
     const int center = p.y * width + p.x;
+
+    // Skip masked pixels (compiled out when UseMask=false)
+    if (UseMask && ref_mask[center]) {
+        return;
+    }
 
     // Validate center index
     if (center < 0 || center >= width * height) {
@@ -1183,7 +1199,8 @@ __device__ void CheckerboardPropagation(
     int down_near = center + width;
     int down_far = center + 3 * width;
 
-    // Adaptive Checkerboard Sampling - original structure for safety
+    // Evaluate 8 checkerboard neighbors (near/far x up/down/left/right).
+    // Spherical cameras: horizontal neighbors always valid due to wrapping.
     float cost_array[8][32];
     // Initialize cost array
     for (int i = 0; i < 8; ++i) {
@@ -1196,7 +1213,6 @@ __device__ void CheckerboardPropagation(
     int num_valid_pixels = 0;
     const int positions[8] = {up_near, up_far, down_near, down_far, left_near, left_far, right_near, right_far};
 
-    // up_far - safe version
     if (p.y > 2) {
         flag[1] = true;
         num_valid_pixels++;
@@ -1204,7 +1220,6 @@ __device__ void CheckerboardPropagation(
         ComputeMultiViewCostVector(images, cameras, p, plane_hypotheses[up_far], cost_array[1], params);
     }
 
-    // down_far - safe version
     if (p.y < height - 3) {
         flag[3] = true;
         num_valid_pixels++;
@@ -1212,7 +1227,6 @@ __device__ void CheckerboardPropagation(
         ComputeMultiViewCostVector(images, cameras, p, plane_hypotheses[down_far], cost_array[3], params);
     }
 
-    // left_far - safe version (always valid for spherical cameras due to wrapping)
     if (p.x > 2 || is_sphere) {
         flag[5] = true;
         num_valid_pixels++;
@@ -1222,7 +1236,6 @@ __device__ void CheckerboardPropagation(
         ComputeMultiViewCostVector(images, cameras, p, plane_hypotheses[left_far], cost_array[5], params);
     }
 
-    // right_far - safe version (always valid for spherical cameras due to wrapping)
     if (p.x < width - 3 || is_sphere) {
         flag[7] = true;
         num_valid_pixels++;
@@ -1232,7 +1245,6 @@ __device__ void CheckerboardPropagation(
         ComputeMultiViewCostVector(images, cameras, p, plane_hypotheses[right_far], cost_array[7], params);
     }
 
-    // up_near - safe version
     if (p.y > 0) {
         flag[0] = true;
         num_valid_pixels++;
@@ -1240,7 +1252,6 @@ __device__ void CheckerboardPropagation(
         ComputeMultiViewCostVector(images, cameras, p, plane_hypotheses[up_near], cost_array[0], params);
     }
 
-    // down_near - safe version
     if (p.y < height - 1) {
         flag[2] = true;
         num_valid_pixels++;
@@ -1248,7 +1259,6 @@ __device__ void CheckerboardPropagation(
         ComputeMultiViewCostVector(images, cameras, p, plane_hypotheses[down_near], cost_array[2], params);
     }
 
-    // left_near - safe version (always valid for spherical cameras due to wrapping)
     if (p.x > 0 || is_sphere) {
         flag[4] = true;
         num_valid_pixels++;
@@ -1258,7 +1268,6 @@ __device__ void CheckerboardPropagation(
         ComputeMultiViewCostVector(images, cameras, p, plane_hypotheses[left_near], cost_array[4], params);
     }
 
-    // right_near - safe version (always valid for spherical cameras due to wrapping)
     if (p.x < width - 1 || is_sphere) {
         flag[6] = true;
         num_valid_pixels++;
@@ -1271,7 +1280,6 @@ __device__ void CheckerboardPropagation(
     // Update positions array with safe values
     const int final_positions[8] = {up_near, up_far, down_near, down_far, left_near, left_far, right_near, right_far};
 
-    // Multi-hypothesis Joint View Selection - safe version
     float view_weights[32] = {0.0f};
     float view_selection_priors[32];
     
@@ -1284,7 +1292,6 @@ __device__ void CheckerboardPropagation(
 
     TransformPDFToCDF(sampling_probs, params.num_images - 1);
     
-    // Safe random sampling
     for (int sample = 0; sample < 15; ++sample) {
         const float rand_prob = rng_uniform(&rand_states[center], (unsigned int)center) - FLT_EPSILON;
 
@@ -1308,7 +1315,6 @@ __device__ void CheckerboardPropagation(
         }
     }
 
-    // Safe final cost computation
     float final_costs[8];
     ComputeFinalCosts(final_costs, cost_array, view_weights, weight_norm,
                       flag, final_positions, depths, cameras, 
@@ -1316,7 +1322,6 @@ __device__ void CheckerboardPropagation(
 
     const int min_cost_idx = FindMinCostIndex(final_costs, 8);
 
-    // Current cost computation - safe version
     float cost_vector_now[32];
     for (int i = 0; i < 32; ++i) {
         cost_vector_now[i] = 2.0f;
@@ -1341,7 +1346,6 @@ __device__ void CheckerboardPropagation(
     float depth_now = ComputeDepthfromPlaneHypothesis(cameras[0], plane_hypotheses[center], p);
     float restricted_cost = 0.0f;
     
-    // Planar prior handling - original safe logic
     if (params.planar_prior) {
         float restricted_final_costs[8] = {0.0f};
         float gamma = 0.5f;
@@ -1423,28 +1427,31 @@ __device__ void CheckerboardPropagation(
         plane_hypotheses[center] = plane_hypotheses_now;
     }
 }
-__global__ void BlackPixelUpdate(cudaTextureObjects *texture_objects, cudaTextureObjects *texture_depths, Camera *cameras, float4 *plane_hypotheses, float *costs,  float *pre_costs,  RNGState *rand_states, unsigned int *selected_views, float4 *prior_planes, unsigned int *plane_masks, const PatchMatchParams params, const int iter)
-{
-    int2 p = make_int2(blockIdx.x * blockDim.x + threadIdx.x, blockIdx.y * blockDim.y + threadIdx.y);
-    if (threadIdx.x % 2 == 0) {
-        p.y = p.y * 2;
-    } else {
-        p.y = p.y * 2 + 1;
-    }
 
-    CheckerboardPropagation(texture_objects[0].images, texture_depths[0].images, cameras, plane_hypotheses, costs, pre_costs,  rand_states, selected_views, prior_planes, plane_masks, p, params, iter);
+template<bool UseMask>
+__global__ void BlackPixelUpdate(cudaTextureObjects *texture_objects, cudaTextureObjects *texture_depths, Camera *cameras, float4 *plane_hypotheses, float *costs,  float *pre_costs,  RNGState *rand_states, unsigned int *selected_views, float4 *prior_planes, unsigned int *plane_masks, const uint8_t *ref_mask, const PatchMatchParams params, const int iter)
+{
+    // Coalesced: all threads in a warp access the same row, stride-2 columns
+    const int tx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int row = blockIdx.y * blockDim.y + threadIdx.y;
+    // Black pixels: (col + row) % 2 == 0
+    const int col = 2 * tx + (row & 1);
+    int2 p = make_int2(col, row);
+
+    CheckerboardPropagation<UseMask>(texture_objects[0].images, texture_depths[0].images, cameras, plane_hypotheses, costs, pre_costs,  rand_states, selected_views, prior_planes, plane_masks, ref_mask, p, params, iter);
 }
 
-__global__ void RedPixelUpdate(cudaTextureObjects *texture_objects, cudaTextureObjects *texture_depths, Camera *cameras, float4 *plane_hypotheses, float *costs,  float *pre_costs, RNGState *rand_states, unsigned int *selected_views, float4 *prior_planes, unsigned int *plane_masks, const PatchMatchParams params, const int iter)
+template<bool UseMask>
+__global__ void RedPixelUpdate(cudaTextureObjects *texture_objects, cudaTextureObjects *texture_depths, Camera *cameras, float4 *plane_hypotheses, float *costs,  float *pre_costs, RNGState *rand_states, unsigned int *selected_views, float4 *prior_planes, unsigned int *plane_masks, const uint8_t *ref_mask, const PatchMatchParams params, const int iter)
 {
-    int2 p = make_int2(blockIdx.x * blockDim.x + threadIdx.x, blockIdx.y * blockDim.y + threadIdx.y);
-    if (threadIdx.x % 2 == 0) {
-        p.y = p.y * 2 + 1;
-    } else {
-        p.y = p.y * 2;
-    }
+    // Coalesced: all threads in a warp access the same row, stride-2 columns
+    const int tx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int row = blockIdx.y * blockDim.y + threadIdx.y;
+    // Red pixels: (col + row) % 2 == 1
+    const int col = 2 * tx + (1 - (row & 1));
+    int2 p = make_int2(col, row);
 
-    CheckerboardPropagation(texture_objects[0].images, texture_depths[0].images, cameras, plane_hypotheses, costs, pre_costs, rand_states, selected_views, prior_planes, plane_masks, p, params, iter);
+    CheckerboardPropagation<UseMask>(texture_objects[0].images, texture_depths[0].images, cameras, plane_hypotheses, costs, pre_costs, rand_states, selected_views, prior_planes, plane_masks, ref_mask, p, params, iter);
 }
 
 __global__ void GetDepthandNormal(Camera *cameras, float4 *plane_hypotheses, const PatchMatchParams params)
@@ -1555,8 +1562,9 @@ __device__ __constant__ NeighborPattern NEIGHBOR_PATTERNS[20] = {
     {1 + 2 * 1, 0, INT_MAX-1, 0, INT_MAX-2}     // right + 2*width
 };
 
-// Optimized CheckerboardFilter with same signature
-__device__ void CheckerboardFilter(const Camera *cameras, float4 *plane_hypotheses, float *costs, const int2 p)
+// Optimized CheckerboardFilter with compile-time mask specialization
+template<bool UseMask>
+__device__ void CheckerboardFilter(const Camera *cameras, float4 *plane_hypotheses, float *costs, const uint8_t *ref_mask, const int2 p)
 {
     const int width = cameras[0].width;
     const int height = cameras[0].height;
@@ -1578,6 +1586,11 @@ __device__ void CheckerboardFilter(const Camera *cameras, float4 *plane_hypothes
         return;
     }
 
+    // Don't overwrite masked pixel with neighbor median (compiled out when UseMask=false)
+    if (UseMask && ref_mask[center]) {
+        return;
+    }
+
     // Early exit for very low cost (unchanged from original)
     if (costs[center] < 0.001f) {
         return;
@@ -1586,10 +1599,10 @@ __device__ void CheckerboardFilter(const Camera *cameras, float4 *plane_hypothes
     // Pre-allocate filter array with maximum possible size
     float filter[21];
     int index = 0;
-    
+
     // Always include center pixel
     filter[index++] = plane_hypotheses[center].w;
-    
+
     // Precompute width multipliers for efficiency
     const int width_1 = width;
     const int width_3 = 3 * width;
@@ -1601,110 +1614,86 @@ __device__ void CheckerboardFilter(const Camera *cameras, float4 *plane_hypothes
     #define WRAPPED_IDX(dx, dy) \
         ((p.y + (dy)) * width + (is_sphere ? (((p.x + (dx)) % width + width) % width) : (p.x + (dx))))
 
+    // Skip masked neighbors (compiled out when UseMask=false)
+    #define ADD_NEIGHBOR(idx_expr) do { \
+        const int _ni = (idx_expr); \
+        if (!(UseMask && ref_mask[_ni])) \
+            filter[index++] = plane_hypotheses[_ni].w; \
+    } while(0)
+
     // Optimized neighbor collection using precomputed patterns
     // Vertical neighbors (up/down directions)
     if (p.y > 0) {
-        const int up = center - width_1;
-        filter[index++] = plane_hypotheses[up].w;
-
+        ADD_NEIGHBOR(center - width_1);
         if (p.y > 2) {
             const int upup = center - width_3;
-            filter[index++] = plane_hypotheses[upup].w;
-
+            ADD_NEIGHBOR(upup);
             if (p.y > 4) {
-                filter[index++] = plane_hypotheses[upup - 2 * width_1].w;
+                ADD_NEIGHBOR(upup - 2 * width_1);
             }
         }
     }
 
     if (p.y < height - 1) {
-        const int down = center + width_1;
-        filter[index++] = plane_hypotheses[down].w;
-
+        ADD_NEIGHBOR(center + width_1);
         if (p.y < height - 3) {
             const int downdown = center + width_3;
-            filter[index++] = plane_hypotheses[downdown].w;
-
+            ADD_NEIGHBOR(downdown);
             if (p.y < height - 5) {
-                filter[index++] = plane_hypotheses[downdown + 2 * width_1].w;
+                ADD_NEIGHBOR(downdown + 2 * width_1);
             }
         }
     }
 
     // Horizontal neighbors (left/right directions)
-    // For spherical cameras, x always wraps so neighbors are always valid
     if (p.x > 0 || is_sphere) {
-        filter[index++] = plane_hypotheses[WRAPPED_IDX(-1, 0)].w;
-
+        ADD_NEIGHBOR(WRAPPED_IDX(-1, 0));
         if (p.x > 2 || is_sphere) {
-            filter[index++] = plane_hypotheses[WRAPPED_IDX(-3, 0)].w;
-
+            ADD_NEIGHBOR(WRAPPED_IDX(-3, 0));
             if (p.x > 4 || is_sphere) {
-                filter[index++] = plane_hypotheses[WRAPPED_IDX(-5, 0)].w;
+                ADD_NEIGHBOR(WRAPPED_IDX(-5, 0));
             }
         }
     }
 
     if (p.x < width - 1 || is_sphere) {
-        filter[index++] = plane_hypotheses[WRAPPED_IDX(1, 0)].w;
-
+        ADD_NEIGHBOR(WRAPPED_IDX(1, 0));
         if (p.x < width - 3 || is_sphere) {
-            filter[index++] = plane_hypotheses[WRAPPED_IDX(3, 0)].w;
-
+            ADD_NEIGHBOR(WRAPPED_IDX(3, 0));
             if (p.x < width - 5 || is_sphere) {
-                filter[index++] = plane_hypotheses[WRAPPED_IDX(5, 0)].w;
+                ADD_NEIGHBOR(WRAPPED_IDX(5, 0));
             }
         }
     }
 
-    // Diagonal neighbors - optimized with combined conditions
-    // Upper-right and upper-left
+    // Diagonal neighbors
     if (p.y > 0) {
-        if (p.x < width - 2 || is_sphere) {
-            filter[index++] = plane_hypotheses[WRAPPED_IDX(2, -1)].w;
-        }
-        if (p.x > 1 || is_sphere) {
-            filter[index++] = plane_hypotheses[WRAPPED_IDX(-2, -1)].w;
-        }
+        if (p.x < width - 2 || is_sphere) ADD_NEIGHBOR(WRAPPED_IDX(2, -1));
+        if (p.x > 1 || is_sphere) ADD_NEIGHBOR(WRAPPED_IDX(-2, -1));
     }
-
-    // Lower-right and lower-left
     if (p.y < height - 1) {
-        if (p.x < width - 2 || is_sphere) {
-            filter[index++] = plane_hypotheses[WRAPPED_IDX(2, 1)].w;
-        }
-        if (p.x > 1 || is_sphere) {
-            filter[index++] = plane_hypotheses[WRAPPED_IDX(-2, 1)].w;
-        }
+        if (p.x < width - 2 || is_sphere) ADD_NEIGHBOR(WRAPPED_IDX(2, 1));
+        if (p.x > 1 || is_sphere) ADD_NEIGHBOR(WRAPPED_IDX(-2, 1));
     }
-
-    // Far diagonal neighbors
     if (p.y > 2) {
-        if (p.x > 0 || is_sphere) {
-            filter[index++] = plane_hypotheses[WRAPPED_IDX(-1, -2)].w;
-        }
-        if (p.x < width - 1 || is_sphere) {
-            filter[index++] = plane_hypotheses[WRAPPED_IDX(1, -2)].w;
-        }
+        if (p.x > 0 || is_sphere) ADD_NEIGHBOR(WRAPPED_IDX(-1, -2));
+        if (p.x < width - 1 || is_sphere) ADD_NEIGHBOR(WRAPPED_IDX(1, -2));
+    }
+    if (p.y < height - 2) {
+        if (p.x > 0 || is_sphere) ADD_NEIGHBOR(WRAPPED_IDX(-1, 2));
+        if (p.x < width - 1 || is_sphere) ADD_NEIGHBOR(WRAPPED_IDX(1, 2));
     }
 
-    if (p.y < height - 2) {
-        if (p.x > 0 || is_sphere) {
-            filter[index++] = plane_hypotheses[WRAPPED_IDX(-1, 2)].w;
-        }
-        if (p.x < width - 1 || is_sphere) {
-            filter[index++] = plane_hypotheses[WRAPPED_IDX(1, 2)].w;
-        }
-    }
-    
     #undef WRAPPED_IDX
+    #undef ADD_NEIGHBOR
 
     // Fast median computation and assignment
     const float median_value = FindMedianFast(filter, index);
     plane_hypotheses[center].w = median_value;
 }
 // Fused depth+normal+filter: GetDepthandNormal + median filter in one kernel
-__global__ void PostProcessKernel(Camera *cameras, float4 *plane_hypotheses, float *costs, const PatchMatchParams params)
+template<bool UseMask>
+__global__ void PostProcessKernel(Camera *cameras, float4 *plane_hypotheses, float *costs, const uint8_t *ref_mask, const PatchMatchParams params)
 {
     const int2 p = make_int2(blockIdx.x * blockDim.x + threadIdx.x, blockIdx.y * blockDim.y + threadIdx.y);
     const int width = cameras[0].width;
@@ -1720,19 +1709,27 @@ __global__ void PostProcessKernel(Camera *cameras, float4 *plane_hypotheses, flo
         return;
     }
 
+    // Zero depth for masked pixels (compiled out when UseMask=false)
+    if (UseMask && ref_mask[center]) {
+        plane_hypotheses[center] = make_float4(0.f, 0.f, 1.f, 0.f);
+        return;
+    }
+
     // Step 1: Compute depth from plane hypothesis and transform normal
     plane_hypotheses[center].w = ComputeDepthfromPlaneHypothesis(cameras[0], plane_hypotheses[center], p);
     plane_hypotheses[center] = TransformNormal(cameras[0], plane_hypotheses[center]);
 }
 
 // All-pixel filter: processes both black and red pixels in one launch
-__global__ void AllPixelFilter(const Camera *cameras, float4 *plane_hypotheses, float *costs)
+template<bool UseMask>
+__global__ void AllPixelFilter(const Camera *cameras, float4 *plane_hypotheses, float *costs, const uint8_t *ref_mask, const PatchMatchParams params)
 {
     const int2 p = make_int2(blockIdx.x * blockDim.x + threadIdx.x, blockIdx.y * blockDim.y + threadIdx.y);
-    CheckerboardFilter(cameras, plane_hypotheses, costs, p);
+    CheckerboardFilter<UseMask>(cameras, plane_hypotheses, costs, ref_mask, p);
 }
 
-__global__ void BlackPixelFilter(const Camera *cameras, float4 *plane_hypotheses, float *costs)
+template<bool UseMask>
+__global__ void BlackPixelFilter(const Camera *cameras, float4 *plane_hypotheses, float *costs, const uint8_t *ref_mask, const PatchMatchParams params)
 {
     int2 p = make_int2(blockIdx.x * blockDim.x + threadIdx.x, blockIdx.y * blockDim.y + threadIdx.y);
     if (threadIdx.x % 2 == 0) {
@@ -1741,10 +1738,11 @@ __global__ void BlackPixelFilter(const Camera *cameras, float4 *plane_hypotheses
         p.y = p.y * 2 + 1;
     }
 
-    CheckerboardFilter(cameras, plane_hypotheses, costs, p);
+    CheckerboardFilter<UseMask>(cameras, plane_hypotheses, costs, ref_mask, p);
 }
 
-__global__ void RedPixelFilter(const Camera *cameras, float4 *plane_hypotheses, float *costs)
+template<bool UseMask>
+__global__ void RedPixelFilter(const Camera *cameras, float4 *plane_hypotheses, float *costs, const uint8_t *ref_mask, const PatchMatchParams params)
 {
     int2 p = make_int2(blockIdx.x * blockDim.x + threadIdx.x, blockIdx.y * blockDim.y + threadIdx.y);
     if (threadIdx.x % 2 == 0) {
@@ -1753,73 +1751,283 @@ __global__ void RedPixelFilter(const Camera *cameras, float4 *plane_hypotheses, 
         p.y = p.y * 2;
     }
 
-    CheckerboardFilter(cameras, plane_hypotheses, costs, p);
+    CheckerboardFilter<UseMask>(cameras, plane_hypotheses, costs, ref_mask, p);
 }
 
-void ACMMP::RunPatchMatch(ProblemGPUResources* res) {
-    // Create a local copy of the stream handle for safety.
+// ── Item 5: Batch Planar Prior GPU Kernels ────────────────────────────────
+
+// Extract support points: one thread per 5×5 block, find min-cost pixel
+__global__ void ExtractSupportPointsKernel(
+    const float4* plane_hypotheses, const float* costs,
+    int width, int height,
+    int2* support_points_out, int* num_points_out, int max_points)
+{
+    const int bx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int by = blockIdx.y * blockDim.y + threadIdx.y;
+    const int step = 5;
+    const int x0 = bx * step;
+    const int y0 = by * step;
+
+    if (x0 >= width || y0 >= height) return;
+
+    const int x1 = min(x0 + step, width);
+    const int y1 = min(y0 + step, height);
+
+    float min_cost = 2.0f;
+    int best_x = x0, best_y = y0;
+
+    for (int y = y0; y < y1; y++) {
+        for (int x = x0; x < x1; x++) {
+            int c = y * width + x;
+            float cost = costs[c];
+            if (cost < min_cost) {
+                min_cost = cost;
+                best_x = x;
+                best_y = y;
+            }
+        }
+    }
+
+    if (min_cost < 0.1f) {
+        int idx = atomicAdd(num_points_out, 1);
+        if (idx < max_points) {
+            support_points_out[idx] = make_int2(best_x, best_y);
+        }
+    }
+}
+
+// Rasterize triangles: one thread per triangle, iterate bounding box
+__global__ void RasterizeTrianglesKernel(
+    const int2* triangle_vertices,  // 3 int2 per triangle
+    int num_triangles,
+    unsigned int* plane_masks,
+    int width, int height)
+{
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_triangles) return;
+
+    const int2 v0 = triangle_vertices[tid * 3 + 0];
+    const int2 v1 = triangle_vertices[tid * 3 + 1];
+    const int2 v2 = triangle_vertices[tid * 3 + 2];
+
+    // Bounding box
+    int minx = max(0, min(v0.x, min(v1.x, v2.x)));
+    int maxx = min(width - 1, max(v0.x, max(v1.x, v2.x)));
+    int miny = max(0, min(v0.y, min(v1.y, v2.y)));
+    int maxy = min(height - 1, max(v0.y, max(v1.y, v2.y)));
+
+    // Edge function coefficients
+    int e01_dx = v1.y - v0.y, e01_dy = v0.x - v1.x;
+    int e12_dx = v2.y - v1.y, e12_dy = v1.x - v2.x;
+    int e20_dx = v0.y - v2.y, e20_dy = v2.x - v0.x;
+
+    for (int y = miny; y <= maxy; y++) {
+        for (int x = minx; x <= maxx; x++) {
+            int w0 = e12_dx * (x - v1.x) + e12_dy * (y - v1.y);
+            int w1 = e20_dx * (x - v2.x) + e20_dy * (y - v2.y);
+            int w2 = e01_dx * (x - v0.x) + e01_dy * (y - v0.y);
+
+            if ((w0 >= 0 && w1 >= 0 && w2 >= 0) || (w0 <= 0 && w1 <= 0 && w2 <= 0)) {
+                plane_masks[y * width + x] = (unsigned int)(tid + 1);
+            }
+        }
+    }
+}
+
+// Compute prior planes from triangulated depths
+__global__ void ComputePriorPlanesKernel(
+    const float4* plane_hypotheses,  // depths from Pass 1 (in .w field)
+    const Camera* cameras,
+    const int2* triangle_vertices,
+    unsigned int* plane_masks,
+    float4* prior_planes,
+    float depth_min, float depth_max,
+    int width, int height)
+{
+    const int2 p = make_int2(blockIdx.x * blockDim.x + threadIdx.x, blockIdx.y * blockDim.y + threadIdx.y);
+    if (p.x >= width || p.y >= height) return;
+
+    const int center = p.y * width + p.x;
+    unsigned int tri_id = plane_masks[center];
+
+    if (tri_id == 0) {
+        prior_planes[center] = make_float4(0.f, 0.f, 0.f, 0.f);
+        return;
+    }
+
+    int tri_idx = tri_id - 1;
+    const int2 v0 = triangle_vertices[tri_idx * 3 + 0];
+    const int2 v1 = triangle_vertices[tri_idx * 3 + 1];
+    const int2 v2 = triangle_vertices[tri_idx * 3 + 2];
+
+    // Get depths at vertices
+    float d0 = plane_hypotheses[v0.y * width + v0.x].w;
+    float d1 = plane_hypotheses[v1.y * width + v1.x].w;
+    float d2 = plane_hypotheses[v2.y * width + v2.x].w;
+
+    // Validate depths
+    if (d0 <= 0.f || d1 <= 0.f || d2 <= 0.f ||
+        d0 != d0 || d1 != d1 || d2 != d2 ||
+        d0 < depth_min || d0 > depth_max ||
+        d1 < depth_min || d1 > depth_max ||
+        d2 < depth_min || d2 > depth_max) {
+        prior_planes[center] = make_float4(0.f, 0.f, 0.f, 0.f);
+        plane_masks[center] = 0;
+        return;
+    }
+
+    // Unproject vertices to 3D in camera space
+    float X0[3], X1[3], X2[3];
+    int2 ip0 = make_int2(v0.x, v0.y);
+    int2 ip1 = make_int2(v1.x, v1.y);
+    int2 ip2 = make_int2(v2.x, v2.y);
+    Get3DPoint(cameras[0], ip0, d0, X0);
+    Get3DPoint(cameras[0], ip1, d1, X1);
+    Get3DPoint(cameras[0], ip2, d2, X2);
+
+    // Cross product to get plane normal
+    float e1x = X1[0] - X0[0], e1y = X1[1] - X0[1], e1z = X1[2] - X0[2];
+    float e2x = X2[0] - X0[0], e2y = X2[1] - X0[1], e2z = X2[2] - X0[2];
+    float nx = e1y * e2z - e1z * e2y;
+    float ny = e1z * e2x - e1x * e2z;
+    float nz = e1x * e2y - e1y * e2x;
+
+    float len = sqrtf(nx * nx + ny * ny + nz * nz);
+    if (len < 1e-8f) {
+        prior_planes[center] = make_float4(0.f, 0.f, 0.f, 0.f);
+        plane_masks[center] = 0;
+        return;
+    }
+
+    float inv_len = 1.f / len;
+    nx *= inv_len; ny *= inv_len; nz *= inv_len;
+    float d = -(nx * X0[0] + ny * X0[1] + nz * X0[2]);
+
+    // Store as plane params: (nx, ny, nz, d) where plane: nx*x + ny*y + nz*z + d = 0
+    // But the convention in this code stores depth in .w for prior_planes
+    // Actually, prior_planes stores the plane equation and depth is computed via ComputeDepthfromPlaneHypothesis
+    float4 plane = make_float4(nx, ny, nz, d);
+
+    // Validate: compute depth at current pixel from this plane
+    float test_depth = ComputeDepthfromPlaneHypothesis(cameras[0], plane, p);
+    if (test_depth < depth_min || test_depth > depth_max || test_depth != test_depth) {
+        prior_planes[center] = make_float4(0.f, 0.f, 0.f, 0.f);
+        plane_masks[center] = 0;
+        return;
+    }
+
+    prior_planes[center] = plane;
+}
+
+// ── End Batch Planar Prior Kernels ────────────────────────────────────────
+
+void ACMMP::RunPatchMatch(ProblemGPUResources* res, bool skip_host_download) {
     cudaStream_t s = stream_ ? stream_ : 0;
-    
+
     const int width  = cameras[0].width;
     const int height = cameras[0].height;
-
-    const int BLOCK_W = 32;
-    const int BLOCK_H = 16; // BLOCK_W / 2 is common
 
     dim3 grid_init((width + 15) / 16, (height + 15) / 16, 1);
     dim3 blk_init(16, 16, 1);
 
-    dim3 grid_cb((width + BLOCK_W - 1) / BLOCK_W, ((height + 1) / 2 + BLOCK_H - 1) / BLOCK_H, 1);
-    dim3 blk_cb(BLOCK_W, BLOCK_H, 1);
-
+    const int half_width = (width + 1) / 2;
     const int max_iterations = params.max_iterations;
 
-    // Launch kernels using the pointers from the resource object 'res'.
-    RandomInitialization<<<grid_init, blk_init, 0, s>>>(
-        res->texture_objects_cuda, res->cameras_cuda, res->plane_hypotheses_cuda,
-        res->scaled_plane_hypotheses_cuda, res->costs_cuda, res->pre_costs_cuda,
-        res->rand_states_cuda, res->selected_views_cuda, res->prior_planes_cuda,
-        res->plane_masks_cuda, params);
-    CUDA_CHECK(cudaPeekAtLastError());
-    
-    for (int i = 0; i < max_iterations; ++i) {
-        BlackPixelUpdate<<<grid_cb, blk_cb, 0, s>>>(
-            res->texture_objects_cuda, res->texture_depths_cuda, res->cameras_cuda,
-            res->plane_hypotheses_cuda, res->costs_cuda, res->pre_costs_cuda,
+    const int BLOCK_W = 32;
+    const int BLOCK_H = 16;
+    dim3 grid_cb((half_width + BLOCK_W - 1) / BLOCK_W, (height + BLOCK_H - 1) / BLOCK_H, 1);
+    dim3 blk_cb(BLOCK_W, BLOCK_H, 1);
+
+    // Template dispatch strategy:
+    // - Propagation kernels (RandomInit, Black/RedPixelUpdate): use <true> only for PLANAR+mask
+    //   GEOM phases use <false> because PLANAR already zeroed masked pixels, and <true> causes
+    //   register pressure that regresses Scale 0 GEOM by ~69%.
+    // - PostProcess/Filter kernels: always use <true> when masks exist, to ensure masked pixels
+    //   stay zeroed after depth computation. These are lightweight so register pressure is not an issue.
+    const bool use_mask_propagation = params.has_mask && !params.geom_consistency;
+
+    if (use_mask_propagation) {
+        RandomInitialization<true><<<grid_init, blk_init, 0, s>>>(
+            res->texture_objects_cuda, res->cameras_cuda, res->plane_hypotheses_cuda,
+            res->scaled_plane_hypotheses_cuda, res->costs_cuda, res->pre_costs_cuda,
             res->rand_states_cuda, res->selected_views_cuda, res->prior_planes_cuda,
-            res->plane_masks_cuda, params, i);
+            res->plane_masks_cuda, res->ref_mask_cuda, params);
         CUDA_CHECK(cudaPeekAtLastError());
 
-        RedPixelUpdate<<<grid_cb, blk_cb, 0, s>>>(
-            res->texture_objects_cuda, res->texture_depths_cuda, res->cameras_cuda,
-            res->plane_hypotheses_cuda, res->costs_cuda, res->pre_costs_cuda,
+        for (int i = 0; i < max_iterations; ++i) {
+            BlackPixelUpdate<true><<<grid_cb, blk_cb, 0, s>>>(
+                res->texture_objects_cuda, res->texture_depths_cuda, res->cameras_cuda,
+                res->plane_hypotheses_cuda, res->costs_cuda, res->pre_costs_cuda,
+                res->rand_states_cuda, res->selected_views_cuda, res->prior_planes_cuda,
+                res->plane_masks_cuda, res->ref_mask_cuda, params, i);
+            CUDA_CHECK(cudaPeekAtLastError());
+
+            RedPixelUpdate<true><<<grid_cb, blk_cb, 0, s>>>(
+                res->texture_objects_cuda, res->texture_depths_cuda, res->cameras_cuda,
+                res->plane_hypotheses_cuda, res->costs_cuda, res->pre_costs_cuda,
+                res->rand_states_cuda, res->selected_views_cuda, res->prior_planes_cuda,
+                res->plane_masks_cuda, res->ref_mask_cuda, params, i);
+            CUDA_CHECK(cudaPeekAtLastError());
+        }
+    } else {
+        RandomInitialization<false><<<grid_init, blk_init, 0, s>>>(
+            res->texture_objects_cuda, res->cameras_cuda, res->plane_hypotheses_cuda,
+            res->scaled_plane_hypotheses_cuda, res->costs_cuda, res->pre_costs_cuda,
             res->rand_states_cuda, res->selected_views_cuda, res->prior_planes_cuda,
-            res->plane_masks_cuda, params, i);
+            res->plane_masks_cuda, nullptr, params);
+        CUDA_CHECK(cudaPeekAtLastError());
+
+        for (int i = 0; i < max_iterations; ++i) {
+            BlackPixelUpdate<false><<<grid_cb, blk_cb, 0, s>>>(
+                res->texture_objects_cuda, res->texture_depths_cuda, res->cameras_cuda,
+                res->plane_hypotheses_cuda, res->costs_cuda, res->pre_costs_cuda,
+                res->rand_states_cuda, res->selected_views_cuda, res->prior_planes_cuda,
+                res->plane_masks_cuda, nullptr, params, i);
+            CUDA_CHECK(cudaPeekAtLastError());
+
+            RedPixelUpdate<false><<<grid_cb, blk_cb, 0, s>>>(
+                res->texture_objects_cuda, res->texture_depths_cuda, res->cameras_cuda,
+                res->plane_hypotheses_cuda, res->costs_cuda, res->pre_costs_cuda,
+                res->rand_states_cuda, res->selected_views_cuda, res->prior_planes_cuda,
+                res->plane_masks_cuda, nullptr, params, i);
+            CUDA_CHECK(cudaPeekAtLastError());
+        }
+    }
+
+    // PostProcess and Filter always use <true> when masks exist to zero masked pixels.
+    // These kernels are lightweight — no register pressure concern.
+    if (params.has_mask) {
+        PostProcessKernel<true><<<grid_init, blk_init, 0, s>>>(res->cameras_cuda, res->plane_hypotheses_cuda, res->costs_cuda, res->ref_mask_cuda, params);
+        CUDA_CHECK(cudaPeekAtLastError());
+
+        AllPixelFilter<true><<<grid_init, blk_init, 0, s>>>(res->cameras_cuda, res->plane_hypotheses_cuda, res->costs_cuda, res->ref_mask_cuda, params);
+        CUDA_CHECK(cudaPeekAtLastError());
+    } else {
+        PostProcessKernel<false><<<grid_init, blk_init, 0, s>>>(res->cameras_cuda, res->plane_hypotheses_cuda, res->costs_cuda, nullptr, params);
+        CUDA_CHECK(cudaPeekAtLastError());
+
+        AllPixelFilter<false><<<grid_init, blk_init, 0, s>>>(res->cameras_cuda, res->plane_hypotheses_cuda, res->costs_cuda, nullptr, params);
         CUDA_CHECK(cudaPeekAtLastError());
     }
 
-    // Fused post-processing: depth+normal computation then all-pixel filter (2 launches instead of 3)
-    PostProcessKernel<<<grid_init, blk_init, 0, s>>>(res->cameras_cuda, res->plane_hypotheses_cuda, res->costs_cuda, params);
-    CUDA_CHECK(cudaPeekAtLastError());
+    if (!skip_host_download) {
+        // Asynchronously copy results from device to the resource's pinned host memory.
+        CUDA_CHECK(cudaMemcpyAsync(res->planes_host_pinned, res->plane_hypotheses_cuda,
+                        sizeof(float4) * width * height,
+                        cudaMemcpyDeviceToHost, s));
+        CUDA_CHECK(cudaMemcpyAsync(res->costs_host_pinned, res->costs_cuda,
+                        sizeof(float) * width * height,
+                        cudaMemcpyDeviceToHost, s));
+    }
 
-    AllPixelFilter<<<grid_init, blk_init, 0, s>>>(res->cameras_cuda, res->plane_hypotheses_cuda, res->costs_cuda);
-    CUDA_CHECK(cudaPeekAtLastError());
-
-    // Asynchronously copy results from device to the resource's pinned host memory.
-    CUDA_CHECK(cudaMemcpyAsync(res->planes_host_pinned, res->plane_hypotheses_cuda,
-                    sizeof(float4) * width * height,
-                    cudaMemcpyDeviceToHost, s));
-    CUDA_CHECK(cudaMemcpyAsync(res->costs_host_pinned, res->costs_cuda,
-                    sizeof(float) * width * height,
-                    cudaMemcpyDeviceToHost, s));
-    
-    // Wait for the stream to finish all operations, including the copies.
+    // Wait for the stream to finish all operations.
     CUDA_CHECK(cudaStreamSynchronize(s));
-    
-    // Now that the data is on the host, do a fast CPU-side copy
-    // from the pinned buffer to this object's final result buffer.
-    memcpy(plane_hypotheses_host, res->planes_host_pinned, sizeof(float4) * width * height);
-    memcpy(costs_host, res->costs_host_pinned, sizeof(float) * width * height);
+
+    // Sequential mode: copy to class buffers for GetPlaneHypothesis/GetCost
+    if (!batch_mode_ && !skip_host_download) {
+        memcpy(plane_hypotheses_host, res->planes_host_pinned, sizeof(float4) * width * height);
+        memcpy(costs_host, res->costs_host_pinned, sizeof(float) * width * height);
+    }
 }
 
 __global__ void JBU_cu(JBUParameters *jp, JBUTexObj *jt, float *depth)

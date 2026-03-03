@@ -50,8 +50,13 @@ void ProcessProblem(const std::string &dense_folder, const std::vector<Problem> 
         acmmp.SetHierarchyParams();
     }
 
-    acmmp.InuputInitialization(dense_folder, problems, idx);
-    acmmp.CudaSpaceInitialization(dense_folder, problem,&resources);
+    acmmp.InputInitialization(dense_folder, problems, idx);
+
+    // Fix A: Allocate ProblemGPUResources for sequential path (batch path does this in initializeResourcePool)
+    int num_imgs = std::min((int)(1 + problems[idx].src_image_ids.size()), MAX_IMAGES);
+    resources.allocate(acmmp.GetReferenceImageWidth(), acmmp.GetReferenceImageHeight(), num_imgs);
+
+    acmmp.CudaSpaceInitialization(dense_folder, problem, &resources);
     acmmp.RunPatchMatch(&resources);
 
     const int width = acmmp.GetReferenceImageWidth();
@@ -264,7 +269,7 @@ if (planar_prior) {
     // 6) CUDA prior init + PatchMatch (sync for real timings)
     auto Tc0 = clock::now();
     cv::Mat mask_tri_f; mask_tri_i.convertTo(mask_tri_f, CV_32F);
-    acmmp.CudaPlanarPriorInitialization(planeParams_tri, mask_tri_f);
+    acmmp.CudaPlanarPriorInitialization(planeParams_tri, mask_tri_f, &resources);
     cudaDeviceSynchronize();
     auto Tc1 = clock::now();
     std::cout << "  [timing] CudaPlanarPriorInitialization: " << ms(Tc0, Tc1) << " ms\n";

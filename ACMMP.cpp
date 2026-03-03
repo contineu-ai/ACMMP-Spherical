@@ -140,8 +140,7 @@ Camera ReadCamera(const std::string &cam_path)
         file >> camera.R[3 * i + 0] >> camera.R[3 * i + 1] >> camera.R[3 * i + 2] >> camera.t[i];
     }
     
-    // --- FIX 1: Consume the extra "0.0 0.0 0.0 1.0" line ---
-    // This is the primary parsing bug.
+    // Skip extrinsic padding line
     float dummy_float;
     for (int i = 0; i < 4; ++i) {
         file >> dummy_float;
@@ -198,12 +197,8 @@ void RescaleImageAndCamera(cv::Mat_<cv::Vec3b> &src, cv::Mat_<cv::Vec3b> &dst, c
     const int cols = depth.cols;
     const int rows = depth.rows;
 
-    // ============================= THE FINAL FIX IS HERE =============================
-    // Set the camera's dimensions immediately. This ensures they are never uninitialized,
-    // even if the function returns early.
     camera.width = cols;
     camera.height = rows;
-    // ===============================================================================
 
     // If the image already matches the depth map size, we don't need to resize.
     // It's now safe to return early.
@@ -268,8 +263,7 @@ float3 Get3DPointonRefCam(const int x, const int y, const float depth, const Cam
     // 1) Camera‐space point
     float3 point_cam;
     if (camera.model == SPHERE) {
-        // --- FIX 2: Corrected spherical math using cx, cy ---
-        // This generalizes your original code to use the principal point.
+        // Spherical projection using principal point
         float lon = (static_cast<float>(x) - camera.params[1]) / static_cast<float>(camera.width) * 2.0f * M_PI;
         float lat = -(static_cast<float>(y) - camera.params[2]) / static_cast<float>(camera.height) * M_PI;
         
@@ -309,7 +303,7 @@ void ProjectonCamera(const float3 PointX,
             return;
         }
 
-        // --- FIX 3: Corrected spherical back-projection ---
+        // Spherical back-projection
         float latitude  = -std::asin(tmp.y / depth);
         float longitude =  std::atan2(tmp.x, tmp.z);
         
@@ -653,7 +647,7 @@ static int readCostAuto(const std::string& base_path, cv::Mat_<float>& cost) {
     return readDepthDmb(base_path, cost);
 }
 
-void ACMMP::InuputInitialization(const std::string &dense_folder, const std::vector<Problem> &problems, const int idx)
+void ACMMP::InputInitialization(const std::string &dense_folder, const std::vector<Problem> &problems, const int idx)
 {
     images.clear();
     cameras.clear();
@@ -734,11 +728,18 @@ void ACMMP::InuputInitialization(const std::string &dense_folder, const std::vec
     }
 
 
+    // Fix C: Build image_id → problem_index map for safe source image scaling lookup
+    std::unordered_map<int, int> id_to_idx;
+    for (size_t pi = 0; pi < problems.size(); pi++)
+        id_to_idx[problems[pi].ref_image_id] = (int)pi;
+
     // Scale cameras and images (and masks if present)
     int max_image_size = problems[idx].cur_image_size;
     for (size_t i = 0; i < images.size(); ++i) {
         if (i > 0) {
-            max_image_size = problems[problem.src_image_ids[i - 1]].cur_image_size;
+            int src_id = problem.src_image_ids[i - 1];
+            auto it = id_to_idx.find(src_id);
+            max_image_size = (it != id_to_idx.end()) ? problems[it->second].cur_image_size : problems[idx].cur_image_size;
         }
 
         if (images[i].cols <= max_image_size && images[i].rows <= max_image_size) {
@@ -819,41 +820,187 @@ void ACMMP::InuputInitialization(const std::string &dense_folder, const std::vec
 }
 
 
+void ACMMP::InputInitialization(const std::string &dense_folder, const std::vector<Problem> &problems, const int idx, ImageCache& cache)
+{
+    images.clear();
+    cameras.clear();
+    masks.clear();
+    has_masks_ = false;
+    const Problem problem = problems[idx];
+
+    // Build id → problem_index map for source image scaling
+    std::unordered_map<int, int> id_to_idx;
+    for (size_t pi = 0; pi < problems.size(); pi++)
+        id_to_idx[problems[pi].ref_image_id] = (int)pi;
+
+    // Load ref image from cache
+    auto ref_entry = cache.get(problem.ref_image_id);
+    images.push_back(ref_entry->image_float.clone());
+    cameras.push_back(ref_entry->camera);
+    if (ref_entry->has_mask) {
+        masks.push_back(ref_entry->mask_float.clone());
+        has_masks_ = true;
+    }
+
+    // Load source images from cache
+    size_t num_src_images = problem.src_image_ids.size();
+    for (size_t i = 0; i < num_src_images; ++i) {
+        auto src_entry = cache.get(problem.src_image_ids[i]);
+        images.push_back(src_entry->image_float.clone());
+        if (src_entry->has_mask) {
+            masks.push_back(src_entry->mask_float.clone());
+        } else if (has_masks_) {
+            cv::Mat mask_float = cv::Mat::ones(src_entry->image_float.rows, src_entry->image_float.cols, CV_32FC1);
+            masks.push_back(mask_float);
+        }
+        cameras.push_back(src_entry->camera);
+    }
+
+    // Scale cameras and images (same logic as original)
+    int max_image_size = problems[idx].cur_image_size;
+    for (size_t i = 0; i < images.size(); ++i) {
+        if (i > 0) {
+            int src_id = problem.src_image_ids[i - 1];
+            auto it = id_to_idx.find(src_id);
+            max_image_size = (it != id_to_idx.end()) ? problems[it->second].cur_image_size : problems[idx].cur_image_size;
+        }
+
+        if (images[i].cols <= max_image_size && images[i].rows <= max_image_size) {
+            continue;
+        }
+
+        const float factor_x = static_cast<float>(max_image_size) / images[i].cols;
+        const float factor_y = static_cast<float>(max_image_size) / images[i].rows;
+        const float factor = std::min(factor_x, factor_y);
+
+        const int new_cols = std::round(images[i].cols * factor);
+        const int new_rows = std::round(images[i].rows * factor);
+
+        const float scale_x = new_cols / static_cast<float>(images[i].cols);
+        const float scale_y = new_rows / static_cast<float>(images[i].rows);
+
+        cv::Mat_<float> scaled_image_float;
+        cv::resize(images[i], scaled_image_float, cv::Size(new_cols, new_rows), 0, 0, cv::INTER_LINEAR);
+        images[i] = scaled_image_float.clone();
+
+        if (has_masks_ && i < masks.size()) {
+            cv::Mat scaled_mask;
+            cv::resize(masks[i], scaled_mask, cv::Size(new_cols, new_rows), 0, 0, cv::INTER_NEAREST);
+            masks[i] = scaled_mask.clone();
+        }
+
+        if (cameras[i].model == SPHERE) {
+            cameras[i].params[1] *= scale_x;
+            cameras[i].params[2] *= scale_y;
+        } else {
+            cameras[i].K[0] *= scale_x;
+            cameras[i].K[2] *= scale_x;
+            cameras[i].K[4] *= scale_y;
+            cameras[i].K[5] *= scale_y;
+        }
+        cameras[i].height = scaled_image_float.rows;
+        cameras[i].width = scaled_image_float.cols;
+    }
+
+    params.depth_min = cameras[0].depth_min * 0.6f;
+    params.depth_max = cameras[0].depth_max * 1.2f;
+    params.num_images = (int)images.size();
+    params.disparity_min = cameras[0].K[0] * params.baseline / params.depth_max;
+    params.disparity_max = cameras[0].K[0] * params.baseline / params.depth_min;
+
+    if (params.geom_consistency) {
+        depths.clear();
+
+        std::stringstream result_path;
+        result_path << dense_folder << "/ACMMP" << "/2333_" << std::setw(8) << std::setfill('0') << problem.ref_image_id;
+        std::string result_folder = result_path.str();
+        std::string suffix = "/depths.dmb";
+        if (params.multi_geometry) {
+            suffix = "/depths_geom.dmb";
+        }
+        std::string depth_path = result_folder + suffix;
+        cv::Mat_<float> ref_depth;
+        readDepthAuto(depth_path, ref_depth);
+        depths.push_back(ref_depth);
+
+        for (size_t i = 0; i < num_src_images; ++i) {
+            std::stringstream src_result_path;
+            src_result_path << dense_folder << "/ACMMP" << "/2333_" << std::setw(8) << std::setfill('0') << problem.src_image_ids[i];
+            std::string src_result_folder = src_result_path.str();
+            std::string src_depth_path = src_result_folder + suffix;
+            cv::Mat_<float> depth;
+            readDepthAuto(src_depth_path, depth);
+            depths.push_back(depth);
+        }
+    }
+}
+
 void ACMMP::CudaSpaceInitialization(const std::string &dense_folder, const Problem &problem, ProblemGPUResources* res)
 {
     num_images = (int)images.size();
     cudaStream_t s = stream_ ? stream_ : 0;
 
+    // Guard: num_images must not exceed allocated slots
+    if (res->allocated_images > 0 && num_images > res->allocated_images) {
+        std::cerr << "ERROR: num_images (" << num_images << ") > allocated_images ("
+                  << res->allocated_images << "). Clamping." << std::endl;
+        num_images = res->allocated_images;
+    }
+
     for (int i = 0; i < num_images; ++i) {
         int rows = images[i].rows;
         int cols = images[i].cols;
 
+        // Always copy image data to array
         CUDA_CHECK(cudaMemcpy2DToArrayAsync(res->cuArray[i], 0, 0, images[i].ptr<float>(), images[i].step[0], cols * sizeof(float), rows, cudaMemcpyHostToDevice, s));
 
-        struct cudaResourceDesc resDesc;
-        memset(&resDesc, 0, sizeof(cudaResourceDesc));
-        resDesc.resType = cudaResourceTypeArray;
-        resDesc.res.array.array = res->cuArray[i];
+        // Skip texture creation if already created in allocate() (batch path)
+        if (!res->textures_created) {
+            struct cudaResourceDesc resDesc;
+            memset(&resDesc, 0, sizeof(cudaResourceDesc));
+            resDesc.resType = cudaResourceTypeArray;
+            resDesc.res.array.array = res->cuArray[i];
 
-        struct cudaTextureDesc texDesc;
-        memset(&texDesc, 0, sizeof(cudaTextureDesc));
-        texDesc.addressMode[0] = cudaAddressModeClamp;
-        texDesc.addressMode[1] = cudaAddressModeClamp;
-        texDesc.filterMode = cudaFilterModeLinear;
-        texDesc.readMode = cudaReadModeElementType;
-        texDesc.normalizedCoords = 0;
+            struct cudaTextureDesc texDesc;
+            memset(&texDesc, 0, sizeof(cudaTextureDesc));
+            texDesc.addressMode[0] = cudaAddressModeClamp;
+            texDesc.addressMode[1] = cudaAddressModeClamp;
+            texDesc.filterMode = cudaFilterModeLinear;
+            texDesc.readMode = cudaReadModeElementType;
+            texDesc.normalizedCoords = 0;
 
-        if (res->texture_objects_host.images[i] != 0) {
-            cudaDestroyTextureObject(res->texture_objects_host.images[i]);
+            if (res->texture_objects_host.images[i] != 0) {
+                cudaDestroyTextureObject(res->texture_objects_host.images[i]);
+            }
+            CUDA_CHECK(cudaCreateTextureObject(&(res->texture_objects_host.images[i]), &resDesc, &texDesc, NULL));
         }
-        CUDA_CHECK(cudaCreateTextureObject(&(res->texture_objects_host.images[i]), &resDesc, &texDesc, NULL));
     }
-    
-    CUDA_CHECK(cudaMemcpyAsync(res->texture_objects_cuda, &res->texture_objects_host, sizeof(cudaTextureObjects), cudaMemcpyHostToDevice, s));
+
+    // Upload texture handles only if sequential path created them
+    if (!res->textures_created) {
+        CUDA_CHECK(cudaMemcpyAsync(res->texture_objects_cuda, &res->texture_objects_host, sizeof(cudaTextureObjects), cudaMemcpyHostToDevice, s));
+    }
+    // ALWAYS upload cameras (per-problem data)
     CUDA_CHECK(cudaMemcpyAsync(res->cameras_cuda, &cameras[0], sizeof(Camera) * num_images, cudaMemcpyHostToDevice, s));
 
-    plane_hypotheses_host = new float4[cameras[0].height * cameras[0].width];
-    costs_host = new float[cameras[0].height * cameras[0].width];
+    // Item 4: Upload reference mask to GPU
+    if (has_masks_ && !masks.empty() && res->ref_mask_cuda) {
+        const int w = cameras[0].width, h = cameras[0].height;
+        std::vector<uint8_t> mask_u8(w * h);
+        for (int y = 0; y < h; y++)
+            for (int x = 0; x < w; x++)
+                mask_u8[y * w + x] = (masks[0].at<float>(y, x) > 0.5f) ? 1 : 0;
+        CUDA_CHECK(cudaMemcpyAsync(res->ref_mask_cuda, mask_u8.data(),
+            w * h, cudaMemcpyHostToDevice, s));
+        params.has_mask = true;
+    } else {
+        params.has_mask = false;
+    }
+
+    if (!batch_mode_) {
+        plane_hypotheses_host = new float4[cameras[0].height * cameras[0].width];
+        costs_host = new float[cameras[0].height * cameras[0].width];
+    }
 
     if (params.geom_consistency) {
         for (int i = 0; i < num_images; ++i) {
@@ -862,25 +1009,29 @@ void ACMMP::CudaSpaceInitialization(const std::string &dense_folder, const Probl
 
             CUDA_CHECK(cudaMemcpy2DToArrayAsync(res->cuDepthArray[i], 0, 0, depths[i].ptr<float>(), depths[i].step[0], cols*sizeof(float), rows, cudaMemcpyHostToDevice, s));
 
-            struct cudaResourceDesc resDesc;
-            memset(&resDesc, 0, sizeof(cudaResourceDesc));
-            resDesc.resType = cudaResourceTypeArray;
-            resDesc.res.array.array = res->cuDepthArray[i];
+            if (!res->textures_created) {
+                struct cudaResourceDesc resDesc;
+                memset(&resDesc, 0, sizeof(cudaResourceDesc));
+                resDesc.resType = cudaResourceTypeArray;
+                resDesc.res.array.array = res->cuDepthArray[i];
 
-            struct cudaTextureDesc texDesc;
-            memset(&texDesc, 0, sizeof(cudaTextureDesc));
-            texDesc.addressMode[0] = cudaAddressModeClamp;
-            texDesc.addressMode[1] = cudaAddressModeClamp;
-            texDesc.filterMode = cudaFilterModeLinear;
-            texDesc.readMode  = cudaReadModeElementType;
-            texDesc.normalizedCoords = 0;
+                struct cudaTextureDesc texDesc;
+                memset(&texDesc, 0, sizeof(cudaTextureDesc));
+                texDesc.addressMode[0] = cudaAddressModeClamp;
+                texDesc.addressMode[1] = cudaAddressModeClamp;
+                texDesc.filterMode = cudaFilterModeLinear;
+                texDesc.readMode  = cudaReadModeElementType;
+                texDesc.normalizedCoords = 0;
 
-            if (res->texture_depths_host.images[i] != 0) {
-                cudaDestroyTextureObject(res->texture_depths_host.images[i]);
+                if (res->texture_depths_host.images[i] != 0) {
+                    cudaDestroyTextureObject(res->texture_depths_host.images[i]);
+                }
+                CUDA_CHECK(cudaCreateTextureObject(&(res->texture_depths_host.images[i]), &resDesc, &texDesc, NULL));
             }
-            CUDA_CHECK(cudaCreateTextureObject(&(res->texture_depths_host.images[i]), &resDesc, &texDesc, NULL));
         }
-        CUDA_CHECK(cudaMemcpyAsync(res->texture_depths_cuda, &res->texture_depths_host, sizeof(cudaTextureObjects), cudaMemcpyHostToDevice, s));
+        if (!res->textures_created) {
+            CUDA_CHECK(cudaMemcpyAsync(res->texture_depths_cuda, &res->texture_depths_host, sizeof(cudaTextureObjects), cudaMemcpyHostToDevice, s));
+        }
 
         std::stringstream result_path;
         result_path << dense_folder << "/ACMMP" << "/2333_" << std::setw(8) << std::setfill('0') << problem.ref_image_id;
@@ -979,17 +1130,19 @@ void ACMMP::CudaSpaceInitialization(const std::string &dense_folder, const Probl
     }
 }
 
-void ACMMP::CudaPlanarPriorInitialization(const std::vector<float4> &PlaneParams, const cv::Mat_<float> &masks)
+void ACMMP::CudaPlanarPriorInitialization(const std::vector<float4> &PlaneParams, const cv::Mat_<float> &masks, ProblemGPUResources* res)
 {
-    prior_planes_host = new float4[cameras[0].height * cameras[0].width];
-    cudaMalloc((void**)&prior_planes_cuda, sizeof(float4) * (cameras[0].height * cameras[0].width));
+    const int w = cameras[0].width;
+    const int h = cameras[0].height;
+    const int n = w * h;
+    cudaStream_t s = stream_ ? stream_ : 0;
 
-    plane_masks_host = new unsigned int[cameras[0].height * cameras[0].width];
-    cudaMalloc((void**)&plane_masks_cuda, sizeof(unsigned int) * (cameras[0].height * cameras[0].width));
+    prior_planes_host = new float4[n];
+    plane_masks_host = new unsigned int[n];
 
-    for (int i = 0; i < cameras[0].width; ++i) {
-        for (int j = 0; j < cameras[0].height; ++j) {
-            int center = j * cameras[0].width + i;
+    for (int i = 0; i < w; ++i) {
+        for (int j = 0; j < h; ++j) {
+            int center = j * w + i;
             plane_masks_host[center] = (unsigned int)masks(j, i);
             if (masks(j, i) > 0) {
                 prior_planes_host[center] = PlaneParams[masks(j, i) - 1];
@@ -997,8 +1150,16 @@ void ACMMP::CudaPlanarPriorInitialization(const std::vector<float4> &PlaneParams
         }
     }
 
-    cudaMemcpy(prior_planes_cuda, prior_planes_host, sizeof(float4) * (cameras[0].height * cameras[0].width), cudaMemcpyHostToDevice);
-    cudaMemcpy(plane_masks_cuda, plane_masks_host, sizeof(unsigned int) * (cameras[0].height * cameras[0].width), cudaMemcpyHostToDevice);
+    // Fix B: Write to resource pool buffers if available, else class-local
+    if (res) {
+        cudaMemcpyAsync(res->prior_planes_cuda, prior_planes_host, sizeof(float4) * n, cudaMemcpyHostToDevice, s);
+        cudaMemcpyAsync(res->plane_masks_cuda, plane_masks_host, sizeof(unsigned int) * n, cudaMemcpyHostToDevice, s);
+    } else {
+        cudaMalloc((void**)&prior_planes_cuda, sizeof(float4) * n);
+        cudaMalloc((void**)&plane_masks_cuda, sizeof(unsigned int) * n);
+        cudaMemcpy(prior_planes_cuda, prior_planes_host, sizeof(float4) * n, cudaMemcpyHostToDevice);
+        cudaMemcpy(plane_masks_cuda, plane_masks_host, sizeof(unsigned int) * n, cudaMemcpyHostToDevice);
+    }
 }
 
 int ACMMP::GetReferenceImageWidth()
@@ -1162,7 +1323,7 @@ float ACMMP::GetDepthFromPlaneParam(const float4 plane_hypothesis, const int x, 
     }
 }
 
- void JBUAddImageToTextureFloatGray ( std::vector<cv::Mat_<float>>  &imgs, cudaTextureObject_t texs[], cudaArray *cuArray[], const int &numSelViews)
+ void JBUAddImageToTextureFloatGray ( std::vector<cv::Mat_<float>>  &imgs, cudaTextureObject_t texs[], cudaArray *cuArray[], const int &numSelViews, cudaStream_t s = 0)
 {
     for (int i=0; i<numSelViews; i++) {
         int index = i;
@@ -1172,7 +1333,7 @@ float ACMMP::GetDepthFromPlaneParam(const float4 plane_hypothesis, const int x, 
         cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc (32, 0, 0,  0, cudaChannelFormatKindFloat);
         // Allocate array with correct size and number of channels
         cudaMallocArray(&cuArray[i], &channelDesc, cols, rows);
-        cudaMemcpy2DToArray (cuArray[i], 0, 0, imgs[index].ptr<float>(), imgs[index].step[0], cols*sizeof(float), rows, cudaMemcpyHostToDevice);
+        cudaMemcpy2DToArrayAsync(cuArray[i], 0, 0, imgs[index].ptr<float>(), imgs[index].step[0], cols*sizeof(float), rows, cudaMemcpyHostToDevice, s);
 
         // Specify texture
         struct cudaResourceDesc resDesc;
@@ -1213,11 +1374,10 @@ float ACMMP::GetDepthFromPlaneParam(const float4 plane_hypothesis, const int x, 
      cudaMalloc ((void**)&depth_d,  sizeof(float) * n);
 
      cudaMalloc((void**)&jp_d, sizeof(JBUParameters) * 1);
-     cudaMemcpy(jp_d, &jp_h, sizeof(JBUParameters) * 1, cudaMemcpyHostToDevice);
+     cudaMemcpyAsync(jp_d, &jp_h, sizeof(JBUParameters) * 1, cudaMemcpyHostToDevice, stream_);
 
      cudaMalloc((void**)&jt_d, sizeof(JBUTexObj) * 1);
-     cudaMemcpy(jt_d, &jt_h, sizeof(JBUTexObj) * 1, cudaMemcpyHostToDevice);
-     cudaDeviceSynchronize();
+     cudaMemcpyAsync(jt_d, &jt_h, sizeof(JBUTexObj) * 1, cudaMemcpyHostToDevice, stream_);
  }
 
 void RunJBU(const cv::Mat_<float>  &scaled_image_float, const cv::Mat_<float> &src_depthmap, const std::string &dense_folder , const Problem &problem)           
@@ -1241,11 +1401,15 @@ void RunJBU(const cv::Mat_<float>  &scaled_image_float, const cv::Mat_<float> &s
     jbu.jp_h.s_height = src_depthmap.rows;
     jbu.jp_h.s_width = src_depthmap.cols;
     jbu.jp_h.Imagescale = Imagescale;
-    JBUAddImageToTextureFloatGray(imgs, jbu.jt_h.imgs, jbu.cuArray, JBU_NUM);
-    const cudaStream_t s = 0;
+    // Create per-call non-blocking stream
+    cudaStream_t s;
+    cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking);
 
-    jbu.InitializeParameters(rows * cols);
+    JBUAddImageToTextureFloatGray(imgs, jbu.jt_h.imgs, jbu.cuArray, JBU_NUM, s);
+
+    // SetStream BEFORE InitializeParameters (it uses stream_ for async copies)
     jbu.SetStream(s);
+    jbu.InitializeParameters(rows * cols);
     jbu.CudaRun();
 
     cv::Mat_<float> depthmap = cv::Mat::zeros( rows, cols, CV_32FC1 );
@@ -1253,9 +1417,6 @@ void RunJBU(const cv::Mat_<float>  &scaled_image_float, const cv::Mat_<float> &s
     for (uint32_t i = 0; i < cols; ++i) {
         for(uint32_t j = 0; j < rows; ++j) {
             int center = i + cols * j;
-            if (jbu.depth_h[center] != jbu.depth_h[center]) {
-                std::cout << "wrong!" << std::endl;
-            }
             depthmap (j, i) = jbu.depth_h[center];
         }
     }
@@ -1265,7 +1426,7 @@ void RunJBU(const cv::Mat_<float>  &scaled_image_float, const cv::Mat_<float> &s
     result_path << dense_folder << "/ACMMP" << "/2333_" << std::setw(8) << std::setfill('0') << problem.ref_image_id;
     std::string result_folder = result_path.str();
     mkdir(result_folder.c_str(), 0777);
-    
+
     // Use compressed format for output
     std::string depth_path = result_folder + "/depths.cdmb";
     CompressedDMB::writeDepthCompressed(depth_path, disp0);
@@ -1274,5 +1435,6 @@ void RunJBU(const cv::Mat_<float>  &scaled_image_float, const cv::Mat_<float> &s
         CUDA_SAFE_CALL( cudaDestroyTextureObject(jbu.jt_h.imgs[i]) );
         CUDA_SAFE_CALL( cudaFreeArray(jbu.cuArray[i]) );
     }
-    cudaDeviceSynchronize();
+    cudaStreamSynchronize(s);
+    cudaStreamDestroy(s);
 }

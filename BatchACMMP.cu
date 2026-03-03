@@ -4,12 +4,90 @@
 
 #include "BatchACMMP.h"
 #include "CompressedDMB.h"
+#include <sys/stat.h>
 #include <iostream>
 #include <algorithm>
 #include <chrono>
 #include <fstream>
 #include <sstream>
 #include <iomanip>
+
+// Forward declarations for GPU kernels defined in ACMMP.cu
+__global__ void ExtractSupportPointsKernel(
+    const float4* plane_hypotheses, const float* costs,
+    int width, int height,
+    int2* support_points_out, int* num_points_out, int max_points);
+
+__global__ void RasterizeTrianglesKernel(
+    const int2* triangle_vertices, int num_triangles,
+    unsigned int* plane_masks, int width, int height);
+
+__global__ void ComputePriorPlanesKernel(
+    const float4* plane_hypotheses, const Camera* cameras,
+    const int2* triangle_vertices, unsigned int* plane_masks,
+    float4* prior_planes, float depth_min, float depth_max,
+    int width, int height);
+
+// ── ImageCache implementation ──────────────────────────────────────────────
+ImageCache::ImageCache(size_t max_entries, const std::string& dense_folder, bool has_masks)
+    : max_entries_(max_entries), dense_folder_(dense_folder), has_masks_(has_masks) {}
+
+std::shared_ptr<const ImageCacheEntry> ImageCache::get(int image_id) {
+    std::lock_guard<std::mutex> lk(mutex_);
+    auto it = cache_.find(image_id);
+    if (it != cache_.end()) {
+        // Move to front of LRU
+        lru_order_.remove(image_id);
+        lru_order_.push_front(image_id);
+        hits_++;
+        return it->second;
+    }
+    misses_++;
+    evict_if_needed();
+    auto entry = load(image_id);
+    cache_[image_id] = entry;
+    lru_order_.push_front(image_id);
+    return entry;
+}
+
+void ImageCache::evict_if_needed() {
+    while (cache_.size() >= max_entries_ && !lru_order_.empty()) {
+        int victim = lru_order_.back();
+        lru_order_.pop_back();
+        cache_.erase(victim);
+    }
+}
+
+std::shared_ptr<ImageCacheEntry> ImageCache::load(int image_id) {
+    auto entry = std::make_shared<ImageCacheEntry>();
+
+    // Load image
+    std::stringstream image_path;
+    image_path << dense_folder_ << "/images/" << std::setw(8) << std::setfill('0') << image_id << ".png";
+    cv::Mat_<uint8_t> image_uint = cv::imread(image_path.str(), cv::IMREAD_GRAYSCALE);
+    image_uint.convertTo(entry->image_float, CV_32FC1);
+
+    // Load camera
+    std::stringstream cam_path;
+    cam_path << dense_folder_ << "/cams/" << std::setw(8) << std::setfill('0') << image_id << "_cam.txt";
+    entry->camera = ReadCamera(cam_path.str());
+    entry->camera.height = entry->image_float.rows;
+    entry->camera.width = entry->image_float.cols;
+
+    // Load mask
+    if (has_masks_) {
+        std::stringstream mask_path;
+        mask_path << dense_folder_ << "/masks/" << std::setw(8) << std::setfill('0') << image_id << ".png";
+        cv::Mat mask_img = cv::imread(mask_path.str(), cv::IMREAD_GRAYSCALE);
+        if (!mask_img.empty()) {
+            mask_img.convertTo(entry->mask_float, CV_32FC1, 1.0 / 255.0);
+            entry->has_mask = true;
+        }
+    }
+    return entry;
+}
+
+// ── End ImageCache ────────────────────────────────────────────────────────
 
 void checkCudaLimits() {
     cudaDeviceProp prop;
@@ -39,7 +117,8 @@ ProblemGPUResources::ProblemGPUResources() {
 
 void ProblemGPUResources::allocate(int max_width, int max_height, int max_images) {
     // This function is called once per resource object when the pool is initialized.
-    
+    allocated_images = max_images;
+
     // Allocate arrays for images and depths using the maximum possible dimensions.
     for (int i = 0; i < max_images; ++i) {
         cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc(32, 0, 0, 0, cudaChannelFormatKindFloat);
@@ -61,9 +140,47 @@ void ProblemGPUResources::allocate(int max_width, int max_height, int max_images
     CUDA_CHECK(cudaMalloc(&prior_planes_cuda, sizeof(float4) * max_width * max_height));
     CUDA_CHECK(cudaMalloc(&plane_masks_cuda, sizeof(unsigned int) * max_width * max_height));
 
+    // Item 4: GPU early masking buffer
+    CUDA_CHECK(cudaMalloc(&ref_mask_cuda, sizeof(uint8_t) * max_width * max_height));
+
+    // Item 5: Batch planar prior buffers
+    const int max_support_points = ((max_width + 4) / 5) * ((max_height + 4) / 5);
+    const int max_triangles = max_support_points * 2;
+    CUDA_CHECK(cudaMalloc(&support_points_cuda, sizeof(int2) * max_support_points));
+    CUDA_CHECK(cudaMalloc(&num_support_points_cuda, sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&triangle_vertices_cuda, sizeof(int2) * max_triangles * 3));
+    CUDA_CHECK(cudaMallocHost(&support_points_pinned, sizeof(int2) * max_support_points));
+    CUDA_CHECK(cudaMallocHost(&num_support_points_pinned, sizeof(int)));
+
     // Allocate pinned host memory for high-speed asynchronous transfers.
     CUDA_CHECK(cudaMallocHost(&planes_host_pinned, sizeof(float4) * max_width * max_height));
     CUDA_CHECK(cudaMallocHost(&costs_host_pinned, sizeof(float) * max_width * max_height));
+
+    // Item 2: Create texture objects once for all allocated slots
+    struct cudaTextureDesc texDesc;
+    memset(&texDesc, 0, sizeof(cudaTextureDesc));
+    texDesc.addressMode[0] = cudaAddressModeClamp;
+    texDesc.addressMode[1] = cudaAddressModeClamp;
+    texDesc.filterMode = cudaFilterModeLinear;
+    texDesc.readMode = cudaReadModeElementType;
+    texDesc.normalizedCoords = 0;
+
+    for (int i = 0; i < max_images; i++) {
+        struct cudaResourceDesc resDesc;
+        memset(&resDesc, 0, sizeof(cudaResourceDesc));
+        resDesc.resType = cudaResourceTypeArray;
+
+        resDesc.res.array.array = cuArray[i];
+        CUDA_CHECK(cudaCreateTextureObject(&texture_objects_host.images[i], &resDesc, &texDesc, NULL));
+
+        resDesc.res.array.array = cuDepthArray[i];
+        CUDA_CHECK(cudaCreateTextureObject(&texture_depths_host.images[i], &resDesc, &texDesc, NULL));
+    }
+
+    // Upload texture handles to GPU (one-time)
+    CUDA_CHECK(cudaMemcpy(texture_objects_cuda, &texture_objects_host, sizeof(cudaTextureObjects), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(texture_depths_cuda, &texture_depths_host, sizeof(cudaTextureObjects), cudaMemcpyHostToDevice));
+    textures_created = true;
 }
 
 void BatchACMMP::initializeResourcePool() {
@@ -176,8 +293,20 @@ void ProblemGPUResources::cleanup() {
     safeFree((void*&)depths_cuda, "depths_cuda");
     safeFree((void*&)prior_planes_cuda, "prior_planes_cuda");
     safeFree((void*&)plane_masks_cuda, "plane_masks_cuda");
+    safeFree((void*&)ref_mask_cuda, "ref_mask_cuda");
+    safeFree((void*&)support_points_cuda, "support_points_cuda");
+    safeFree((void*&)num_support_points_cuda, "num_support_points_cuda");
+    safeFree((void*&)triangle_vertices_cuda, "triangle_vertices_cuda");
 
-    if (planes_host_pinned) { 
+    if (support_points_pinned) {
+        cudaFreeHost(support_points_pinned);
+        support_points_pinned = nullptr;
+    }
+    if (num_support_points_pinned) {
+        cudaFreeHost(num_support_points_pinned);
+        num_support_points_pinned = nullptr;
+    }
+    if (planes_host_pinned) {
         cudaFreeHost(planes_host_pinned); 
         planes_host_pinned = nullptr; 
     }
@@ -229,6 +358,13 @@ BatchACMMP::BatchACMMP(const std::string& dense_folder_,
     std::cout << "  Disk Writers: " << num_disk_writers << std::endl;
     std::cout << "  GPU Memory: " << (available_gpu_memory/(1024*1024)) << "MB free, "
               << (memory_per_problem/(1024*1024)) << "MB/problem" << std::endl;
+
+    // Initialize image cache: detect mask folder
+    std::string mask_dir = dense_folder + "/masks";
+    struct stat mask_stat;
+    bool masks_exist = (stat(mask_dir.c_str(), &mask_stat) == 0 && S_ISDIR(mask_stat.st_mode));
+    image_cache_ = std::unique_ptr<ImageCache>(new ImageCache(50, dense_folder, masks_exist));
+    std::cout << "[BatchACMMP] Image cache: max 50 entries, masks=" << (masks_exist ? "yes" : "no") << std::endl;
 
     initializeResourcePool();
     initializeDiskWriters();
@@ -284,7 +420,11 @@ BatchACMMP::~BatchACMMP() {
         // Ignore errors during shutdown
     }
     
-    std::cout << "[BatchACMMP] Shutdown complete. Peak memory: " 
+    if (image_cache_) {
+        std::cout << "[BatchACMMP] Image cache: " << image_cache_->hits() << " hits, "
+                  << image_cache_->misses() << " misses" << std::endl;
+    }
+    std::cout << "[BatchACMMP] Shutdown complete. Peak memory: "
               << getPeakMemoryUsage() << "MB" << std::endl;
 }
 
@@ -314,8 +454,15 @@ size_t BatchACMMP::estimateMemoryPerProblem(const Problem& problem) {
     size_t textures = N * W * H * (sizeof(float) + sizeof(float)); // images + depths
     size_t working = W * H * (2*sizeof(float4) + 3*sizeof(float)); // hypotheses + costs
     size_t misc = W * H * (sizeof(RNGState) + sizeof(unsigned int));
-    
-    return (textures + working + misc) * 130 / 100; // 30% overhead
+    size_t masks = W * H * sizeof(uint8_t);                           // ref_mask_cuda
+    size_t prior = W * H * (sizeof(float4) + sizeof(unsigned int));   // prior_planes + plane_masks
+    size_t max_sp = ((W + 4) / 5) * ((H + 4) / 5);
+    size_t support = max_sp * sizeof(int2) + sizeof(int);             // support_points + counter
+    size_t triangles = max_sp * 2 * 3 * sizeof(int2);                // triangle_vertices
+    size_t pinned = W * H * (sizeof(float4) + sizeof(float))         // planes + costs
+                  + max_sp * sizeof(int2) + sizeof(int);              // support points pinned
+
+    return (textures + working + misc + masks + prior + support + triangles + pinned) * 130 / 100;
 }
 
 size_t BatchACMMP::getAvailableGPUMemory() {
@@ -482,49 +629,135 @@ void BatchACMMP::processProblemOnStream(int problem_idx, ProblemGPUResources* re
             ACMMP acmmp;
             if (geom_consistency) acmmp.SetGeomConsistencyParams(multi_geometry);
             if (hierarchy) acmmp.SetHierarchyParams();
+            acmmp.SetBatchMode();
 
             acmmp.SetStream(stream);
-            acmmp.InuputInitialization(dense_folder, all_problems, problem_idx);
+            acmmp.InputInitialization(dense_folder, all_problems, problem_idx, *image_cache_);
             acmmp.CudaSpaceInitialization(dense_folder, problem, resources);
-            
+
             cudaError_t pre_run_check = cudaGetLastError();
             if (pre_run_check != cudaSuccess) {
                 std::cerr << "Pre-run error: " << cudaGetErrorString(pre_run_check) << std::endl;
                 throw std::runtime_error("CUDA setup failed");
             }
-            
-            acmmp.RunPatchMatch(resources);
-            
+
             const int width = acmmp.GetReferenceImageWidth();
             const int height = acmmp.GetReferenceImageHeight();
+
+            if (planar_prior && !geom_consistency) {
+                // ═══ PASS 1: initial depth estimates ═══
+                acmmp.RunPatchMatch(resources, /*skip_host_download=*/true);
+
+                // GPU: extract support points
+                const int max_sp = ((width + 4) / 5) * ((height + 4) / 5);
+                CUDA_CHECK(cudaMemsetAsync(resources->num_support_points_cuda, 0, sizeof(int), stream));
+                dim3 sp_grid((width + 4) / 5, (height + 4) / 5);
+                dim3 sp_block(1, 1);
+                ExtractSupportPointsKernel<<<sp_grid, sp_block, 0, stream>>>(
+                    resources->plane_hypotheses_cuda, resources->costs_cuda,
+                    width, height,
+                    resources->support_points_cuda, resources->num_support_points_cuda, max_sp);
+
+                // D2H: count first
+                CUDA_CHECK(cudaMemcpyAsync(resources->num_support_points_pinned,
+                                           resources->num_support_points_cuda,
+                                           sizeof(int), cudaMemcpyDeviceToHost, stream));
+                CUDA_CHECK(cudaStreamSynchronize(stream));
+                int num_pts = std::min(*resources->num_support_points_pinned, max_sp);
+
+                if (num_pts > 2) {
+                    // D2H: support points
+                    CUDA_CHECK(cudaMemcpyAsync(resources->support_points_pinned,
+                                               resources->support_points_cuda,
+                                               sizeof(int2) * num_pts, cudaMemcpyDeviceToHost, stream));
+                    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+                    // CPU: Delaunay triangulation
+                    std::vector<cv::Point> support2DPoints(num_pts);
+                    for (int i = 0; i < num_pts; i++)
+                        support2DPoints[i] = cv::Point(resources->support_points_pinned[i].x,
+                                                       resources->support_points_pinned[i].y);
+                    cv::Rect imageRC(0, 0, width, height);
+                    auto triangles = acmmp.DelaunayTriangulation(imageRC, support2DPoints);
+
+                    // Filter OOB triangles and pack vertices
+                    std::vector<int2> tri_verts;
+                    tri_verts.reserve(triangles.size() * 3);
+                    for (const auto& tr : triangles) {
+                        if (imageRC.contains(tr.pt1) && imageRC.contains(tr.pt2) && imageRC.contains(tr.pt3)) {
+                            tri_verts.push_back(make_int2(tr.pt1.x, tr.pt1.y));
+                            tri_verts.push_back(make_int2(tr.pt2.x, tr.pt2.y));
+                            tri_verts.push_back(make_int2(tr.pt3.x, tr.pt3.y));
+                        }
+                    }
+                    int num_valid_tris = (int)tri_verts.size() / 3;
+
+                    if (num_valid_tris > 0) {
+                        // H2D: triangle vertices
+                        CUDA_CHECK(cudaMemcpyAsync(resources->triangle_vertices_cuda, tri_verts.data(),
+                                                   sizeof(int2) * tri_verts.size(), cudaMemcpyHostToDevice, stream));
+
+                        // GPU: rasterize triangles → plane_masks
+                        CUDA_CHECK(cudaMemsetAsync(resources->plane_masks_cuda, 0,
+                                                   sizeof(unsigned int) * width * height, stream));
+                        RasterizeTrianglesKernel<<<(num_valid_tris + 255) / 256, 256, 0, stream>>>(
+                            resources->triangle_vertices_cuda, num_valid_tris,
+                            resources->plane_masks_cuda, width, height);
+
+                        // GPU: compute prior planes from triangulated depths
+                        float dmin = acmmp.GetMinDepth();
+                        float dmax = acmmp.GetMaxDepth();
+                        dim3 pp_block(16, 16);
+                        dim3 pp_grid((width + pp_block.x - 1) / pp_block.x,
+                                     (height + pp_block.y - 1) / pp_block.y);
+                        ComputePriorPlanesKernel<<<pp_grid, pp_block, 0, stream>>>(
+                            resources->plane_hypotheses_cuda, resources->cameras_cuda,
+                            resources->triangle_vertices_cuda, resources->plane_masks_cuda,
+                            resources->prior_planes_cuda,
+                            dmin, dmax, width, height);
+
+                        // Upload plane_masks and prior_planes to GPU is already done (they're on GPU)
+                        // Upload plane_masks_cuda and prior_planes_cuda handles to the device struct
+                        // (RunPatchMatch reads from res->plane_masks_cuda and res->prior_planes_cuda directly)
+
+                        // ═══ PASS 2: prior-assisted PatchMatch ═══
+                        acmmp.SetPlanarPriorParams();
+                        acmmp.RunPatchMatch(resources, /*skip_host_download=*/false);
+                    } else {
+                        // No valid triangles: download Pass 1 results
+                        CUDA_CHECK(cudaMemcpyAsync(resources->planes_host_pinned, resources->plane_hypotheses_cuda,
+                                                   sizeof(float4) * width * height, cudaMemcpyDeviceToHost, stream));
+                        CUDA_CHECK(cudaMemcpyAsync(resources->costs_host_pinned, resources->costs_cuda,
+                                                   sizeof(float) * width * height, cudaMemcpyDeviceToHost, stream));
+                        CUDA_CHECK(cudaStreamSynchronize(stream));
+                    }
+                } else {
+                    // Too few support points: download Pass 1 results
+                    CUDA_CHECK(cudaMemcpyAsync(resources->planes_host_pinned, resources->plane_hypotheses_cuda,
+                                               sizeof(float4) * width * height, cudaMemcpyDeviceToHost, stream));
+                    CUDA_CHECK(cudaMemcpyAsync(resources->costs_host_pinned, resources->costs_cuda,
+                                               sizeof(float) * width * height, cudaMemcpyDeviceToHost, stream));
+                    CUDA_CHECK(cudaStreamSynchronize(stream));
+                }
+            } else {
+                acmmp.RunPatchMatch(resources);
+            }
 
             cv::Mat_<float> depths(height, width);
             cv::Mat_<cv::Vec3f> normals(height, width);
             cv::Mat_<float> costs(height, width);
-            
-            // Get reference mask for filtering (mask values: 0=masked, 1=valid)
-            cv::Mat ref_mask = acmmp.GetReferenceMask();
-            bool has_mask = acmmp.HasMasks() && !ref_mask.empty();
+
+            // Item 3: Read directly from pinned buffers (no intermediate copy)
+            const float4* planes_pinned = resources->planes_host_pinned;
+            const float* costs_pinned = resources->costs_host_pinned;
 
             for (int y = 0; y < height; ++y) {
                 for (int x = 0; x < width; ++x) {
                     const int c = y * width + x;
-                    const float4 plane_hypothesis = acmmp.GetPlaneHypothesis(c);
-                    
-                    // Apply mask: set depth to 0 for masked pixels
-                    // Mask semantics: 1 (white) = masked (skip), 0 (black) = valid (keep)
-                    float depth_value = plane_hypothesis.w;
-                    if (has_mask) {
-                        float mask_val = ref_mask.at<float>(y, x);
-                        if (mask_val > 0.5f) {
-                            depth_value = 0.0f;  // Masked - set to 0 so fusion ignores it
-                        }
-                    }
-
-                    
-                    depths(y, x) = depth_value;
-                    normals(y, x) = cv::Vec3f(plane_hypothesis.x, plane_hypothesis.y, plane_hypothesis.z);
-                    costs(y, x) = acmmp.GetCost(c);
+                    const float4 ph = planes_pinned[c];
+                    depths(y, x) = ph.w;
+                    normals(y, x) = cv::Vec3f(ph.x, ph.y, ph.z);
+                    costs(y, x) = costs_pinned[c];
                 }
             }
 

@@ -3,7 +3,7 @@
 #include <math_constants.h>
 #include <iostream>
 #include <cmath>
-#define FLT_MAX 100
+#include <cfloat>
 
 // Global instance
 SphericalLUTManager* g_lut_manager = nullptr;
@@ -336,27 +336,6 @@ SphericalLUT* SphericalLUTManager::FindClosestLUT(int width, int height, float c
     return closest;
 }
 
-void SphericalLUTManager::InitializeMultiScaleLUTs(int base_width, int base_height, 
-                                                   float base_cx, float base_cy, 
-                                                   int num_scales) {
-    std::cout << "Initializing " << num_scales << " scale LUTs with memory pool optimization..." << std::endl;
-    
-    for (int scale = 0; scale < num_scales; ++scale) {
-        int scale_factor = 1 << scale;
-        int width = base_width / scale_factor;
-        int height = base_height / scale_factor;
-        float cx = base_cx / scale_factor;
-        float cy = base_cy / scale_factor;
-        
-        if (width < 32 || height < 32) break;
-        
-        GetOrCreateLUT(width, height, cx, cy);
-    }
-    
-    std::cout << "Total LUTs created: " << lut_map.size() 
-              << ", Memory usage: " << GetTotalMemoryUsage() / (1024.0 * 1024.0) << " MB" << std::endl;
-}
-
 void SphericalLUTManager::UpdateDeviceArray() {
     if (device_luts.empty()) return;
     
@@ -388,13 +367,6 @@ void SphericalLUTManager::UpdateDeviceArray() {
     delete[] h_lut_array;
 }
 
-SphericalLUT* SphericalLUTManager::GetLUTByIndex(int idx) {
-    if (idx >= 0 && idx < (int)device_luts.size()) {
-        return device_luts[idx];
-    }
-    return nullptr;
-}
-
 void SphericalLUTManager::FreeAllLUTs() {
     for (auto& pair : lut_map) {
         FreeLUT(pair.second);
@@ -413,66 +385,6 @@ size_t SphericalLUTManager::GetTotalMemoryUsage() const {
         total += inverse_trig_lut->total_memory;
     }
     return total;
-}
-
-void SphericalLUTManager::ValidateInverseTrigLUTs() const {
-    if (!inverse_trig_lut) {
-        std::cerr << "Error: Inverse trig LUTs not initialized!" << std::endl;
-        return;
-    }
-    
-    std::cout << "Validating Inverse Trig LUTs..." << std::endl;
-    
-    // Validate ASIN LUT
-    float max_asin_error = 0.0f;
-    for (int i = 0; i < 1000; ++i) {
-        float input = -1.0f + 2.0f * i / 999.0f;
-        float expected = std::asin(input);
-        
-        // Simulate LUT lookup (would need to copy from device for real validation)
-        float idx_f = (input - inverse_trig_lut->asin_min) * inverse_trig_lut->asin_scale;
-        int idx = static_cast<int>(idx_f);
-        float error = 0.001f; // Placeholder
-        max_asin_error = std::max(max_asin_error, error);
-    }
-    
-    std::cout << "  ASIN LUT max error: ~" << max_asin_error << " radians (~" 
-              << max_asin_error * 180.0f / M_PI << " degrees)" << std::endl;
-    std::cout << "  ATAN2 LUT: " << inverse_trig_lut->atan2_size << "x" 
-              << inverse_trig_lut->atan2_size << " grid validated" << std::endl;
-}
-
-void SphericalLUTManager::PrintStatistics() const {
-    std::cout << "\n=== LUT Manager Statistics ===" << std::endl;
-    std::cout << "Resolution LUTs: " << lut_map.size() << "/" << MAX_RESOLUTIONS << std::endl;
-    std::cout << "Total memory: " << GetTotalMemoryUsage() / (1024.0 * 1024.0) << " MB" << std::endl;
-    std::cout << "Memory pool usage: " << memory_pool_offset / (1024.0 * 1024.0) << " MB / "
-              << memory_pool_size / (1024.0 * 1024.0) << " MB ("
-              << GetMemoryPoolUtilization() * 100.0f << "%)" << std::endl;
-    
-    if (inverse_trig_lut) {
-        std::cout << "Inverse Trig LUTs: " << inverse_trig_lut->total_memory / 1024.0 << " KB" << std::endl;
-    }
-}
-
-void SphericalLUTManager::ValidateAllLUTs() const {
-    std::cout << "\n=== Validating All LUTs ===" << std::endl;
-    for (const auto& pair : lut_map) {
-        const ResolutionKey& key = pair.first;
-        std::cout << "LUT " << key.width << "x" << key.height 
-                  << " at (" << key.cx << ", " << key.cy << "): OK" << std::endl;
-    }
-    ValidateInverseTrigLUTs();
-}
-
-void SphericalLUTManager::DefragmentMemoryPool() {
-    // Placeholder for future implementation
-    std::cout << "Memory pool defragmentation not yet implemented" << std::endl;
-}
-
-void SphericalLUTManager::OptimizeLUTOrder() {
-    // Placeholder for future implementation
-    std::cout << "LUT order optimization not yet implemented" << std::endl;
 }
 
 // Global functions
