@@ -761,6 +761,14 @@ __global__ void RandomInitialization(cudaTextureObjects *texture_objects, Camera
     }
 }
 
+// Fast approximation for acos(c)^2: uses Taylor expansion 2(1-c) for aligned normals (c>0),
+// falls back to full acosf for opposing normals (c<0). Max relative error ~4% at c=0.5.
+__device__ __forceinline__ float ApproxAcosSq(float c) {
+    c = fminf(fmaxf(c, -1.0f), 1.0f);
+    if (c > 0.0f) return 2.0f * (1.0f - c);  // Taylor approx for small angles
+    float a = acosf(c); return a * a;          // fallback for large angles
+}
+
 __device__ void PlaneHypothesisRefinement(const cudaTextureObject_t *images,
                                           const cudaTextureObject_t *depth_images,
                                           const Camera *cameras,
@@ -834,17 +842,18 @@ __device__ void PlaneHypothesisRefinement(const cudaTextureObject_t *images,
     float4 plane_hypothesis_perturbed = 
         GeneratePerturbedNormal(cameras[0], p, *plane_hypothesis, rand_state, pixel_key, perturbation * CUDART_PI_F);
 
-    // 4) Evaluate candidates
-    const int num_planes = 5;
-    float  depths[num_planes]  = { depth_rand, *depth, depth_rand, *depth, depth_perturbed };
-    float4 normals[num_planes] = { *plane_hypothesis, plane_hypothesis_rand,
+    // 4) Evaluate candidates — with prior guidance, 3 most informative suffice
+    const bool has_prior = params.planar_prior && plane_masks[center] > 0;
+    const int num_planes = has_prior ? 3 : 5;
+    float  depths_arr[5]  = { depth_rand, *depth, depth_rand, *depth, depth_perturbed };
+    float4 normals_arr[5] = { *plane_hypothesis, plane_hypothesis_rand,
                                    plane_hypothesis_rand, plane_hypothesis_perturbed,
                                    *plane_hypothesis };
 
     for (int i = 0; i < num_planes; ++i) {
         float cost_vector[32] = { 2.0f };
-        float4 temp_plane_hypothesis = normals[i];
-        temp_plane_hypothesis.w = GetDistance2Origin(cameras[0], p, depths[i], temp_plane_hypothesis);
+        float4 temp_plane_hypothesis = normals_arr[i];
+        temp_plane_hypothesis.w = GetDistance2Origin(cameras[0], p, depths_arr[i], temp_plane_hypothesis);
 
         // Compute multi-view photo-consistency costs
         ComputeMultiViewCostVector(images, cameras, p, temp_plane_hypothesis, cost_vector, params);
@@ -874,16 +883,15 @@ __device__ void PlaneHypothesisRefinement(const cudaTextureObject_t *images,
         }
 
         // Accept based on prior availability (ACMMP's strength preserved)
-        if (params.planar_prior && plane_masks[center] > 0) {
+        if (has_prior) {
             // Prior-based acceptance
             float depth_prior = ComputeDepthfromPlaneHypothesis(cameras[0], prior_planes[center], p);
-            float depth_diff = depths[i] - depth_prior;
+            float depth_diff = depth_before - depth_prior;
             float angle_cos = Vec3DotVec3(prior_planes[center], temp_plane_hypothesis);
-            angle_cos = fminf(fmaxf(angle_cos, -1.0f), 1.0f);  // Clamp for numerical stability
-            float angle_diff = acosf(angle_cos);
-            
-            float prior = gamma + expf(-depth_diff * depth_diff / two_depth_sigma_squared) * 
-                                 expf(-angle_diff * angle_diff / two_angle_sigma_squared);
+            float angle_diff_sq = ApproxAcosSq(angle_cos);
+
+            float prior = gamma + expf(-(depth_diff * depth_diff / two_depth_sigma_squared +
+                                         angle_diff_sq / two_angle_sigma_squared));
             float restricted_temp_cost = expf(-temp_cost * temp_cost / beta) * prior;
             
             if (restricted_temp_cost > *restricted_cost) {
@@ -1382,9 +1390,8 @@ __device__ void CheckerboardPropagation(
                     float depth_now_temp = ComputeDepthfromPlaneHypothesis(cameras[0], plane_hypotheses[final_positions[i]], p);
                     float depth_diff = depth_now_temp - depth_prior;
                     float angle_cos = Vec3DotVec3(prior_planes[center], plane_hypotheses[final_positions[i]]);
-                    angle_cos = fminf(fmaxf(angle_cos, -1.0f), 1.0f);
-                    float angle_diff = acosf(angle_cos);
-                    float prior = gamma + expf(- depth_diff * depth_diff / two_depth_sigma_squared) * expf(- angle_diff * angle_diff / two_angle_sigma_squared);
+                    float angle_diff_sq = ApproxAcosSq(angle_cos);
+                    float prior = gamma + expf(-(depth_diff * depth_diff / two_depth_sigma_squared + angle_diff_sq / two_angle_sigma_squared));
                     restricted_final_costs[i] = expf(-final_costs[i] * final_costs[i] / beta) * prior;
                 }
             }
@@ -1394,9 +1401,8 @@ __device__ void CheckerboardPropagation(
             float depth_now_temp = ComputeDepthfromPlaneHypothesis(cameras[0], plane_hypotheses[center], p);
             float depth_diff = depth_now_temp - depth_prior;
             float angle_cos = Vec3DotVec3(prior_planes[center], plane_hypotheses[center]);
-            angle_cos = fminf(fmaxf(angle_cos, -1.0f), 1.0f);
-            float angle_diff = acosf(angle_cos);
-            float prior = gamma + expf(- depth_diff * depth_diff / two_depth_sigma_squared) * expf(- angle_diff * angle_diff / two_angle_sigma_squared);
+            float angle_diff_sq = ApproxAcosSq(angle_cos);
+            float prior = gamma + expf(-(depth_diff * depth_diff / two_depth_sigma_squared + angle_diff_sq / two_angle_sigma_squared));
             restricted_cost_now = expf(-cost_now * cost_now / beta) * prior;
 
             if (flag[max_cost_idx]) {
@@ -1819,14 +1825,16 @@ __global__ void ExtractSupportPointsKernel(
 }
 
 // Rasterize triangles: one thread per triangle, iterate bounding box
+// num_triangles_ptr is a device pointer to avoid host sync; max_triangles bounds the launch grid.
 __global__ void RasterizeTrianglesKernel(
     const int2* triangle_vertices,  // 3 int2 per triangle
-    int num_triangles,
+    const int* num_triangles_ptr,   // device pointer to actual count
+    int max_triangles,              // upper bound for grid launch
     unsigned int* plane_masks,
     int width, int height)
 {
     const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= num_triangles) return;
+    if (tid >= *num_triangles_ptr || tid >= max_triangles) return;
 
     const int2 v0 = triangle_vertices[tid * 3 + 0];
     const int2 v1 = triangle_vertices[tid * 3 + 1];

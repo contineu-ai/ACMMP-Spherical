@@ -20,8 +20,8 @@ __global__ void ExtractSupportPointsKernel(
     int2* support_points_out, int* num_points_out, int max_points);
 
 __global__ void RasterizeTrianglesKernel(
-    const int2* triangle_vertices, int num_triangles,
-    unsigned int* plane_masks, int width, int height);
+    const int2* triangle_vertices, const int* num_triangles_ptr,
+    int max_triangles, unsigned int* plane_masks, int width, int height);
 
 __global__ void ComputePriorPlanesKernel(
     const float4* plane_hypotheses, const Camera* cameras,
@@ -677,8 +677,10 @@ void BatchACMMP::processProblemOnStream(int problem_idx, ProblemGPUResources* re
             const int height = acmmp.GetReferenceImageHeight();
 
             if (planar_prior && !geom_consistency) {
-                // ═══ PASS 1: initial depth estimates ═══
+                // ═══ PASS 1: initial depth estimates (2 iters suffice for rough estimates) ═══
+                acmmp.SetMaxIterations(2);
                 acmmp.RunPatchMatch(resources, /*skip_host_download=*/true);
+                acmmp.SetMaxIterations(4);  // restore default
 
                 // GPU-only planar prior pipeline (no CPU sync point)
                 const int block_size = 5;
@@ -710,24 +712,18 @@ void BatchACMMP::processProblemOnStream(int problem_idx, ProblemGPUResources* re
                         resources->triangle_vertices_cuda, resources->num_support_points_cuda, max_tris);
                 }
 
-                // Step 3: Get triangle count (need it for rasterization launch)
-                CUDA_CHECK(cudaMemcpyAsync(resources->num_support_points_pinned,
-                                           resources->num_support_points_cuda,
-                                           sizeof(int), cudaMemcpyDeviceToHost, stream));
-                CUDA_CHECK(cudaStreamSynchronize(stream));
-                int num_valid_tris = std::min(*resources->num_support_points_pinned, max_tris);
+                // Steps 3-5: Rasterize + compute priors without host sync
+                // Launch with max_tris upper bound; kernel reads actual count from device ptr
+                CUDA_CHECK(cudaMemsetAsync(resources->plane_masks_cuda, 0,
+                                           sizeof(unsigned int) * width * height, stream));
+                RasterizeTrianglesKernel<<<(max_tris + 255) / 256, 256, 0, stream>>>(
+                    resources->triangle_vertices_cuda, resources->num_support_points_cuda,
+                    max_tris, resources->plane_masks_cuda, width, height);
 
-                if (num_valid_tris > 0) {
-                    // Step 4: Rasterize triangles → plane_masks (GPU)
-                    CUDA_CHECK(cudaMemsetAsync(resources->plane_masks_cuda, 0,
-                                               sizeof(unsigned int) * width * height, stream));
-                    RasterizeTrianglesKernel<<<(num_valid_tris + 255) / 256, 256, 0, stream>>>(
-                        resources->triangle_vertices_cuda, num_valid_tris,
-                        resources->plane_masks_cuda, width, height);
-
-                    // Step 5: Compute prior planes from triangulated depths (GPU)
-                    float dmin = acmmp.GetMinDepth();
-                    float dmax = acmmp.GetMaxDepth();
+                // Compute prior planes from triangulated depths (GPU)
+                float dmin = acmmp.GetMinDepth();
+                float dmax = acmmp.GetMaxDepth();
+                {
                     dim3 pp_block(16, 16);
                     dim3 pp_grid((width + pp_block.x - 1) / pp_block.x,
                                  (height + pp_block.y - 1) / pp_block.y);
@@ -736,18 +732,12 @@ void BatchACMMP::processProblemOnStream(int problem_idx, ProblemGPUResources* re
                         resources->triangle_vertices_cuda, resources->plane_masks_cuda,
                         resources->prior_planes_cuda,
                         dmin, dmax, width, height);
-
-                    // ═══ PASS 2: prior-assisted PatchMatch ═══
-                    acmmp.SetPlanarPriorParams();
-                    acmmp.RunPatchMatch(resources, /*skip_host_download=*/false);
-                } else {
-                    // No valid triangles: download Pass 1 results
-                    CUDA_CHECK(cudaMemcpyAsync(resources->planes_host_pinned, resources->plane_hypotheses_cuda,
-                                               sizeof(float4) * width * height, cudaMemcpyDeviceToHost, stream));
-                    CUDA_CHECK(cudaMemcpyAsync(resources->costs_host_pinned, resources->costs_cuda,
-                                               sizeof(float) * width * height, cudaMemcpyDeviceToHost, stream));
-                    CUDA_CHECK(cudaStreamSynchronize(stream));
                 }
+
+                // ═══ PASS 2: prior-assisted PatchMatch (3 iters with prior guidance) ═══
+                acmmp.SetPlanarPriorParams();
+                acmmp.SetMaxIterations(3);
+                acmmp.RunPatchMatch(resources, /*skip_host_download=*/false);
             } else {
                 acmmp.RunPatchMatch(resources);
             }

@@ -80,6 +80,9 @@ public:
     void SetPlanarPriorParams();
     void SetHierarchyParams();
 
+    int GetMaxIterations() const { return params.max_iterations; }
+    void SetMaxIterations(int n) { params.max_iterations = n; }
+
     int GetReferenceImageWidth();
     int GetReferenceImageHeight();
     cv::Mat GetReferenceImage();
