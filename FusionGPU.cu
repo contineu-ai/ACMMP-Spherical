@@ -382,7 +382,7 @@ private:
 public:
     StreamingPointWriter(const std::string& output_folder) 
         : point_count(0) {
-        temp_path = output_folder + "/ACMMP/points_temp.bin";
+        temp_path = output_folder + "/APD/points_temp.bin";
         temp_stream.open(temp_path, std::ios::binary | std::ios::trunc);
         if (!temp_stream.is_open()) {
             throw std::runtime_error("Failed to open temp file: " + temp_path);
@@ -1010,7 +1010,7 @@ private:
         bool depth_loaded = false;
         std::string depth_error;
         
-        ret = snprintf(buf, sizeof(buf), "%s/ACMMP/2333_%08d%s.cdmb", 
+        ret = snprintf(buf, sizeof(buf), "%s/APD/%08d%s.cdmb", 
                       dense_folder.c_str(), image_id, depth_suffix.c_str());
         if (ret >= 0 && ret < static_cast<int>(sizeof(buf))) {
             std::string cdmb_path(buf);
@@ -1030,7 +1030,7 @@ private:
         }
         
         if (!depth_loaded) {
-            ret = snprintf(buf, sizeof(buf), "%s/ACMMP/2333_%08d%s.dmb", 
+            ret = snprintf(buf, sizeof(buf), "%s/APD/%08d%s.dmb", 
                           dense_folder.c_str(), image_id, depth_suffix.c_str());
             if (ret < 0 || ret >= static_cast<int>(sizeof(buf))) {
                 if (tracker) tracker->recordImageFailure(image_id, "depth", "Path buffer overflow");
@@ -1065,7 +1065,7 @@ private:
         bool normal_loaded = false;
         std::string normal_error;
         
-        ret = snprintf(buf, sizeof(buf), "%s/ACMMP/2333_%08d/normals.cdmb", dense_folder.c_str(), image_id);
+        ret = snprintf(buf, sizeof(buf), "%s/APD/%08d/normals.cdmb", dense_folder.c_str(), image_id);
         if (ret >= 0 && ret < static_cast<int>(sizeof(buf))) {
             std::string cdmb_path(buf);
             std::ifstream cdmb_check(cdmb_path);
@@ -1084,7 +1084,7 @@ private:
         }
         
         if (!normal_loaded) {
-            ret = snprintf(buf, sizeof(buf), "%s/ACMMP/2333_%08d/normals.dmb", dense_folder.c_str(), image_id);
+            ret = snprintf(buf, sizeof(buf), "%s/APD/%08d/normals.dmb", dense_folder.c_str(), image_id);
             if (ret < 0 || ret >= static_cast<int>(sizeof(buf))) {
                 if (tracker) tracker->recordImageFailure(image_id, "normal", "Path buffer overflow");
                 return data;
@@ -2066,7 +2066,7 @@ void RunFusionCuda(const std::string &dense_folder,
                 
                 std::string depth_suffix = geom_consistency ? "/depths_geom.dmb" : "/depths.dmb";
                 char depth_buf[512];
-                ret = snprintf(depth_buf, sizeof(depth_buf), "%s/ACMMP/2333_%08d%s", 
+                ret = snprintf(depth_buf, sizeof(depth_buf), "%s/APD/%08d%s", 
                             dense_folder.c_str(), image_id, depth_suffix.c_str());
                 if (ret < 0 || ret >= static_cast<int>(sizeof(depth_buf))) continue;
                 
@@ -2406,7 +2406,7 @@ void RunFusionCuda(const std::string &dense_folder,
                           " points total in " + std::to_string(total_duration.count()) + " seconds");
         
         // Finalize output
-        std::string output_path = dense_folder + "/ACMMP/ACMM_model.ply";
+        std::string output_path = dense_folder + "/APD/APD_model.ply";
         point_writer->finalize(output_path);
         
         FusionLogger::info("Fusion", "Output written to: " + output_path);

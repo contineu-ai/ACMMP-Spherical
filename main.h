@@ -35,12 +35,15 @@
 #include <sys/types.h> // mkdir
 
 #define MAX_IMAGES 256
-#define JBU_NUM 2
+#define NEIGHBOUR_NUM 9
 
 enum CameraModel {
     PINHOLE = 0,
-    SPHERE = 11 // Using 11 to match your comment, but any distinct int is fine
+    SPHERE = 11
 };
+
+enum RunState { FIRST_INIT, REFINE_INIT, REFINE_ITER };
+enum PixelState { WEAK = 0, STRONG = 1, UNKNOWN = 2 };
 
 struct Camera {
     // Use the enum instead of std::string
@@ -52,6 +55,7 @@ struct Camera {
     float params[4]; // For SPHERE: [f, cx, cy, unused]
     float R[9];
     float t[3];
+    float c[3]; // Camera center in world coords: c[j] = -(R[0+j]*t[0] + R[3+j]*t[1] + R[6+j]*t[2])
     float K[9];
     int width, height;
     float depth_min, depth_max;
@@ -63,6 +67,8 @@ struct Problem {
     int max_image_size = 3200;
     int num_downscale = 0;
     int cur_image_size = 3200;
+    int scale_size = 1;      // APD: downscale factor for current round
+    int iteration = 0;       // APD: iteration tracking
 };
 
 struct Triangle {
@@ -89,44 +95,30 @@ void makeDir(const std::string& path);
 void printUsage(const char* program_name);
 
 void GenerateSampleList(const std::string& dense_folder, std::vector<Problem>& problems);
-void InitializeLUTsForAllResolutions(const std::string& dense_folder, 
+void InitializeLUTsForAllResolutions(const std::string& dense_folder,
                                      const std::vector<Problem>& problems,
                                      int max_num_downscale);
-int ComputeMultiScaleSettings(const std::string& dense_folder, std::vector<Problem>& problems);
+int ComputeRoundNum(const std::string& dense_folder, const std::vector<Problem>& problems);
 
-void ProcessProblem(const std::string& dense_folder, 
-                   const std::vector<Problem>& problems, 
-                   const int idx, 
-                   bool geom_consistency, 
-                   bool planar_prior, 
-                   bool hierarchy, 
-                   bool multi_geometry = false);
+struct PatchMatchParams;
 
-void ProcessProblemsInParallel(const std::string& dense_folder, 
-                               std::vector<Problem>& problems,
-                               bool geom_consistency,
-                               bool planar_prior,
-                               bool hierarchy,
-                               bool multi_geometry = false);
+void ProcessProblemAPD(const std::string& dense_folder,
+                       const std::vector<Problem>& problems,
+                       const int idx,
+                       const PatchMatchParams& params);
 
-void ProcessProblemsSequential(const std::string& dense_folder,
-                              const std::vector<Problem>& problems,
-                              bool geom_consistency,
-                              bool planar_prior,
-                              bool hierarchy,
-                              bool multi_geometry = false);
+void ProcessAllProblemsAPD(const std::string& dense_folder,
+                           std::vector<Problem>& problems,
+                           const PatchMatchParams& params,
+                           bool use_batching = true);
 
-void ProcessProblemsWithMode(const std::string& dense_folder,
-                            std::vector<Problem>& problems,
-                            bool geom_consistency,
-                            bool planar_prior,
-                            bool hierarchy,
-                            bool multi_geometry = false,
-                            bool use_batching = true);
+void ProcessProblemsAPDSequential(const std::string& dense_folder,
+                                  const std::vector<Problem>& problems,
+                                  const PatchMatchParams& params);
 
-void JointBilateralUpsampling(const std::string& dense_folder, 
-                             const Problem& problem, 
-                             int acmmp_size);
+void ProcessProblemsAPDInParallel(const std::string& dense_folder,
+                                  std::vector<Problem>& problems,
+                                  const PatchMatchParams& params);
 
 
 

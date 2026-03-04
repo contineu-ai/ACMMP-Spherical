@@ -187,6 +187,13 @@ Camera ReadCamera(const std::string &cam_path)
         file >> camera.depth_min >> camera.depth_max >> dummy1 >> dummy2;
     }
 
+    // Compute camera center in world coords: c[j] = -R^T * t
+    for (int j = 0; j < 3; ++j) {
+        camera.c[j] = -(float)(double(camera.R[0+j])*double(camera.t[0]) +
+                                double(camera.R[3+j])*double(camera.t[1]) +
+                                double(camera.R[6+j])*double(camera.t[2]));
+    }
+
     return camera;
 }
 // In file: ACMH.cpp
@@ -244,15 +251,11 @@ float3 Get3DPointonWorld(const int x, const int y, const float depth, const Came
         Xc.z = depth;
     }
 
-    // 2) cam->world: Xw = R^T * Xc + C, with C = -R^T * t
-    const float Cx = -(camera.R[0]*camera.t[0] + camera.R[1]*camera.t[1] + camera.R[2]*camera.t[2]);
-    const float Cy = -(camera.R[3]*camera.t[0] + camera.R[4]*camera.t[1] + camera.R[5]*camera.t[2]);
-    const float Cz = -(camera.R[6]*camera.t[0] + camera.R[7]*camera.t[1] + camera.R[8]*camera.t[2]);
-
+    // 2) cam->world: Xw = R^T * Xc + C (camera center precomputed in ReadCamera)
     float3 Xw;
-    Xw.x = camera.R[0]*Xc.x + camera.R[3]*Xc.y + camera.R[6]*Xc.z + Cx; // R^T * Xc + C
-    Xw.y = camera.R[1]*Xc.x + camera.R[4]*Xc.y + camera.R[7]*Xc.z + Cy;
-    Xw.z = camera.R[2]*Xc.x + camera.R[5]*Xc.y + camera.R[8]*Xc.z + Cz;
+    Xw.x = camera.R[0]*Xc.x + camera.R[3]*Xc.y + camera.R[6]*Xc.z + camera.c[0];
+    Xw.y = camera.R[1]*Xc.x + camera.R[4]*Xc.y + camera.R[7]*Xc.z + camera.c[1];
+    Xw.z = camera.R[2]*Xc.x + camera.R[5]*Xc.y + camera.R[8]*Xc.z + camera.c[2];
 
     return Xw;
 }
@@ -514,7 +517,56 @@ int readCostDmb(const std::string file_path, cv::Mat_<float> &cost)
     return readDepthDmb(file_path, cost);
 }
 
+// ============================================================================
+// APD binary mat I/O (ported from APD-MVS)
+// ============================================================================
 
+bool ReadBinMat(const std::string &mat_path, cv::Mat &mat)
+{
+    std::ifstream in(mat_path, std::ios_base::binary);
+    if (!in.is_open()) {
+        std::cerr << "Error opening file: " << mat_path << std::endl;
+        return false;
+    }
+
+    int version, rows, cols, type;
+    in.read((char *)(&version), sizeof(int));
+    in.read((char *)(&rows), sizeof(int));
+    in.read((char *)(&cols), sizeof(int));
+    in.read((char *)(&type), sizeof(int));
+
+    if (version != 1) {
+        in.close();
+        std::cerr << "Version error: " << mat_path << std::endl;
+        return false;
+    }
+
+    mat = cv::Mat(rows, cols, type);
+    in.read((char *)mat.data, sizeof(char) * mat.step * mat.rows);
+    in.close();
+    return true;
+}
+
+bool WriteBinMat(const std::string &mat_path, const cv::Mat &mat)
+{
+    std::ofstream out(mat_path, std::ios_base::binary);
+    if (!out.is_open()) {
+        std::cerr << "Error opening file: " << mat_path << std::endl;
+        return false;
+    }
+    int version = 1;
+    int rows = mat.rows;
+    int cols = mat.cols;
+    int type = mat.type();
+
+    out.write((char *)&version, sizeof(int));
+    out.write((char *)&rows, sizeof(int));
+    out.write((char *)&cols, sizeof(int));
+    out.write((char *)&type, sizeof(int));
+    out.write((char *)mat.data, sizeof(char) * mat.step * mat.rows);
+    out.close();
+    return true;
+}
 
 void StoreColorPlyFileBinaryPointCloud (const std::string &plyFilePath, const std::vector<PointList> &pc)
 {
@@ -600,6 +652,22 @@ void ACMMP::SetHierarchyParams()
 void ACMMP::SetPlanarPriorParams()
 {
     params.planar_prior = true;
+}
+
+void ACMMP::SetAPDParams(const PatchMatchParams &apd_params)
+{
+    params.state = apd_params.state;
+    params.use_APD = apd_params.use_APD;
+    params.strong_radius = apd_params.strong_radius;
+    params.strong_increment = apd_params.strong_increment;
+    params.weak_radius = apd_params.weak_radius;
+    params.weak_increment = apd_params.weak_increment;
+    params.weak_peak_radius = apd_params.weak_peak_radius;
+    params.rotate_time = apd_params.rotate_time;
+    params.ransac_threshold = apd_params.ransac_threshold;
+    params.geom_factor = apd_params.geom_factor;
+    params.geom_consistency = apd_params.geom_consistency;
+    params.max_iterations = apd_params.max_iterations;
 }
 
 static int readDepthAuto(const std::string& base_path, cv::Mat_<float>& depth) {
@@ -932,6 +1000,651 @@ void ACMMP::InputInitialization(const std::string &dense_folder, const std::vect
             readDepthAuto(src_depth_path, depth);
             depths.push_back(depth);
         }
+    }
+}
+
+// ============================================================================
+// APD Input Initialization (ported from APD-MVS)
+// ============================================================================
+void ACMMP::APDInputInitialization(const std::string &dense_folder, const std::vector<Problem> &problems, const int idx)
+{
+    images.clear();
+    cameras.clear();
+    depths.clear();
+    masks.clear();
+    has_masks_ = false;
+    const Problem &problem = problems[idx];
+
+    std::string image_folder = dense_folder + "/images";
+    std::string cam_folder = dense_folder + "/cams";
+    std::string mask_folder = dense_folder + "/masks";
+
+    // Check if mask folder exists
+    struct stat mask_stat;
+    bool mask_folder_exists = (stat(mask_folder.c_str(), &mask_stat) == 0 && S_ISDIR(mask_stat.st_mode));
+
+    // Read ref image (try .png first, then .jpg)
+    {
+        std::stringstream ss;
+        ss << image_folder << "/" << std::setw(8) << std::setfill('0') << problem.ref_image_id;
+        std::string base = ss.str();
+        cv::Mat_<uint8_t> image_uint;
+        if (FILE *f = fopen((base + ".png").c_str(), "r")) { fclose(f); image_uint = cv::imread(base + ".png", cv::IMREAD_GRAYSCALE); }
+        else { image_uint = cv::imread(base + ".jpg", cv::IMREAD_GRAYSCALE); }
+        cv::Mat image_float;
+        image_uint.convertTo(image_float, CV_32FC1);
+        images.push_back(image_float);
+    }
+
+    // Load ref mask
+    if (mask_folder_exists) {
+        std::stringstream ss;
+        ss << mask_folder << "/" << std::setw(8) << std::setfill('0') << problem.ref_image_id << ".png";
+        cv::Mat mask_img = cv::imread(ss.str(), cv::IMREAD_GRAYSCALE);
+        if (!mask_img.empty()) {
+            cv::Mat mask_float;
+            mask_img.convertTo(mask_float, CV_32FC1, 1.0 / 255.0);
+            masks.push_back(mask_float);
+            has_masks_ = true;
+        } else {
+            masks.push_back(cv::Mat::ones(images[0].rows, images[0].cols, CV_32FC1));
+        }
+    }
+
+    // Read src images
+    for (const auto &src_id : problem.src_image_ids) {
+        std::stringstream ss;
+        ss << image_folder << "/" << std::setw(8) << std::setfill('0') << src_id;
+        std::string base = ss.str();
+        cv::Mat_<uint8_t> image_uint;
+        if (FILE *f = fopen((base + ".png").c_str(), "r")) { fclose(f); image_uint = cv::imread(base + ".png", cv::IMREAD_GRAYSCALE); }
+        else { image_uint = cv::imread(base + ".jpg", cv::IMREAD_GRAYSCALE); }
+        cv::Mat image_float;
+        image_uint.convertTo(image_float, CV_32FC1);
+        images.push_back(image_float);
+
+        if (mask_folder_exists) {
+            std::stringstream ms;
+            ms << mask_folder << "/" << std::setw(8) << std::setfill('0') << src_id << ".png";
+            cv::Mat mask_img = cv::imread(ms.str(), cv::IMREAD_GRAYSCALE);
+            if (!mask_img.empty()) {
+                cv::Mat mask_float;
+                mask_img.convertTo(mask_float, CV_32FC1, 1.0 / 255.0);
+                masks.push_back(mask_float);
+            } else if (has_masks_) {
+                masks.push_back(cv::Mat::ones(image_float.rows, image_float.cols, CV_32FC1));
+            }
+        }
+    }
+
+    if ((int)images.size() > MAX_IMAGES) {
+        std::cerr << "Too many images: " << images.size() << std::endl;
+        exit(EXIT_FAILURE);
+    }
+
+    // Read cameras
+    {
+        std::stringstream ss;
+        ss << cam_folder << "/" << std::setw(8) << std::setfill('0') << problem.ref_image_id << "_cam.txt";
+        Camera cam = ReadCamera(ss.str());
+        cam.width = images[0].cols;
+        cam.height = images[0].rows;
+        cameras.push_back(cam);
+    }
+    for (const auto &src_id : problem.src_image_ids) {
+        std::stringstream ss;
+        ss << cam_folder << "/" << std::setw(8) << std::setfill('0') << src_id << "_cam.txt";
+        Camera cam = ReadCamera(ss.str());
+        cam.width = images[0].cols;
+        cam.height = images[0].rows;
+        cameras.push_back(cam);
+    }
+
+    // Set depth range
+    params.depth_min = cameras[0].depth_min * 0.6f;
+    params.depth_max = cameras[0].depth_max * 1.2f;
+    params.num_images = (int)images.size();
+    num_images = params.num_images;
+
+    int width = images[0].cols;
+    int height = images[0].rows;
+
+    // Scale images and cameras if scale_size != 1
+    if (problem.scale_size != 1) {
+        const float factor = 1.0f / (float)(problem.scale_size);
+        for (int i = 0; i < num_images; ++i) {
+            const int new_cols = std::round(images[i].cols * factor);
+            const int new_rows = std::round(images[i].rows * factor);
+            const float scale_x = new_cols / static_cast<float>(images[i].cols);
+            const float scale_y = new_rows / static_cast<float>(images[i].rows);
+
+            cv::Mat_<float> scaled;
+            cv::resize(images[i], scaled, cv::Size(new_cols, new_rows), 0, 0, cv::INTER_LINEAR);
+            images[i] = scaled.clone();
+
+            if (has_masks_ && i < (int)masks.size()) {
+                cv::Mat sm;
+                cv::resize(masks[i], sm, cv::Size(new_cols, new_rows), 0, 0, cv::INTER_NEAREST);
+                masks[i] = sm.clone();
+            }
+
+            if (cameras[i].model == SPHERE) {
+                cameras[i].params[0] *= scale_x; // f (for consistency)
+                cameras[i].params[1] *= scale_x; // cx
+                cameras[i].params[2] *= scale_y; // cy
+            } else {
+                cameras[i].K[0] *= scale_x;
+                cameras[i].K[2] *= scale_x;
+                cameras[i].K[4] *= scale_y;
+                cameras[i].K[5] *= scale_y;
+            }
+            cameras[i].width = scaled.cols;
+            cameras[i].height = scaled.rows;
+        }
+        width = images[0].cols;
+        height = images[0].rows;
+    }
+
+    std::cout << "APD: Image size: " << width << " x " << height
+              << ", depth range: [" << params.depth_min << ", " << params.depth_max << "]"
+              << ", num images: " << params.num_images << std::endl;
+
+    // Read depths for geom consistency (compressed DMB format)
+    if (params.geom_consistency) {
+        depths.clear();
+        // Ref depth
+        std::stringstream rp;
+        rp << dense_folder << "/APD/" << std::setw(8) << std::setfill('0') << problem.ref_image_id;
+        std::string result_folder = rp.str();
+        cv::Mat_<float> ref_depth;
+        readDepthDmb(result_folder + "/depths.dmb", ref_depth);
+        depths.push_back(ref_depth);
+        // Src depths
+        for (const auto &src_id : problem.src_image_ids) {
+            std::stringstream sp;
+            sp << dense_folder << "/APD/" << std::setw(8) << std::setfill('0') << src_id << "/depths.dmb";
+            cv::Mat_<float> src_depth;
+            readDepthDmb(sp.str(), src_depth);
+            depths.push_back(src_depth);
+        }
+        // Resize if needed
+        for (auto &d : depths) {
+            if (d.cols != width || d.rows != height) {
+                cv::Mat resized;
+                cv::resize(d, resized, cv::Size(width, height), 0, 0, cv::INTER_LINEAR);
+                d = resized;
+            }
+        }
+    }
+
+    // Read weak info
+    if (params.use_APD) {
+        std::stringstream wp;
+        wp << dense_folder << "/APD/" << std::setw(8) << std::setfill('0') << problem.ref_image_id << "/weak.bin";
+        std::string weak_path = wp.str();
+        if (!ReadBinMat(weak_path, weak_info_host)) {
+            std::cerr << "APD: Can't find weak info: " << weak_path << std::endl;
+            exit(EXIT_FAILURE);
+        }
+        if (weak_info_host.cols != width || weak_info_host.rows != height) {
+            cv::Mat resized;
+            cv::resize(weak_info_host, resized, cv::Size(width, height), 0, 0, cv::INTER_NEAREST);
+            weak_info_host = resized;
+        }
+
+        neighbours_map_host = cv::Mat::zeros(height, width, CV_32SC1);
+        weak_count = 0;
+        for (int r = 0; r < height; ++r) {
+            for (int c = 0; c < width; ++c) {
+                if (weak_info_host.at<uchar>(r, c) == WEAK) {
+                    neighbours_map_host.at<int>(r, c) = weak_count;
+                    weak_count++;
+                }
+            }
+        }
+        std::cout << "APD: Weak count: " << weak_count << " / " << width * height
+                  << " = " << 100.0f * weak_count / (width * height) << "%" << std::endl;
+    } else {
+        weak_info_host = cv::Mat(height, width, CV_8UC1, cv::Scalar(STRONG));
+        neighbours_map_host = cv::Mat::zeros(height, width, CV_32SC1);
+        weak_count = 0;
+    }
+
+    // Allocate plane_hypotheses and load previous results if not FIRST_INIT
+    if (!batch_mode_) {
+        plane_hypotheses_host = new float4[width * height];
+    }
+    selected_views_host = cv::Mat::zeros(height, width, CV_32SC1);
+
+    if (params.state != FIRST_INIT) {
+        std::stringstream rp;
+        rp << dense_folder << "/APD/" << std::setw(8) << std::setfill('0') << problem.ref_image_id;
+        std::string result_folder = rp.str();
+
+        cv::Mat_<float> depth_mat;
+        cv::Mat_<cv::Vec3f> normal_mat;
+        readDepthDmb(result_folder + "/depths.dmb", depth_mat);
+        readNormalDmb(result_folder + "/normals.dmb", normal_mat);
+
+        if (depth_mat.cols != width || depth_mat.rows != height) {
+            cv::Mat rd, rn;
+            cv::resize(depth_mat, rd, cv::Size(width, height), 0, 0, cv::INTER_LINEAR);
+            cv::resize(normal_mat, rn, cv::Size(width, height), 0, 0, cv::INTER_LINEAR);
+            depth_mat = rd;
+            normal_mat = rn;
+        }
+
+        float4 *ph = batch_mode_ ? nullptr : plane_hypotheses_host;
+        if (!ph) {
+            // In batch mode, we'll upload directly in CudaSpaceInitialization
+            // Store in a temporary for now
+            ph = new float4[width * height];
+        }
+        for (int r = 0; r < height; ++r) {
+            for (int c = 0; c < width; ++c) {
+                int idx = r * width + c;
+                ph[idx].w = depth_mat.at<float>(r, c);
+                ph[idx].x = normal_mat.at<cv::Vec3f>(r, c)[0];
+                ph[idx].y = normal_mat.at<cv::Vec3f>(r, c)[1];
+                ph[idx].z = normal_mat.at<cv::Vec3f>(r, c)[2];
+            }
+        }
+        if (batch_mode_) {
+            // In batch mode, we temporarily set plane_hypotheses_host to this
+            // It will be freed after upload
+            plane_hypotheses_host = ph;
+        }
+
+        ReadBinMat(result_folder + "/selected_views.bin", selected_views_host);
+        if (selected_views_host.cols != width || selected_views_host.rows != height) {
+            cv::Mat rs;
+            cv::resize(selected_views_host, rs, cv::Size(width, height), 0, 0, cv::INTER_NEAREST);
+            selected_views_host = rs;
+        }
+    }
+}
+
+// ============================================================================
+// APD Input Initialization (ImageCache overload for batch mode)
+// ============================================================================
+void ACMMP::APDInputInitialization(const std::string &dense_folder, const std::vector<Problem> &problems, const int idx, ImageCache& cache)
+{
+    images.clear();
+    cameras.clear();
+    depths.clear();
+    masks.clear();
+    has_masks_ = false;
+    const Problem &problem = problems[idx];
+
+    // Load ref image from cache
+    auto ref_entry = cache.get(problem.ref_image_id);
+    images.push_back(ref_entry->image_float.clone());
+    cameras.push_back(ref_entry->camera);
+    if (ref_entry->has_mask) {
+        masks.push_back(ref_entry->mask_float.clone());
+        has_masks_ = true;
+    }
+
+    // Load source images from cache
+    for (const auto &src_id : problem.src_image_ids) {
+        auto src_entry = cache.get(src_id);
+        images.push_back(src_entry->image_float.clone());
+        cameras.push_back(src_entry->camera);
+        if (src_entry->has_mask) {
+            masks.push_back(src_entry->mask_float.clone());
+        } else if (has_masks_) {
+            masks.push_back(cv::Mat::ones(src_entry->image_float.rows, src_entry->image_float.cols, CV_32FC1));
+        }
+    }
+
+    if ((int)images.size() > MAX_IMAGES) {
+        std::cerr << "Too many images: " << images.size() << std::endl;
+        exit(EXIT_FAILURE);
+    }
+
+    // Set depth range
+    params.depth_min = cameras[0].depth_min * 0.6f;
+    params.depth_max = cameras[0].depth_max * 1.2f;
+    params.num_images = (int)images.size();
+    num_images = params.num_images;
+
+    int width = images[0].cols;
+    int height = images[0].rows;
+
+    // Scale images and cameras if scale_size != 1
+    if (problem.scale_size != 1) {
+        const float factor = 1.0f / (float)(problem.scale_size);
+        for (int i = 0; i < num_images; ++i) {
+            const int new_cols = std::round(images[i].cols * factor);
+            const int new_rows = std::round(images[i].rows * factor);
+            const float scale_x = new_cols / static_cast<float>(images[i].cols);
+            const float scale_y = new_rows / static_cast<float>(images[i].rows);
+
+            cv::Mat_<float> scaled;
+            cv::resize(images[i], scaled, cv::Size(new_cols, new_rows), 0, 0, cv::INTER_LINEAR);
+            images[i] = scaled.clone();
+
+            if (has_masks_ && i < (int)masks.size()) {
+                cv::Mat sm;
+                cv::resize(masks[i], sm, cv::Size(new_cols, new_rows), 0, 0, cv::INTER_NEAREST);
+                masks[i] = sm.clone();
+            }
+
+            if (cameras[i].model == SPHERE) {
+                cameras[i].params[0] *= scale_x;
+                cameras[i].params[1] *= scale_x;
+                cameras[i].params[2] *= scale_y;
+            } else {
+                cameras[i].K[0] *= scale_x;
+                cameras[i].K[2] *= scale_x;
+                cameras[i].K[4] *= scale_y;
+                cameras[i].K[5] *= scale_y;
+            }
+            cameras[i].width = scaled.cols;
+            cameras[i].height = scaled.rows;
+        }
+        width = images[0].cols;
+        height = images[0].rows;
+    }
+
+    std::cout << "APD: Image size: " << width << " x " << height
+              << ", depth range: [" << params.depth_min << ", " << params.depth_max << "]"
+              << ", num images: " << params.num_images << std::endl;
+
+    // Read depths for geom consistency
+    if (params.geom_consistency) {
+        depths.clear();
+        std::stringstream rp;
+        rp << dense_folder << "/APD/" << std::setw(8) << std::setfill('0') << problem.ref_image_id;
+        cv::Mat_<float> ref_depth;
+        readDepthDmb(rp.str() + "/depths.dmb", ref_depth);
+        depths.push_back(ref_depth);
+        for (const auto &src_id : problem.src_image_ids) {
+            std::stringstream sp;
+            sp << dense_folder << "/APD/" << std::setw(8) << std::setfill('0') << src_id << "/depths.dmb";
+            cv::Mat_<float> src_depth;
+            readDepthDmb(sp.str(), src_depth);
+            depths.push_back(src_depth);
+        }
+        for (auto &d : depths) {
+            if (d.cols != width || d.rows != height) {
+                cv::Mat resized;
+                cv::resize(d, resized, cv::Size(width, height), 0, 0, cv::INTER_LINEAR);
+                d = resized;
+            }
+        }
+    }
+
+    // Read weak info
+    if (params.use_APD) {
+        std::stringstream wp;
+        wp << dense_folder << "/APD/" << std::setw(8) << std::setfill('0') << problem.ref_image_id << "/weak.bin";
+        if (!ReadBinMat(wp.str(), weak_info_host)) {
+            std::cerr << "APD: Can't find weak info: " << wp.str() << std::endl;
+            exit(EXIT_FAILURE);
+        }
+        if (weak_info_host.cols != width || weak_info_host.rows != height) {
+            cv::Mat resized;
+            cv::resize(weak_info_host, resized, cv::Size(width, height), 0, 0, cv::INTER_NEAREST);
+            weak_info_host = resized;
+        }
+        neighbours_map_host = cv::Mat::zeros(height, width, CV_32SC1);
+        weak_count = 0;
+        for (int r = 0; r < height; ++r) {
+            for (int c = 0; c < width; ++c) {
+                if (weak_info_host.at<uchar>(r, c) == WEAK) {
+                    neighbours_map_host.at<int>(r, c) = weak_count;
+                    weak_count++;
+                }
+            }
+        }
+    } else {
+        weak_info_host = cv::Mat(height, width, CV_8UC1, cv::Scalar(STRONG));
+        neighbours_map_host = cv::Mat::zeros(height, width, CV_32SC1);
+        weak_count = 0;
+    }
+
+    // Allocate plane_hypotheses and load previous results
+    if (!batch_mode_) {
+        plane_hypotheses_host = new float4[width * height];
+    }
+    selected_views_host = cv::Mat::zeros(height, width, CV_32SC1);
+
+    if (params.state != FIRST_INIT) {
+        std::stringstream rp;
+        rp << dense_folder << "/APD/" << std::setw(8) << std::setfill('0') << problem.ref_image_id;
+        std::string result_folder = rp.str();
+
+        cv::Mat_<float> depth_mat;
+        cv::Mat_<cv::Vec3f> normal_mat;
+        readDepthDmb(result_folder + "/depths.dmb", depth_mat);
+        readNormalDmb(result_folder + "/normals.dmb", normal_mat);
+
+        if (depth_mat.cols != width || depth_mat.rows != height) {
+            cv::Mat rd, rn;
+            cv::resize(depth_mat, rd, cv::Size(width, height), 0, 0, cv::INTER_LINEAR);
+            cv::resize(normal_mat, rn, cv::Size(width, height), 0, 0, cv::INTER_LINEAR);
+            depth_mat = rd;
+            normal_mat = rn;
+        }
+
+        float4 *ph = batch_mode_ ? nullptr : plane_hypotheses_host;
+        if (!ph) {
+            ph = new float4[width * height];
+        }
+        for (int r = 0; r < height; ++r) {
+            for (int c = 0; c < width; ++c) {
+                int ci = r * width + c;
+                ph[ci].w = depth_mat.at<float>(r, c);
+                ph[ci].x = normal_mat.at<cv::Vec3f>(r, c)[0];
+                ph[ci].y = normal_mat.at<cv::Vec3f>(r, c)[1];
+                ph[ci].z = normal_mat.at<cv::Vec3f>(r, c)[2];
+            }
+        }
+        if (batch_mode_) {
+            plane_hypotheses_host = ph;
+        }
+
+        ReadBinMat(result_folder + "/selected_views.bin", selected_views_host);
+        if (selected_views_host.cols != width || selected_views_host.rows != height) {
+            cv::Mat rs;
+            cv::resize(selected_views_host, rs, cv::Size(width, height), 0, 0, cv::INTER_NEAREST);
+            selected_views_host = rs;
+        }
+    }
+}
+
+// ============================================================================
+// APD CUDA Space Initialization
+// ============================================================================
+void ACMMP::APDCudaSpaceInitialization(const std::string &dense_folder, const Problem &problem, ProblemGPUResources* res)
+{
+    num_images = (int)images.size();
+    cudaStream_t s = stream_ ? stream_ : 0;
+    const int width = cameras[0].width;
+    const int height = cameras[0].height;
+    const int length = width * height;
+
+    // Guard: num_images must not exceed allocated slots
+    if (res->allocated_images > 0 && num_images > res->allocated_images) {
+        std::cerr << "ERROR: num_images (" << num_images << ") > allocated_images ("
+                  << res->allocated_images << "). Clamping." << std::endl;
+        num_images = res->allocated_images;
+    }
+
+    // Upload images to texture arrays
+    for (int i = 0; i < num_images; ++i) {
+        int rows = images[i].rows;
+        int cols = images[i].cols;
+        CUDA_CHECK(cudaMemcpy2DToArrayAsync(res->cuArray[i], 0, 0, images[i].ptr<float>(),
+            images[i].step[0], cols * sizeof(float), rows, cudaMemcpyHostToDevice, s));
+
+        if (!res->textures_created) {
+            struct cudaResourceDesc resDesc;
+            memset(&resDesc, 0, sizeof(cudaResourceDesc));
+            resDesc.resType = cudaResourceTypeArray;
+            resDesc.res.array.array = res->cuArray[i];
+
+            struct cudaTextureDesc texDesc;
+            memset(&texDesc, 0, sizeof(cudaTextureDesc));
+            texDesc.addressMode[0] = cudaAddressModeClamp;
+            texDesc.addressMode[1] = cudaAddressModeClamp;
+            texDesc.filterMode = cudaFilterModeLinear;
+            texDesc.readMode = cudaReadModeElementType;
+            texDesc.normalizedCoords = 0;
+
+            if (res->texture_objects_host.images[i] != 0)
+                cudaDestroyTextureObject(res->texture_objects_host.images[i]);
+            CUDA_CHECK(cudaCreateTextureObject(&(res->texture_objects_host.images[i]), &resDesc, &texDesc, NULL));
+        }
+    }
+    if (!res->textures_created) {
+        CUDA_CHECK(cudaMemcpyAsync(res->texture_objects_cuda, &res->texture_objects_host,
+            sizeof(cudaTextureObjects), cudaMemcpyHostToDevice, s));
+    }
+
+    // Upload cameras
+    CUDA_CHECK(cudaMemcpyAsync(res->cameras_cuda, &cameras[0], sizeof(Camera) * num_images,
+        cudaMemcpyHostToDevice, s));
+
+    // Upload ref mask
+    if (has_masks_ && !masks.empty() && res->ref_mask_cuda) {
+        std::vector<uint8_t> mask_u8(length);
+        for (int y = 0; y < height; y++)
+            for (int x = 0; x < width; x++)
+                mask_u8[y * width + x] = (masks[0].at<float>(y, x) > 0.5f) ? 1 : 0;
+        CUDA_CHECK(cudaMemcpyAsync(res->ref_mask_cuda, mask_u8.data(), length, cudaMemcpyHostToDevice, s));
+        params.has_mask = true;
+    } else {
+        params.has_mask = false;
+    }
+
+    // Allocate host pinned memory in non-batch mode
+    if (!batch_mode_) {
+        if (!plane_hypotheses_host) plane_hypotheses_host = new float4[length];
+        if (!costs_host) costs_host = new float[length];
+    }
+
+    // Upload depth textures if geom consistency
+    if (params.geom_consistency) {
+        for (int i = 0; i < num_images; ++i) {
+            int rows = depths[i].rows;
+            int cols = depths[i].cols;
+            CUDA_CHECK(cudaMemcpy2DToArrayAsync(res->cuDepthArray[i], 0, 0, depths[i].ptr<float>(),
+                depths[i].step[0], cols * sizeof(float), rows, cudaMemcpyHostToDevice, s));
+
+            if (!res->textures_created) {
+                struct cudaResourceDesc resDesc;
+                memset(&resDesc, 0, sizeof(cudaResourceDesc));
+                resDesc.resType = cudaResourceTypeArray;
+                resDesc.res.array.array = res->cuDepthArray[i];
+
+                struct cudaTextureDesc texDesc;
+                memset(&texDesc, 0, sizeof(cudaTextureDesc));
+                texDesc.addressMode[0] = cudaAddressModeClamp;
+                texDesc.addressMode[1] = cudaAddressModeClamp;
+                texDesc.filterMode = cudaFilterModeLinear;
+                texDesc.readMode = cudaReadModeElementType;
+                texDesc.normalizedCoords = 0;
+
+                if (res->texture_depths_host.images[i] != 0)
+                    cudaDestroyTextureObject(res->texture_depths_host.images[i]);
+                CUDA_CHECK(cudaCreateTextureObject(&(res->texture_depths_host.images[i]), &resDesc, &texDesc, NULL));
+            }
+        }
+        if (!res->textures_created) {
+            CUDA_CHECK(cudaMemcpyAsync(res->texture_depths_cuda, &res->texture_depths_host,
+                sizeof(cudaTextureObjects), cudaMemcpyHostToDevice, s));
+        }
+    }
+
+    // Upload plane hypotheses (from previous round or zeros)
+    if (params.state != FIRST_INIT && plane_hypotheses_host) {
+        CUDA_CHECK(cudaMemcpyAsync(res->plane_hypotheses_cuda, plane_hypotheses_host,
+            sizeof(float4) * length, cudaMemcpyHostToDevice, s));
+    }
+
+    // Upload selected views
+    CUDA_CHECK(cudaMemcpyAsync(res->selected_views_cuda, selected_views_host.ptr<unsigned int>(0),
+        sizeof(unsigned int) * length, cudaMemcpyHostToDevice, s));
+
+    // Upload weak info
+    CUDA_CHECK(cudaMemcpyAsync(res->weak_info_cuda, weak_info_host.ptr<uchar>(0),
+        length * sizeof(uchar), cudaMemcpyHostToDevice, s));
+
+    // Upload neighbours map
+    CUDA_CHECK(cudaMemcpyAsync(res->neighbours_map_cuda, neighbours_map_host.ptr<int>(0),
+        length * sizeof(int), cudaMemcpyHostToDevice, s));
+
+    // Upload params to device
+    CUDA_CHECK(cudaMemcpyAsync(res->params_dev_cuda, &params,
+        sizeof(PatchMatchParams), cudaMemcpyHostToDevice, s));
+
+    // Clear fit plane hypotheses
+    CUDA_CHECK(cudaMemsetAsync(res->fit_plane_hypotheses_cuda, 0, sizeof(float4) * length, s));
+
+    // Build and upload DataPassHelper
+    DataPassHelper helper_host;
+    helper_host.width = width;
+    helper_host.height = height;
+    helper_host.ref_index = problem.ref_image_id;
+    helper_host.texture_objects_cuda = res->texture_objects_cuda;
+    helper_host.texture_depths_cuda = res->texture_depths_cuda;
+    helper_host.cameras_cuda = res->cameras_cuda;
+    helper_host.plane_hypotheses_cuda = res->plane_hypotheses_cuda;
+    helper_host.rand_states_cuda = res->rand_states_cuda;
+    helper_host.selected_views_cuda = res->selected_views_cuda;
+    helper_host.neighbours_cuda = res->neighbours_cuda;
+    helper_host.neighbours_map_cuda = res->neighbours_map_cuda;
+    helper_host.weak_info_cuda = res->weak_info_cuda;
+    helper_host.costs_cuda = res->costs_cuda;
+    helper_host.params = res->params_dev_cuda;
+    helper_host.fit_plane_hypotheses_cuda = res->fit_plane_hypotheses_cuda;
+    helper_host.weak_reliable_cuda = res->weak_reliable_cuda;
+    helper_host.view_weight_cuda = res->view_weight_cuda;
+    helper_host.view_weight_stride = num_images;
+    helper_host.weak_nearest_strong = res->weak_nearest_strong_cuda;
+    helper_host.ref_mask_cuda = res->ref_mask_cuda;
+
+    CUDA_CHECK(cudaMemcpyAsync(res->helper_cuda, &helper_host,
+        sizeof(DataPassHelper), cudaMemcpyHostToDevice, s));
+}
+
+// ============================================================================
+// RunAPDPatchMatch — host-side wrapper
+// ============================================================================
+void ACMMP::RunAPDPatchMatch(ProblemGPUResources* res, bool skip_host_download)
+{
+    const int width = cameras[0].width;
+    const int height = cameras[0].height;
+    const int length = width * height;
+    cudaStream_t s = stream_ ? stream_ : 0;
+
+    RunAPDPatchMatch_GPU(res->helper_cuda, width, height, params, s);
+
+    if (!skip_host_download) {
+        // Download results to host
+        if (batch_mode_ && res->planes_host_pinned && res->costs_host_pinned) {
+            CUDA_CHECK(cudaMemcpyAsync(res->planes_host_pinned, res->plane_hypotheses_cuda,
+                sizeof(float4) * length, cudaMemcpyDeviceToHost, s));
+            CUDA_CHECK(cudaMemcpyAsync(res->costs_host_pinned, res->costs_cuda,
+                sizeof(float) * length, cudaMemcpyDeviceToHost, s));
+        } else {
+            CUDA_CHECK(cudaMemcpyAsync(plane_hypotheses_host, res->plane_hypotheses_cuda,
+                sizeof(float4) * length, cudaMemcpyDeviceToHost, s));
+            CUDA_CHECK(cudaMemcpyAsync(costs_host, res->costs_cuda,
+                sizeof(float) * length, cudaMemcpyDeviceToHost, s));
+        }
+
+        // Download weak info
+        CUDA_CHECK(cudaMemcpyAsync(weak_info_host.ptr<uchar>(0), res->weak_info_cuda,
+            length * sizeof(uchar), cudaMemcpyDeviceToHost, s));
+
+        // Download selected views
+        CUDA_CHECK(cudaMemcpyAsync(selected_views_host.ptr<unsigned int>(0), res->selected_views_cuda,
+            sizeof(unsigned int) * length, cudaMemcpyDeviceToHost, s));
+
+        cudaStreamSynchronize(s);
     }
 }
 
@@ -1323,118 +2036,3 @@ float ACMMP::GetDepthFromPlaneParam(const float4 plane_hypothesis, const int x, 
     }
 }
 
- void JBUAddImageToTextureFloatGray ( std::vector<cv::Mat_<float>>  &imgs, cudaTextureObject_t texs[], cudaArray *cuArray[], const int &numSelViews, cudaStream_t s = 0)
-{
-    for (int i=0; i<numSelViews; i++) {
-        int index = i;
-        int rows = imgs[index].rows;
-        int cols = imgs[index].cols;
-        // Create channel with floating point type
-        cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc (32, 0, 0,  0, cudaChannelFormatKindFloat);
-        // Allocate array with correct size and number of channels
-        cudaMallocArray(&cuArray[i], &channelDesc, cols, rows);
-        cudaMemcpy2DToArrayAsync(cuArray[i], 0, 0, imgs[index].ptr<float>(), imgs[index].step[0], cols*sizeof(float), rows, cudaMemcpyHostToDevice, s);
-
-        // Specify texture
-        struct cudaResourceDesc resDesc;
-        memset(&resDesc, 0, sizeof(cudaResourceDesc));
-        resDesc.resType         = cudaResourceTypeArray;
-        resDesc.res.array.array = cuArray[i];
-
-        // Specify texture object parameters
-        struct cudaTextureDesc texDesc;
-        memset(&texDesc, 0, sizeof(cudaTextureDesc));
-        texDesc.addressMode[0]   = cudaAddressModeWrap;
-        texDesc.addressMode[1]   = cudaAddressModeClamp;
-        texDesc.filterMode       = cudaFilterModeLinear;
-        texDesc.readMode         = cudaReadModeElementType;
-        texDesc.normalizedCoords = 0;
-
-        // Create texture object
-        cudaCreateTextureObject(&(texs[i]), &resDesc, &texDesc, NULL);
-    }
-    return;
-}
-
- JBU::JBU(){}
-
- JBU::~JBU()
- {
-     free(depth_h);
-
-     cudaFree(depth_d);
-     cudaFree(jp_d);
-     cudaFree(jt_d);
- }
-
- void JBU::InitializeParameters(int n)
- {
-     depth_h = (float*)malloc(sizeof(float) * n);
-
-     cudaMalloc ((void**)&depth_d,  sizeof(float) * n);
-
-     cudaMalloc((void**)&jp_d, sizeof(JBUParameters) * 1);
-     cudaMemcpyAsync(jp_d, &jp_h, sizeof(JBUParameters) * 1, cudaMemcpyHostToDevice, stream_);
-
-     cudaMalloc((void**)&jt_d, sizeof(JBUTexObj) * 1);
-     cudaMemcpyAsync(jt_d, &jt_h, sizeof(JBUTexObj) * 1, cudaMemcpyHostToDevice, stream_);
- }
-
-void RunJBU(const cv::Mat_<float>  &scaled_image_float, const cv::Mat_<float> &src_depthmap, const std::string &dense_folder , const Problem &problem)           
-{
-    uint32_t rows = scaled_image_float.rows;
-    uint32_t cols = scaled_image_float.cols;
-    int Imagescale = std::max(scaled_image_float.rows / src_depthmap.rows, scaled_image_float.cols / src_depthmap.cols);
-
-    if (Imagescale == 1) {
-        std::cout << "Image.rows = Depthmap.rows" << std::endl;
-        return;
-    }
-
-    std::vector<cv::Mat_<float> > imgs(JBU_NUM);
-    imgs[0] = scaled_image_float.clone();
-    imgs[1] = src_depthmap.clone();
-
-    JBU jbu;
-    jbu.jp_h.height = rows;
-    jbu.jp_h.width = cols;
-    jbu.jp_h.s_height = src_depthmap.rows;
-    jbu.jp_h.s_width = src_depthmap.cols;
-    jbu.jp_h.Imagescale = Imagescale;
-    // Create per-call non-blocking stream
-    cudaStream_t s;
-    cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking);
-
-    JBUAddImageToTextureFloatGray(imgs, jbu.jt_h.imgs, jbu.cuArray, JBU_NUM, s);
-
-    // SetStream BEFORE InitializeParameters (it uses stream_ for async copies)
-    jbu.SetStream(s);
-    jbu.InitializeParameters(rows * cols);
-    jbu.CudaRun();
-
-    cv::Mat_<float> depthmap = cv::Mat::zeros( rows, cols, CV_32FC1 );
-
-    for (uint32_t i = 0; i < cols; ++i) {
-        for(uint32_t j = 0; j < rows; ++j) {
-            int center = i + cols * j;
-            depthmap (j, i) = jbu.depth_h[center];
-        }
-    }
-
-    cv::Mat_<float> disp0 = depthmap.clone();
-    std::stringstream result_path;
-    result_path << dense_folder << "/ACMMP" << "/2333_" << std::setw(8) << std::setfill('0') << problem.ref_image_id;
-    std::string result_folder = result_path.str();
-    mkdir(result_folder.c_str(), 0777);
-
-    // Use compressed format for output
-    std::string depth_path = result_folder + "/depths.cdmb";
-    CompressedDMB::writeDepthCompressed(depth_path, disp0);
-
-    for (int i=0; i < JBU_NUM; i++) {
-        CUDA_SAFE_CALL( cudaDestroyTextureObject(jbu.jt_h.imgs[i]) );
-        CUDA_SAFE_CALL( cudaFreeArray(jbu.cuArray[i]) );
-    }
-    cudaStreamSynchronize(s);
-    cudaStreamDestroy(s);
-}

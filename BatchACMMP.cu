@@ -143,6 +143,17 @@ void ProblemGPUResources::allocate(int max_width, int max_height, int max_images
     // Item 4: GPU early masking buffer
     CUDA_CHECK(cudaMalloc(&ref_mask_cuda, sizeof(uint8_t) * max_width * max_height));
 
+    // APD buffers
+    CUDA_CHECK(cudaMalloc(&weak_info_cuda, sizeof(uchar) * max_width * max_height));
+    CUDA_CHECK(cudaMalloc(&weak_reliable_cuda, sizeof(uchar) * max_width * max_height));
+    CUDA_CHECK(cudaMalloc(&weak_nearest_strong_cuda, sizeof(short2) * max_width * max_height));
+    CUDA_CHECK(cudaMalloc(&neighbours_cuda, sizeof(short2) * max_width * max_height * NEIGHBOUR_NUM));
+    CUDA_CHECK(cudaMalloc(&neighbours_map_cuda, sizeof(int) * max_width * max_height));
+    CUDA_CHECK(cudaMalloc(&fit_plane_hypotheses_cuda, sizeof(float4) * max_width * max_height));
+    CUDA_CHECK(cudaMalloc(&view_weight_cuda, sizeof(uchar) * max_width * max_height * max_images));
+    CUDA_CHECK(cudaMalloc(&helper_cuda, sizeof(DataPassHelper)));
+    CUDA_CHECK(cudaMalloc(&params_dev_cuda, sizeof(PatchMatchParams)));
+
     // Item 5: Batch planar prior buffers
     const int max_support_points = ((max_width + 4) / 5) * ((max_height + 4) / 5);
     const int max_triangles = max_support_points * 2;
@@ -188,16 +199,19 @@ void BatchACMMP::initializeResourcePool() {
     // This ensures all our pooled resources are large enough.
     int max_width = 0, max_height = 0, max_images = 0;
     for (const auto& p : all_problems) {
-        // A robust way to get dimensions would be to read the camera file for each problem.
-        // For simplicity, we use a fixed upper bound, but reading the files is better.
-        // This is a placeholder; you should replace it with actual dimension fetching logic
-        // if your image sizes vary significantly.
         std::stringstream cam_path;
         cam_path << dense_folder << "/cams/" << std::setw(8) << std::setfill('0') << p.ref_image_id << "_cam.txt";
         Camera cam = ReadCamera(cam_path.str());
-        
-        max_width = std::max(max_width, (int)cam.width);
-        max_height = std::max(max_height, (int)cam.height);
+
+        // Account for scale_size (APD round-based scaling)
+        int w = (int)cam.width;
+        int h = (int)cam.height;
+        if (p.scale_size > 1) {
+            w = (int)std::round((float)w / p.scale_size);
+            h = (int)std::round((float)h / p.scale_size);
+        }
+        max_width = std::max(max_width, w);
+        max_height = std::max(max_height, h);
         max_images = std::max(max_images, (int)(1 + p.src_image_ids.size()));
     }
     // Clamp max_images to the maximum supported by the static array.
@@ -294,6 +308,15 @@ void ProblemGPUResources::cleanup() {
     safeFree((void*&)prior_planes_cuda, "prior_planes_cuda");
     safeFree((void*&)plane_masks_cuda, "plane_masks_cuda");
     safeFree((void*&)ref_mask_cuda, "ref_mask_cuda");
+    safeFree((void*&)weak_info_cuda, "weak_info_cuda");
+    safeFree((void*&)weak_reliable_cuda, "weak_reliable_cuda");
+    safeFree((void*&)weak_nearest_strong_cuda, "weak_nearest_strong_cuda");
+    safeFree((void*&)neighbours_cuda, "neighbours_cuda");
+    safeFree((void*&)neighbours_map_cuda, "neighbours_map_cuda");
+    safeFree((void*&)fit_plane_hypotheses_cuda, "fit_plane_hypotheses_cuda");
+    safeFree((void*&)view_weight_cuda, "view_weight_cuda");
+    safeFree((void*&)helper_cuda, "helper_cuda");
+    safeFree((void*&)params_dev_cuda, "params_dev_cuda");
     safeFree((void*&)support_points_cuda, "support_points_cuda");
     safeFree((void*&)num_support_points_cuda, "num_support_points_cuda");
     safeFree((void*&)triangle_vertices_cuda, "triangle_vertices_cuda");
@@ -320,16 +343,17 @@ void ProblemGPUResources::cleanup() {
 }
 
 // BatchACMMP implementation
-BatchACMMP::BatchACMMP(const std::string& dense_folder_, 
+BatchACMMP::BatchACMMP(const std::string& dense_folder_,
                        const std::vector<Problem>& problems,
                        bool geom_consistency_,
                        bool planar_prior_,
                        bool hierarchy_,
                        bool multi_geometry_,
-                       size_t mask_disk_queue_size_)
+                       size_t mask_disk_queue_size_,
+                       std::shared_ptr<ImageCache> shared_cache)
     : dense_folder(dense_folder_), all_problems(problems),
       geom_consistency(geom_consistency_), planar_prior(planar_prior_),
-      hierarchy(hierarchy_), multi_geometry(multi_geometry_),mask_disk_queue_size(mask_disk_queue_size_) 
+      hierarchy(hierarchy_), multi_geometry(multi_geometry_),mask_disk_queue_size(mask_disk_queue_size_)
 {
     // Device properties
     cudaDeviceProp prop{};
@@ -359,12 +383,17 @@ BatchACMMP::BatchACMMP(const std::string& dense_folder_,
     std::cout << "  GPU Memory: " << (available_gpu_memory/(1024*1024)) << "MB free, "
               << (memory_per_problem/(1024*1024)) << "MB/problem" << std::endl;
 
-    // Initialize image cache: detect mask folder
-    std::string mask_dir = dense_folder + "/masks";
-    struct stat mask_stat;
-    bool masks_exist = (stat(mask_dir.c_str(), &mask_stat) == 0 && S_ISDIR(mask_stat.st_mode));
-    image_cache_ = std::unique_ptr<ImageCache>(new ImageCache(50, dense_folder, masks_exist));
-    std::cout << "[BatchACMMP] Image cache: max 50 entries, masks=" << (masks_exist ? "yes" : "no") << std::endl;
+    // Initialize image cache: use shared if provided, otherwise create own
+    if (shared_cache) {
+        image_cache_ = shared_cache;
+        std::cout << "[BatchACMMP] Using shared image cache" << std::endl;
+    } else {
+        std::string mask_dir = dense_folder + "/masks";
+        struct stat mask_stat;
+        bool masks_exist = (stat(mask_dir.c_str(), &mask_stat) == 0 && S_ISDIR(mask_stat.st_mode));
+        image_cache_ = std::make_shared<ImageCache>(50, dense_folder, masks_exist);
+        std::cout << "[BatchACMMP] Image cache: max 50 entries, masks=" << (masks_exist ? "yes" : "no") << std::endl;
+    }
 
     initializeResourcePool();
     initializeDiskWriters();
@@ -455,6 +484,9 @@ size_t BatchACMMP::estimateMemoryPerProblem(const Problem& problem) {
     size_t working = W * H * (2*sizeof(float4) + 3*sizeof(float)); // hypotheses + costs
     size_t misc = W * H * (sizeof(RNGState) + sizeof(unsigned int));
     size_t masks = W * H * sizeof(uint8_t);                           // ref_mask_cuda
+    size_t apd = W * H * (2*sizeof(uchar) + sizeof(short2) + sizeof(int) + sizeof(float4)  // weak_info, reliable, nearest_strong, neighbours_map, fit_plane
+                          + sizeof(uchar) * N                              // view_weight
+                          + NEIGHBOUR_NUM * sizeof(short2));               // neighbours
     size_t prior = W * H * (sizeof(float4) + sizeof(unsigned int));   // prior_planes + plane_masks
     size_t max_sp = ((W + 4) / 5) * ((H + 4) / 5);
     size_t support = max_sp * sizeof(int2) + sizeof(int);             // support_points + counter
@@ -462,7 +494,7 @@ size_t BatchACMMP::estimateMemoryPerProblem(const Problem& problem) {
     size_t pinned = W * H * (sizeof(float4) + sizeof(float))         // planes + costs
                   + max_sp * sizeof(int2) + sizeof(int);              // support points pinned
 
-    return (textures + working + misc + masks + prior + support + triangles + pinned) * 130 / 100;
+    return (textures + working + misc + masks + apd + prior + support + triangles + pinned) * 130 / 100;
 }
 
 size_t BatchACMMP::getAvailableGPUMemory() {
@@ -624,8 +656,62 @@ void BatchACMMP::processProblemOnStream(int problem_idx, ProblemGPUResources* re
             cudaStreamCreate(&stream);
             resources->stream = stream;
         }
-        
+
+        if (apd_mode_) {
+            // ═══ APD Pipeline ═══
+            ACMMP acmmp;
+            acmmp.SetBatchMode();
+            acmmp.SetStream(stream);
+            acmmp.SetAPDParams(apd_params_);
+            acmmp.APDInputInitialization(dense_folder, all_problems, problem_idx, *image_cache_);
+            acmmp.APDCudaSpaceInitialization(dense_folder, problem, resources);
+            acmmp.RunAPDPatchMatch(resources, /*skip_host_download=*/false);
+
+            const int width = acmmp.GetReferenceImageWidth();
+            const int height = acmmp.GetReferenceImageHeight();
+
+            cv::Mat_<float> depths(height, width);
+            cv::Mat_<cv::Vec3f> normals(height, width);
+            cv::Mat_<float> costs(height, width);
+            const float4* planes_pinned = resources->planes_host_pinned;
+            const float* costs_pinned = resources->costs_host_pinned;
+
+            for (int y = 0; y < height; ++y) {
+                for (int x = 0; x < width; ++x) {
+                    const int c = y * width + x;
+                    const float4 ph = planes_pinned[c];
+                    depths(y, x) = ph.w;
+                    normals(y, x) = cv::Vec3f(ph.x, ph.y, ph.z);
+                    costs(y, x) = costs_pinned[c];
+                }
+            }
+
+            CompletedResult cr;
+            cr.problem_idx = problem_idx;
+            cr.problem = problem;
+            cr.depths = std::move(depths);
+            cr.normals = std::move(normals);
+            cr.costs = std::move(costs);
+            cr.geom_consistency = apd_params_.geom_consistency;
+            cr.is_apd = true;
+            cr.weak_info = acmmp.GetWeakInfo().clone();
+            cr.selected_views = acmmp.GetSelectedViews().clone();
+
+            {
+                std::unique_lock<std::mutex> lk(disk_queue_mutex_);
+                disk_queue_space_cv_.wait(lk, [&]{
+                    return disk_write_queue_.size() < mask_disk_queue_size || stopping_disk_.load();
+                });
+                disk_write_queue_.push(std::move(cr));
+            }
+            disk_queue_cv_.notify_one();
+
+            active_gpu_problems_.fetch_sub(1);
+            return;
+        }
+
         {
+            // ═══ Original ACMMP Pipeline ═══
             ACMMP acmmp;
             if (geom_consistency) acmmp.SetGeomConsistencyParams(multi_geometry);
             if (hierarchy) acmmp.SetHierarchyParams();
@@ -786,26 +872,36 @@ void BatchACMMP::processProblemOnStream(int problem_idx, ProblemGPUResources* re
 }
 
 void BatchACMMP::writeProblemToDisk(CompletedResult&& result) {
-    // Create result folder
     std::stringstream result_path;
-    result_path << dense_folder << "/ACMMP/2333_" << std::setw(8) 
-                << std::setfill('0') << result.problem.ref_image_id;
+    if (result.is_apd) {
+        // APD output path: APD/XXXXXXXX/
+        result_path << dense_folder << "/APD/" << std::setw(8)
+                    << std::setfill('0') << result.problem.ref_image_id;
+    } else {
+        // ACMMP output path: ACMMP/2333_XXXXXXXX/
+        result_path << dense_folder << "/ACMMP/2333_" << std::setw(8)
+                    << std::setfill('0') << result.problem.ref_image_id;
+    }
     std::string result_folder = result_path.str();
-    
-    // Create directory (mkdir is thread-safe on most systems)
     makeDir(result_folder);
-    
-    // Use compressed format (.cdmb) instead of raw (.dmb)
-    // This reduces file sizes by ~75-90%
-    std::string depth_suffix = result.geom_consistency ? "/depths_geom.cdmb" : "/depths.cdmb";
-    std::string depth_path = result_folder + depth_suffix;
-    std::string normal_path = result_folder + "/normals.cdmb";
-    std::string cost_path = result_folder + "/costs.cdmb";
-    
-    // Write compressed files
-    CompressedDMB::writeDepthCompressed(depth_path, result.depths);
-    CompressedDMB::writeNormalCompressed(normal_path, result.normals);
-    CompressedDMB::writeCostCompressed(cost_path, result.costs);
+
+    if (result.is_apd) {
+        // APD: depths/normals in compressed DMB (compatible with fusion reader)
+        std::string depth_name = result.geom_consistency ? "/depths_geom.dmb" : "/depths.dmb";
+        writeDepthDmb(result_folder + depth_name, result.depths);
+        writeNormalDmb(result_folder + "/normals.dmb", result.normals);
+        // APD-specific: weak info and selected views in BinMat format
+        if (!result.weak_info.empty())
+            WriteBinMat(result_folder + "/weak.bin", result.weak_info);
+        if (!result.selected_views.empty())
+            WriteBinMat(result_folder + "/selected_views.bin", result.selected_views);
+    } else {
+        // ACMMP uses compressed format
+        std::string depth_suffix = result.geom_consistency ? "/depths_geom.cdmb" : "/depths.cdmb";
+        CompressedDMB::writeDepthCompressed(result_folder + depth_suffix, result.depths);
+        CompressedDMB::writeNormalCompressed(result_folder + "/normals.cdmb", result.normals);
+        CompressedDMB::writeCostCompressed(result_folder + "/costs.cdmb", result.costs);
+    }
 }
 
 void BatchACMMP::waitForGPUCompletion() {
@@ -875,4 +971,74 @@ size_t BatchACMMP::getCompletedDiskWrites() const {
     return disk_completed_.load();
 }
 
-// ======================================== 
+void BatchACMMP::resetForNextPass() {
+    // Wait until all enqueued problems are fully written to disk
+    {
+        std::unique_lock<std::mutex> lk(disk_queue_mutex_);
+        disk_queue_cv_.wait(lk, [&]{
+            return disk_completed_.load() >= problems_enqueued_.load();
+        });
+    }
+
+    // Synchronize all GPU streams
+    for (auto& s : streams) {
+        if (s) cudaStreamSynchronize(s);
+    }
+
+    // Reset atomic counters
+    problems_enqueued_.store(0);
+    gpu_completed_.store(0);
+    disk_completed_.store(0);
+    active_gpu_problems_.store(0);
+
+    // Drain GPU work queue (should already be empty)
+    {
+        std::lock_guard<std::mutex> lk(gpu_queue_mutex_);
+        while (!gpu_work_queue_.empty()) gpu_work_queue_.pop();
+    }
+
+    // Drain disk write queue (should already be empty)
+    {
+        std::lock_guard<std::mutex> lk(disk_queue_mutex_);
+        while (!disk_write_queue_.empty()) disk_write_queue_.pop();
+    }
+
+    // Return all resources to available pool
+    {
+        std::lock_guard<std::mutex> lk(resource_mutex_);
+        while (!available_resources.empty()) available_resources.pop();
+        for (auto& res : resource_pool) {
+            available_resources.push(res.get());
+        }
+    }
+    resource_cv_.notify_all();
+}
+
+void BatchACMMP::processAllProblemsWithParams(const PatchMatchParams& params) {
+    resetForNextPass();
+
+    // Update APD params
+    apd_mode_ = true;
+    apd_params_ = params;
+
+    // Re-enqueue all problems
+    {
+        std::lock_guard<std::mutex> lk(gpu_queue_mutex_);
+        for (int i = 0; i < (int)all_problems.size(); ++i) {
+            gpu_work_queue_.push(i);
+        }
+        problems_enqueued_.store((int)all_problems.size());
+    }
+    gpu_queue_cv_.notify_all();
+
+    std::cout << "[BatchACMMP] Re-enqueued " << all_problems.size()
+              << " problems with state=" << params.state << std::endl;
+}
+
+void BatchACMMP::updateProblemIterations(int iteration) {
+    for (auto& p : all_problems) {
+        p.iteration = iteration;
+    }
+}
+
+// ========================================

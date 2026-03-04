@@ -1028,20 +1028,20 @@ __device__ __forceinline__ void ComputeViewSelectionPriors(
     const int num_images)
 {
     // Initialize priors safely
-    for (int i = 0; i < num_images - 1 && i < 32; ++i) {
+    for (int i = 0; i < num_images - 1; ++i) {
         view_selection_priors[i] = 0.0f;
     }
-    
+
     // Neighbor offsets for near directions only
     const int neighbor_offsets[4] = {-width, width, -1, 1}; // up, down, left, right
     const int neighbor_dirs[4] = {0, 2, 4, 6};
-    
+
     for (int i = 0; i < 4; ++i) {
         if (valid_directions[neighbor_dirs[i]]) {
             const int neighbor_pos = center + neighbor_offsets[i];
             // Validate neighbor position
             if (neighbor_pos >= 0 && neighbor_pos < width * height) {
-                for (int j = 0; j < num_images - 1 && j < 32; ++j) {
+                for (int j = 0; j < num_images - 1; ++j) {
                     const float weight = isSet(selected_views[neighbor_pos], j) ? 0.9f : 0.1f;
                     view_selection_priors[j] += weight;
                 }
@@ -1050,87 +1050,7 @@ __device__ __forceinline__ void ComputeViewSelectionPriors(
     }
 }
 
-// Compute per-view sampling probabilities from neighbor costs
-__device__ __forceinline__ void ComputeSamplingProbabilities(
-    float* sampling_probs,
-    const float cost_array[8][32],
-    const float* view_selection_priors,
-    const bool* valid_directions,
-    const int num_images,
-    const int iter)
-{
-    const float cost_threshold = 0.8f * expf((iter * iter) / (-90.0f));
-    const float inv_neg_018 = 1.0f / (-0.18f);
-    const float inv_neg_032 = 1.0f / (-0.32f);
-    const float threshold_exp = expf(cost_threshold * cost_threshold * inv_neg_032);
-
-    for (int i = 0; i < num_images - 1 && i < 32; i++) {
-        float count = 0.0f;
-        int count_false = 0;
-        float tmpw = 0.0f;
-        
-        for (int j = 0; j < 8; j++) {
-            if (valid_directions[j]) {
-                const float cost_val = cost_array[j][i];
-                if (cost_val < cost_threshold) {
-                    tmpw += expf(cost_val * cost_val * inv_neg_018);
-                    count += 1.0f;
-                }
-                if (cost_val > 1.2f) {
-                    count_false++;
-                }
-            }
-        }
-        
-        if (count > 2.0f && count_false < 3) {
-            sampling_probs[i] = (tmpw / count) * view_selection_priors[i];
-        } else if (count_false < 3) {
-            sampling_probs[i] = threshold_exp * view_selection_priors[i];
-        } else {
-            sampling_probs[i] = 0.0f;
-        }
-    }
-}
-
-// Compute weighted multi-view costs for each neighbor direction
-__device__ __forceinline__ void ComputeFinalCosts(
-    float* final_costs,
-    const float cost_array[8][32],
-    const float* view_weights,
-    const float weight_norm,
-    const bool* valid_directions,
-    const int* neighbor_positions,
-    const cudaTextureObject_t* depths,
-    const Camera* cameras,
-    const float4* plane_hypotheses,
-    const int2 p,
-    const PatchMatchParams& params)
-{
-    const float inv_weight_norm = (weight_norm > 1e-6f) ? (1.0f / weight_norm) : 0.0f;
-    
-    for (int i = 0; i < 8; ++i) {
-        if (valid_directions[i]) {
-            float cost_sum = 0.0f;
-            for (int j = 0; j < params.num_images - 1 && j < 32; ++j) {
-                if (view_weights[j] > 0.0f) {
-                    float base_cost = cost_array[i][j];
-                    if (params.geom_consistency) {
-                        const float geom_cost = ComputeGeomConsistencyCost(
-                            depths[j + 1], cameras[0], cameras[j + 1], 
-                            plane_hypotheses[neighbor_positions[i]], p);
-                        base_cost += 0.2f * geom_cost;
-                    }
-                    cost_sum += view_weights[j] * base_cost;
-                }
-            }
-            final_costs[i] = cost_sum * inv_weight_norm;
-        } else {
-            final_costs[i] = 2.0f; // High cost for invalid directions
-        }
-    }
-}
-
-template<bool UseMask>
+template<bool UseMask, int NUM_IMAGES>
 __device__ void CheckerboardPropagation(
     const cudaTextureObject_t *images,
     const cudaTextureObject_t *depths,
@@ -1199,105 +1119,131 @@ __device__ void CheckerboardPropagation(
     int down_near = center + width;
     int down_far = center + 3 * width;
 
-    // Evaluate 8 checkerboard neighbors (near/far x up/down/left/right).
-    // Spherical cameras: horizontal neighbors always valid due to wrapping.
-    float cost_array[8][32];
-    // Initialize cost array
-    for (int i = 0; i < 8; ++i) {
-        for (int j = 0; j < 32; ++j) {
-            cost_array[i][j] = 2.0f;
-        }
-    }
-    
+    // Two-pass streaming accumulator: eliminates cost_array[8][NV] register spill.
+    // Pass 1: compute cost vectors on-the-fly, accumulate per-view statistics.
+    // Pass 2: recompute cost vectors, compute weighted final costs.
+    // Trades 2x NCC compute for dramatic register pressure reduction.
+    constexpr int NV = NUM_IMAGES - 1;
+
     bool flag[8] = {false};
     int num_valid_pixels = 0;
-    const int positions[8] = {up_near, up_far, down_near, down_far, left_near, left_far, right_near, right_far};
 
+    // Streaming accumulators for view weight computation (replaces cost_array[8][NV])
+    float sp_count[NV];
+    float sp_tmpw[NV];
+    int sp_count_false[NV];
+    for (int v = 0; v < NV; ++v) { sp_count[v] = 0.0f; sp_tmpw[v] = 0.0f; sp_count_false[v] = 0; }
+
+    const float cost_threshold_sp = 0.8f * expf((iter * iter) / (-90.0f));
+    const float inv_neg_018 = 1.0f / (-0.18f);
+
+    float cost_vector[NV]; // Reusable per-direction cost vector
+
+    // ---- Pass 1: Evaluate neighbors, accumulate per-view statistics ----
+
+    // Helper macro: accumulate cost_vector into streaming accumulators
+    #define ACCUMULATE_STATS() \
+        for (int v = 0; v < params.num_images - 1; ++v) { \
+            if (cost_vector[v] < cost_threshold_sp) { \
+                sp_tmpw[v] += expf(cost_vector[v] * cost_vector[v] * inv_neg_018); \
+                sp_count[v] += 1.0f; \
+            } \
+            if (cost_vector[v] > 1.2f) sp_count_false[v]++; \
+        }
+
+    // up_far (direction 1)
     if (p.y > 2) {
-        flag[1] = true;
-        num_valid_pixels++;
+        flag[1] = true; num_valid_pixels++;
         up_far = FindBestNeighborInDirection(costs, center, width, height, p, 1, up_far);
-        ComputeMultiViewCostVector(images, cameras, p, plane_hypotheses[up_far], cost_array[1], params);
+        ComputeMultiViewCostVector(images, cameras, p, plane_hypotheses[up_far], cost_vector, params);
+        ACCUMULATE_STATS();
     }
-
+    // down_far (direction 3)
     if (p.y < height - 3) {
-        flag[3] = true;
-        num_valid_pixels++;
+        flag[3] = true; num_valid_pixels++;
         down_far = FindBestNeighborInDirection(costs, center, width, height, p, 3, down_far);
-        ComputeMultiViewCostVector(images, cameras, p, plane_hypotheses[down_far], cost_array[3], params);
+        ComputeMultiViewCostVector(images, cameras, p, plane_hypotheses[down_far], cost_vector, params);
+        ACCUMULATE_STATS();
     }
-
+    // left_far (direction 5)
     if (p.x > 2 || is_sphere) {
-        flag[5] = true;
-        num_valid_pixels++;
+        flag[5] = true; num_valid_pixels++;
         if (p.x > 2) {
             left_far = FindBestNeighborInDirection(costs, center, width, height, p, 5, left_far);
         }
-        ComputeMultiViewCostVector(images, cameras, p, plane_hypotheses[left_far], cost_array[5], params);
+        ComputeMultiViewCostVector(images, cameras, p, plane_hypotheses[left_far], cost_vector, params);
+        ACCUMULATE_STATS();
     }
-
+    // right_far (direction 7)
     if (p.x < width - 3 || is_sphere) {
-        flag[7] = true;
-        num_valid_pixels++;
+        flag[7] = true; num_valid_pixels++;
         if (p.x < width - 3) {
             right_far = FindBestNeighborInDirection(costs, center, width, height, p, 7, right_far);
         }
-        ComputeMultiViewCostVector(images, cameras, p, plane_hypotheses[right_far], cost_array[7], params);
+        ComputeMultiViewCostVector(images, cameras, p, plane_hypotheses[right_far], cost_vector, params);
+        ACCUMULATE_STATS();
     }
-
+    // up_near (direction 0)
     if (p.y > 0) {
-        flag[0] = true;
-        num_valid_pixels++;
+        flag[0] = true; num_valid_pixels++;
         up_near = FindBestNeighborInDirection(costs, center, width, height, p, 0, up_near);
-        ComputeMultiViewCostVector(images, cameras, p, plane_hypotheses[up_near], cost_array[0], params);
+        ComputeMultiViewCostVector(images, cameras, p, plane_hypotheses[up_near], cost_vector, params);
+        ACCUMULATE_STATS();
     }
-
+    // down_near (direction 2)
     if (p.y < height - 1) {
-        flag[2] = true;
-        num_valid_pixels++;
+        flag[2] = true; num_valid_pixels++;
         down_near = FindBestNeighborInDirection(costs, center, width, height, p, 2, down_near);
-        ComputeMultiViewCostVector(images, cameras, p, plane_hypotheses[down_near], cost_array[2], params);
+        ComputeMultiViewCostVector(images, cameras, p, plane_hypotheses[down_near], cost_vector, params);
+        ACCUMULATE_STATS();
     }
-
+    // left_near (direction 4)
     if (p.x > 0 || is_sphere) {
-        flag[4] = true;
-        num_valid_pixels++;
+        flag[4] = true; num_valid_pixels++;
         if (p.x > 0) {
             left_near = FindBestNeighborInDirection(costs, center, width, height, p, 4, left_near);
         }
-        ComputeMultiViewCostVector(images, cameras, p, plane_hypotheses[left_near], cost_array[4], params);
+        ComputeMultiViewCostVector(images, cameras, p, plane_hypotheses[left_near], cost_vector, params);
+        ACCUMULATE_STATS();
     }
-
+    // right_near (direction 6)
     if (p.x < width - 1 || is_sphere) {
-        flag[6] = true;
-        num_valid_pixels++;
+        flag[6] = true; num_valid_pixels++;
         if (p.x < width - 1) {
             right_near = FindBestNeighborInDirection(costs, center, width, height, p, 6, right_near);
         }
-        ComputeMultiViewCostVector(images, cameras, p, plane_hypotheses[right_near], cost_array[6], params);
+        ComputeMultiViewCostVector(images, cameras, p, plane_hypotheses[right_near], cost_vector, params);
+        ACCUMULATE_STATS();
     }
 
-    // Update positions array with safe values
+    #undef ACCUMULATE_STATS
+
     const int final_positions[8] = {up_near, up_far, down_near, down_far, left_near, left_far, right_near, right_far};
 
-    float view_weights[32] = {0.0f};
-    float view_selection_priors[32];
-    
-    ComputeViewSelectionPriors(view_selection_priors, selected_views, flag, 
+    // View selection priors (unchanged)
+    float view_weights[NV] = {0.0f};
+    float view_selection_priors[NV];
+    ComputeViewSelectionPriors(view_selection_priors, selected_views, flag,
                                center, width, height, params.num_images);
 
-    float sampling_probs[32];
-    ComputeSamplingProbabilities(sampling_probs, cost_array, view_selection_priors, 
-                                 flag, params.num_images, iter);
+    // Compute sampling probabilities from streaming accumulators
+    float sampling_probs[NV];
+    const float threshold_exp = expf(cost_threshold_sp * cost_threshold_sp / (-0.32f));
+    for (int i = 0; i < params.num_images - 1; i++) {
+        if (sp_count[i] > 2.0f && sp_count_false[i] < 3)
+            sampling_probs[i] = (sp_tmpw[i] / sp_count[i]) * view_selection_priors[i];
+        else if (sp_count_false[i] < 3)
+            sampling_probs[i] = threshold_exp * view_selection_priors[i];
+        else
+            sampling_probs[i] = 0.0f;
+    }
 
     TransformPDFToCDF(sampling_probs, params.num_images - 1);
-    
+
     for (int sample = 0; sample < 15; ++sample) {
         const float rand_prob = rng_uniform(&rand_states[center], (unsigned int)center) - FLT_EPSILON;
-
-        for (int image_id = 0; image_id < params.num_images - 1 && image_id < 32; ++image_id) {
-            const float prob = sampling_probs[image_id];
-            if (prob > rand_prob) {
+        for (int image_id = 0; image_id < params.num_images - 1; ++image_id) {
+            if (sampling_probs[image_id] > rand_prob) {
                 view_weights[image_id] += 1.0f;
                 break;
             }
@@ -1307,7 +1253,7 @@ __device__ void CheckerboardPropagation(
     unsigned int temp_selected_views = 0;
     int num_selected_view = 0;
     float weight_norm = 0.0f;
-    for (int i = 0; i < params.num_images - 1 && i < 32; ++i) {
+    for (int i = 0; i < params.num_images - 1; ++i) {
         if (view_weights[i] > 0.0f) {
             setBit(temp_selected_views, i);
             weight_norm += view_weights[i];
@@ -1315,37 +1261,48 @@ __device__ void CheckerboardPropagation(
         }
     }
 
+    const float inv_weight_norm = (weight_norm > 1e-6f) ? (1.0f / weight_norm) : 0.0f;
+
+    // ---- Pass 2: Recompute cost vectors, compute weighted final costs ----
     float final_costs[8];
-    ComputeFinalCosts(final_costs, cost_array, view_weights, weight_norm,
-                      flag, final_positions, depths, cameras, 
-                      plane_hypotheses, p, params);
+    for (int d = 0; d < 8; ++d) {
+        if (!flag[d]) { final_costs[d] = 2.0f; continue; }
+        ComputeMultiViewCostVector(images, cameras, p, plane_hypotheses[final_positions[d]], cost_vector, params);
+        float cost_sum = 0.0f;
+        for (int j = 0; j < params.num_images - 1; ++j) {
+            if (view_weights[j] > 0.0f) {
+                float base_cost = cost_vector[j];
+                if (params.geom_consistency) {
+                    base_cost += 0.2f * ComputeGeomConsistencyCost(
+                        depths[j + 1], cameras[0], cameras[j + 1],
+                        plane_hypotheses[final_positions[d]], p);
+                }
+                cost_sum += view_weights[j] * base_cost;
+            }
+        }
+        final_costs[d] = cost_sum * inv_weight_norm;
+    }
 
     const int min_cost_idx = FindMinCostIndex(final_costs, 8);
 
-    float cost_vector_now[32];
-    for (int i = 0; i < 32; ++i) {
-        cost_vector_now[i] = 2.0f;
-    }
-    
-    ComputeMultiViewCostVector(images, cameras, p, plane_hypotheses[center], cost_vector_now, params);
+    // Compute center pixel cost (reuse cost_vector)
+    ComputeMultiViewCostVector(images, cameras, p, plane_hypotheses[center], cost_vector, params);
     float cost_now = 0.0f;
-    for (int i = 0; i < params.num_images - 1 && i < 32; ++i) {
+    for (int i = 0; i < params.num_images - 1; ++i) {
         if (view_weights[i] > 0.0f) {
-            float base_cost = cost_vector_now[i];
+            float base_cost = cost_vector[i];
             if (params.geom_consistency) {
                 base_cost += 0.2f * ComputeGeomConsistencyCost(depths[i+1], cameras[0], cameras[i+1], plane_hypotheses[center], p);
             }
             cost_now += view_weights[i] * base_cost;
         }
     }
-    if (weight_norm > 1e-6f) {
-        cost_now /= weight_norm;
-    }
+    cost_now *= inv_weight_norm;
     costs[center] = cost_now;
 
     float depth_now = ComputeDepthfromPlaneHypothesis(cameras[0], plane_hypotheses[center], p);
     float restricted_cost = 0.0f;
-    
+
     if (params.planar_prior) {
         float restricted_final_costs[8] = {0.0f};
         float gamma = 0.5f;
@@ -1428,9 +1385,37 @@ __device__ void CheckerboardPropagation(
     }
 }
 
+// Dispatch helper: selects the right NUM_IMAGES specialization at runtime
 template<bool UseMask>
+__device__ __forceinline__ void DispatchCheckerboardPropagation(
+    const cudaTextureObject_t *images, const cudaTextureObject_t *depths,
+    const Camera *cameras, float4 *plane_hypotheses, float *costs, float *pre_costs,
+    RNGState *rand_states, unsigned int *selected_views, float4 *prior_planes,
+    unsigned int *plane_masks, const uint8_t *ref_mask, const int2 p,
+    const PatchMatchParams params, const int iter)
+{
+    if (params.num_images <= 5)
+        CheckerboardPropagation<UseMask, 5>(images, depths, cameras, plane_hypotheses, costs, pre_costs, rand_states, selected_views, prior_planes, plane_masks, ref_mask, p, params, iter);
+    else if (params.num_images <= 10)
+        CheckerboardPropagation<UseMask, 10>(images, depths, cameras, plane_hypotheses, costs, pre_costs, rand_states, selected_views, prior_planes, plane_masks, ref_mask, p, params, iter);
+    else if (params.num_images <= 16)
+        CheckerboardPropagation<UseMask, 16>(images, depths, cameras, plane_hypotheses, costs, pre_costs, rand_states, selected_views, prior_planes, plane_masks, ref_mask, p, params, iter);
+    else
+        CheckerboardPropagation<UseMask, 32>(images, depths, cameras, plane_hypotheses, costs, pre_costs, rand_states, selected_views, prior_planes, plane_masks, ref_mask, p, params, iter);
+}
+
+template<bool UseMask>
+__launch_bounds__(512, 2)
 __global__ void BlackPixelUpdate(cudaTextureObjects *texture_objects, cudaTextureObjects *texture_depths, Camera *cameras, float4 *plane_hypotheses, float *costs,  float *pre_costs,  RNGState *rand_states, unsigned int *selected_views, float4 *prior_planes, unsigned int *plane_masks, const uint8_t *ref_mask, const PatchMatchParams params, const int iter)
 {
+    // Cache cameras in shared memory (loaded once per block, used ~17x per pixel)
+    __shared__ Camera s_cameras[32];
+    const int tid = threadIdx.y * blockDim.x + threadIdx.x;
+    if (tid < params.num_images) {
+        s_cameras[tid] = cameras[tid];
+    }
+    __syncthreads();
+
     // Coalesced: all threads in a warp access the same row, stride-2 columns
     const int tx = blockIdx.x * blockDim.x + threadIdx.x;
     const int row = blockIdx.y * blockDim.y + threadIdx.y;
@@ -1438,12 +1423,21 @@ __global__ void BlackPixelUpdate(cudaTextureObjects *texture_objects, cudaTextur
     const int col = 2 * tx + (row & 1);
     int2 p = make_int2(col, row);
 
-    CheckerboardPropagation<UseMask>(texture_objects[0].images, texture_depths[0].images, cameras, plane_hypotheses, costs, pre_costs,  rand_states, selected_views, prior_planes, plane_masks, ref_mask, p, params, iter);
+    DispatchCheckerboardPropagation<UseMask>(texture_objects[0].images, texture_depths[0].images, s_cameras, plane_hypotheses, costs, pre_costs,  rand_states, selected_views, prior_planes, plane_masks, ref_mask, p, params, iter);
 }
 
 template<bool UseMask>
+__launch_bounds__(512, 2)
 __global__ void RedPixelUpdate(cudaTextureObjects *texture_objects, cudaTextureObjects *texture_depths, Camera *cameras, float4 *plane_hypotheses, float *costs,  float *pre_costs, RNGState *rand_states, unsigned int *selected_views, float4 *prior_planes, unsigned int *plane_masks, const uint8_t *ref_mask, const PatchMatchParams params, const int iter)
 {
+    // Cache cameras in shared memory (loaded once per block, used ~17x per pixel)
+    __shared__ Camera s_cameras[32];
+    const int tid = threadIdx.y * blockDim.x + threadIdx.x;
+    if (tid < params.num_images) {
+        s_cameras[tid] = cameras[tid];
+    }
+    __syncthreads();
+
     // Coalesced: all threads in a warp access the same row, stride-2 columns
     const int tx = blockIdx.x * blockDim.x + threadIdx.x;
     const int row = blockIdx.y * blockDim.y + threadIdx.y;
@@ -1451,7 +1445,7 @@ __global__ void RedPixelUpdate(cudaTextureObjects *texture_objects, cudaTextureO
     const int col = 2 * tx + (1 - (row & 1));
     int2 p = make_int2(col, row);
 
-    CheckerboardPropagation<UseMask>(texture_objects[0].images, texture_depths[0].images, cameras, plane_hypotheses, costs, pre_costs, rand_states, selected_views, prior_planes, plane_masks, ref_mask, p, params, iter);
+    DispatchCheckerboardPropagation<UseMask>(texture_objects[0].images, texture_depths[0].images, s_cameras, plane_hypotheses, costs, pre_costs, rand_states, selected_views, prior_planes, plane_masks, ref_mask, p, params, iter);
 }
 
 __global__ void GetDepthandNormal(Camera *cameras, float4 *plane_hypotheses, const PatchMatchParams params)
@@ -2030,99 +2024,3 @@ void ACMMP::RunPatchMatch(ProblemGPUResources* res, bool skip_host_download) {
     }
 }
 
-__global__ void JBU_cu(JBUParameters *jp, JBUTexObj *jt, float *depth)
-{
-    const int2 p = make_int2 ( blockIdx.x * blockDim.x + threadIdx.x, blockIdx.y * blockDim.y + threadIdx.y );
-    const int rows = jp[0].height;
-    const int cols = jp[0].width;
-    const int center = p.y * cols + p.x;
-
-    if (p.x >= cols) {
-        return;
-    }
-    if (p.y >= rows) {
-        return;
-    }
-
-    const float scale  = 1.0 * jp[0].s_width / jp[0].width;
-    const float sigmad = 0.50;
-    const float sigmar = 25.5;
-    const int WinWidth = jp[0].Imagescale * jp[0].Imagescale + 1;
-    int num_neighbors = WinWidth / 2;
-
-    const float o_y = p.y * scale;
-    const float o_x = p.x * scale;
-    const float refPix = tex2D<float>(jt[0].imgs[0], p.x + 0.5f, p.y + 0.5f);
-    int r_y = 0;
-    int r_ys = 0;
-    int r_x = 0;
-    int r_xs = 0;
-    float sgauss = 0.0, rgauss = 0.0, totalgauss = 0.0;
-    float total_val = 0.0, normalizing_factor = 0.0;
-    float  srcPix = 0, neighborPix = 0;
-
-    for (int j = -num_neighbors; j <= num_neighbors; ++j) {
-        // source
-        r_y = o_y + j;
-        r_y = (r_y > 0 ? (r_y < jp[0].s_height ? r_y :jp[0].s_height - 1) : 0) ;
-        // reference
-        r_ys = p.y + j;
-        r_ys = (r_ys > 0 ? (r_ys < jp[0].height ? r_ys :jp[0].height - 1) : 0) ;
-        for (int i = -num_neighbors; i <= num_neighbors; ++i) {
-            // source
-            r_x = o_x + i;
-            r_x = (r_x > 0 ? (r_x < jp[0].s_width ? r_x : jp[0].s_width - 1) : 0);
-           srcPix = tex2D<float>(jt[0].imgs[1], r_x + 0.5f, r_y + 0.5f);
-            // refIm
-            r_xs = p.x + i;
-            r_xs = (r_xs > 0 ? (r_xs < jp[0].width ? r_xs :jp[0].width - 1) : 0) ;
-            neighborPix = tex2D<float>(jt[0].imgs[0], r_xs + 0.5f, r_ys + 0.5f);
-
-            sgauss = SpatialGauss(o_x, o_y, r_x, r_y, sigmad);
-            rgauss = RangeGauss(fabs(refPix - neighborPix), sigmar);
-            totalgauss = sgauss * rgauss;
-            normalizing_factor += totalgauss;
-            total_val += srcPix * totalgauss;
-        }
-    }
-
-    depth[center] = total_val / normalizing_factor;
-
-}
-
-void JBU::CudaRun()
-{
-    const cudaStream_t s = stream_ ? stream_ : 0;
-
-    const int rows = jp_h.height;
-    const int cols = jp_h.width;
-
-    dim3 grid((cols + 15) / 16, (rows + 15) / 16, 1);
-    dim3 blk (16, 16, 1);
-
-    cudaEvent_t start, stop;
-    cudaEventCreate(&start);
-    cudaEventCreate(&stop);
-
-    // Record events on the SAME stream
-    cudaEventRecord(start, s);
-
-    // Launch on s (not default stream)
-    JBU_cu<<<grid, blk, 0, s>>>(jp_d, jt_d, depth_d);
-    CUDA_SAFE_CALL(cudaPeekAtLastError());
-
-    // Async copy on s, then fence s once
-    CUDA_SAFE_CALL(cudaMemcpyAsync(
-        depth_h, depth_d, sizeof(float) * rows * cols,
-        cudaMemcpyDeviceToHost, s));
-
-    CUDA_SAFE_CALL(cudaEventRecord(stop, s));
-    CUDA_SAFE_CALL(cudaEventSynchronize(stop));
-
-    float ms = 0.f;
-    cudaEventElapsedTime(&ms, start, stop);
-    // printf("Total time needed for computation: %f seconds\n", ms / 1000.f);
-
-    cudaEventDestroy(start);
-    cudaEventDestroy(stop);
-}

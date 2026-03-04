@@ -91,6 +91,17 @@ public:
     unsigned int* plane_masks_cuda = nullptr;
     uint8_t* ref_mask_cuda = nullptr;  // Item 4: 1=masked, 0=valid
 
+    // APD buffers — ALL owned here, not in ACMMP class
+    uchar* weak_info_cuda = nullptr;
+    uchar* weak_reliable_cuda = nullptr;
+    short2* weak_nearest_strong_cuda = nullptr;
+    short2* neighbours_cuda = nullptr;        // size: weak_count * NEIGHBOUR_NUM
+    int* neighbours_map_cuda = nullptr;
+    float4* fit_plane_hypotheses_cuda = nullptr;
+    uchar* view_weight_cuda = nullptr;
+    DataPassHelper* helper_cuda = nullptr;
+    PatchMatchParams* params_dev_cuda = nullptr;
+
     // Item 5: Batch planar prior buffers
     int2* support_points_cuda = nullptr;
     int* num_support_points_cuda = nullptr;   // device atomic counter
@@ -123,19 +134,25 @@ struct CompletedResult {
     cv::Mat_<cv::Vec3f> normals;
     cv::Mat_<float> costs;
     bool geom_consistency;
-    
+    // APD extras
+    cv::Mat weak_info;          // CV_8UC1
+    cv::Mat selected_views;     // CV_32SC1
+    bool is_apd = false;
+
     CompletedResult() = default;
-    CompletedResult(int idx, const Problem& prob, 
+    CompletedResult(int idx, const Problem& prob,
                    cv::Mat_<float> d, cv::Mat_<cv::Vec3f> n, cv::Mat_<float> c, bool geom)
-        : problem_idx(idx), problem(prob), depths(std::move(d)), 
+        : problem_idx(idx), problem(prob), depths(std::move(d)),
           normals(std::move(n)), costs(std::move(c)), geom_consistency(geom) {}
-    
+
     // Move constructor
     CompletedResult(CompletedResult&& other) noexcept
         : problem_idx(other.problem_idx), problem(std::move(other.problem)),
           depths(std::move(other.depths)), normals(std::move(other.normals)),
-          costs(std::move(other.costs)), geom_consistency(other.geom_consistency) {}
-    
+          costs(std::move(other.costs)), geom_consistency(other.geom_consistency),
+          weak_info(std::move(other.weak_info)), selected_views(std::move(other.selected_views)),
+          is_apd(other.is_apd) {}
+
     // Move assignment
     CompletedResult& operator=(CompletedResult&& other) noexcept {
         if (this != &other) {
@@ -145,10 +162,13 @@ struct CompletedResult {
             normals = std::move(other.normals);
             costs = std::move(other.costs);
             geom_consistency = other.geom_consistency;
+            weak_info = std::move(other.weak_info);
+            selected_views = std::move(other.selected_views);
+            is_apd = other.is_apd;
         }
         return *this;
     }
-    
+
     // Delete copy constructor and assignment to force move semantics
     CompletedResult(const CompletedResult&) = delete;
     CompletedResult& operator=(const CompletedResult&) = delete;
@@ -156,17 +176,26 @@ struct CompletedResult {
 
 class BatchACMMP {
 public:
-    BatchACMMP(const std::string& dense_folder_, 
+    BatchACMMP(const std::string& dense_folder_,
                const std::vector<Problem>& problems,
                bool geom_consistency_,
                bool planar_prior_,
                bool hierarchy_,
-               bool multi_geometry_,size_t mask_disk_queue_size_ = 400);
-               
-    
+               bool multi_geometry_,size_t mask_disk_queue_size_ = 400,
+               std::shared_ptr<ImageCache> shared_cache = nullptr);
+
+    // APD mode: set before calling processAllProblems
+    void SetAPDMode(const PatchMatchParams &apd_params) { apd_mode_ = true; apd_params_ = apd_params; }
+
+
     ~BatchACMMP();
-    
+
     void processAllProblems();
+    // Reuse existing threads/GPU resources with new params (for APD multi-pass)
+    void processAllProblemsWithParams(const PatchMatchParams& params);
+    // Update iteration field on all internal problem copies
+    void updateProblemIterations(int iteration);
+
     void processBatch(const std::vector<int>& idxs);
     void waitForGPUCompletion();
     void waitForDiskCompletion();
@@ -198,7 +227,9 @@ private:
     bool planar_prior;
     bool hierarchy;
     bool multi_geometry;
-    size_t mask_disk_queue_size; 
+    size_t mask_disk_queue_size;
+    bool apd_mode_ = false;
+    PatchMatchParams apd_params_;
     // GPU processing resources
     size_t max_concurrent_problems;
     size_t num_disk_writers;
@@ -240,10 +271,11 @@ private:
     size_t available_gpu_memory;
     size_t memory_per_problem;
 
-    // Image/camera/mask cache
-    std::unique_ptr<ImageCache> image_cache_;
-    
+    // Image/camera/mask cache (shared across rounds when reusing)
+    std::shared_ptr<ImageCache> image_cache_;
+
     // Internal methods
+    void resetForNextPass();  // wait for completion, reset counters + queues
     void initializeResourcePool();
     void initializeDiskWriters();
     ProblemGPUResources* acquireResources();

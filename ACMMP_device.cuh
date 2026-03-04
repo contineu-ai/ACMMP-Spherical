@@ -497,8 +497,9 @@ __device__ __forceinline__ float ComputeDepthFromDirection(
 }
 
 // 1d. Precomputed tangent patch struct (source-independent data)
+// For patch_size=5, radius_increment=2: samples at offsets {-2,0,2} x {-2,0,2} = 9 samples.
 struct TangentPatch {
-    static constexpr int MAX_SAMPLES = 25;
+    static constexpr int MAX_SAMPLES = 9;
     float ref_pix[MAX_SAMPLES];
     float3 world_pt[MAX_SAMPLES];
     float bw[MAX_SAMPLES];

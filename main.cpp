@@ -7,6 +7,7 @@
 #include <atomic>   // Add this for atomic operations
 #include "BatchACMMP.h"
 #include <cstring>  // For strcmp
+#include <sys/stat.h>
 
 void makeDir(const std::string& path) {
     if (mkdir(path.c_str(), 0777) && errno != EEXIST) {
@@ -313,60 +314,17 @@ if (planar_prior) {
 }
 
 
-// Process problems using the original sequential method
-void ProcessProblemsSequential(const std::string &dense_folder,
-                              const std::vector<Problem> &problems,
-                              bool geom_consistency,
-                              bool planar_prior,
-                              bool hierarchy,
-                              bool multi_geometry) {
-    
-    std::cout << "\n========================================" << std::endl;
-    std::cout << "Starting Sequential Processing" << std::endl;
-    std::cout << "========================================" << std::endl;
-    
-    auto start_time = std::chrono::high_resolution_clock::now();
-    
-    for (size_t i = 0; i < problems.size(); ++i) {
-        ProcessProblem(dense_folder, problems, i, geom_consistency, planar_prior, hierarchy, multi_geometry);
-    }
-    
-    auto end_time = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::seconds>(end_time - start_time);
-    
-    std::cout << "\n========================================" << std::endl;
-    std::cout << "Sequential Processing Complete!" << std::endl;
-    std::cout << "Total time: " << duration.count() << " seconds" << std::endl;
-    std::cout << "========================================\n" << std::endl;
-}
-
-// Wrapper function that chooses between batch and sequential processing
-void ProcessProblemsWithMode(const std::string &dense_folder,
-                            std::vector<Problem> &problems,
-                            bool geom_consistency,
-                            bool planar_prior,
-                            bool hierarchy,
-                            bool multi_geometry ,
-                            bool use_batching ) {
-    
-    if (use_batching) {
-        std::cout << "Processing mode: BATCH (parallel GPU streams)" << std::endl;
-        ProcessProblemsInParallel(dense_folder, problems, geom_consistency, 
-                                 planar_prior, hierarchy, multi_geometry);
-    } else {
-        std::cout << "Processing mode: SEQUENTIAL (one problem at a time)" << std::endl;
-        ProcessProblemsSequential(dense_folder, problems, geom_consistency, 
-                                 planar_prior, hierarchy, multi_geometry);
-    }
-}
-
 void GenerateSampleList(const std::string &dense_folder, std::vector<Problem> &problems)
 {
     std::string cluster_list_path = dense_folder + std::string("/pair.txt");
     problems.clear();
 
     std::ifstream file(cluster_list_path);
-    int num_images;
+    if (!file.is_open()) {
+        std::cerr << "ERROR: Cannot open " << cluster_list_path << std::endl;
+        exit(1);
+    }
+    int num_images = 0;
     file >> num_images;
 
     for (int i = 0; i < num_images; ++i) {
@@ -374,7 +332,7 @@ void GenerateSampleList(const std::string &dense_folder, std::vector<Problem> &p
         problem.src_image_ids.clear();
         file >> problem.ref_image_id;
 
-        int num_src_images;
+        int num_src_images = 0;
         file >> num_src_images;
         for (int j = 0; j < num_src_images; ++j) {
             int id;
@@ -431,44 +389,38 @@ void InitializeLUTsForAllResolutions(const std::string &dense_folder,
     // Add base resolution
     unique_resolutions.insert({base_width, base_height, base_cx, base_cy});
     
-    // Process all problems to find all unique resolutions
-    for (const auto& problem : problems) {
-        // Get image size for this problem
-        std::stringstream img_path;
-        img_path << image_folder << "/" << std::setw(8) << std::setfill('0') 
-                 << problem.ref_image_id << ".png";
-        cv::Mat_<uint8_t> img = cv::imread(img_path.str(), cv::IMREAD_GRAYSCALE);
-        
-        int width = img.cols;
-        int height = img.rows;
-        
-        // Calculate scaled versions based on max_image_size
-        if (problem.max_image_size > 0) {
-            if (width > problem.max_image_size || height > problem.max_image_size) {
-                const float factor_x = static_cast<float>(problem.max_image_size) / width;
-                const float factor_y = static_cast<float>(problem.max_image_size) / height;
+    // All images assumed same resolution — use base dimensions for all problems
+    {
+        int width = base_width;
+        int height = base_height;
+
+        // Calculate scaled version based on max_image_size (use first problem)
+        if (problems[0].max_image_size > 0) {
+            if (width > problems[0].max_image_size || height > problems[0].max_image_size) {
+                const float factor_x = static_cast<float>(problems[0].max_image_size) / width;
+                const float factor_y = static_cast<float>(problems[0].max_image_size) / height;
                 const float factor = std::min(factor_x, factor_y);
-                
+
                 int new_width = std::round(width * factor);
                 int new_height = std::round(height * factor);
                 float new_cx = base_cx * factor;
                 float new_cy = base_cy * factor;
-                
+
                 unique_resolutions.insert({new_width, new_height, new_cx, new_cy});
             }
         }
-        
+
         // Add pyramid levels
         for (int scale = 0; scale <= max_num_downscale; ++scale) {
             int scale_factor = 1 << scale;  // 2^scale
             int scaled_width = width / scale_factor;
             int scaled_height = height / scale_factor;
-            
+
             if (scaled_width < 32 || scaled_height < 32) break;
-            
+
             float scaled_cx = base_cx * scaled_width / base_width;
             float scaled_cy = base_cy * scaled_height / base_height;
-            
+
             unique_resolutions.insert({scaled_width, scaled_height, scaled_cx, scaled_cy});
         }
     }
@@ -483,6 +435,118 @@ void InitializeLUTsForAllResolutions(const std::string &dense_folder,
     std::cout << "Initialized " << unique_resolutions.size() << " LUTs" << std::endl;
     std::cout << "Total memory usage: " 
               << g_lut_manager->GetTotalMemoryUsage() / (1024.0 * 1024.0) << " MB" << std::endl;
+}
+
+// ============================================================================
+// APD Round-Based Pipeline Functions
+// ============================================================================
+
+int ComputeRoundNum(const std::string &dense_folder, const std::vector<Problem> &problems)
+{
+    if (problems.empty()) return 0;
+    std::stringstream image_path;
+    image_path << dense_folder << "/images/" << std::setw(8) << std::setfill('0')
+               << problems[0].ref_image_id << ".png";
+    cv::Mat image = cv::imread(image_path.str());
+    if (image.empty()) {
+        // Try .jpg
+        std::stringstream jpg_path;
+        jpg_path << dense_folder << "/images/" << std::setw(8) << std::setfill('0')
+                 << problems[0].ref_image_id << ".jpg";
+        image = cv::imread(jpg_path.str());
+    }
+    if (image.empty()) return 0;
+    int max_size = std::max(image.cols, image.rows);
+    int round_num = 1;
+    while (max_size > 1000) {
+        max_size /= 2;
+        round_num++;
+    }
+    return round_num;
+}
+
+void ProcessProblemAPD(const std::string &dense_folder,
+                       const std::vector<Problem> &problems,
+                       const int idx,
+                       const PatchMatchParams &apd_params)
+{
+    const Problem &problem = problems[idx];
+    std::cout << "APD: Processing image " << std::setw(8) << std::setfill('0')
+              << problem.ref_image_id << " (state=" << apd_params.state << ")" << std::endl;
+    cudaSetDevice(0);
+
+    // Create result folder
+    std::stringstream rp;
+    rp << dense_folder << "/APD/" << std::setw(8) << std::setfill('0') << problem.ref_image_id;
+    std::string result_folder = rp.str();
+    makeDir(result_folder);
+
+    ACMMP acmmp;
+    acmmp.SetAPDParams(apd_params);
+    acmmp.APDInputInitialization(dense_folder, problems, idx);
+
+    int num_imgs = std::min((int)(1 + problem.src_image_ids.size()), MAX_IMAGES);
+    ProblemGPUResources resources;
+    resources.allocate(acmmp.GetReferenceImageWidth(), acmmp.GetReferenceImageHeight(), num_imgs);
+
+    acmmp.APDCudaSpaceInitialization(dense_folder, problem, &resources);
+    acmmp.RunAPDPatchMatch(&resources);
+
+    const int width = acmmp.GetReferenceImageWidth();
+    const int height = acmmp.GetReferenceImageHeight();
+
+    // Extract results
+    cv::Mat_<float> depths(height, width);
+    cv::Mat_<cv::Vec3f> normals(height, width);
+    for (int r = 0; r < height; ++r) {
+        for (int c = 0; c < width; ++c) {
+            int center = r * width + c;
+            float4 ph = acmmp.GetPlaneHypothesis(center);
+            depths(r, c) = ph.w;
+            normals(r, c) = cv::Vec3f(ph.x, ph.y, ph.z);
+        }
+    }
+
+    // Write depths/normals in compressed DMB format (compatible with fusion reader)
+    std::string depth_name = apd_params.geom_consistency ? "/depths_geom.dmb" : "/depths.dmb";
+    writeDepthDmb(result_folder + depth_name, depths);
+    writeNormalDmb(result_folder + "/normals.dmb", normals);
+    // Write APD-specific outputs in BinMat format
+    WriteBinMat(result_folder + "/weak.bin", acmmp.GetWeakInfo());
+    WriteBinMat(result_folder + "/selected_views.bin", acmmp.GetSelectedViews());
+}
+
+void ProcessProblemsAPDSequential(const std::string &dense_folder,
+                                  const std::vector<Problem> &problems,
+                                  const PatchMatchParams &params)
+{
+    for (size_t i = 0; i < problems.size(); ++i) {
+        ProcessProblemAPD(dense_folder, problems, (int)i, params);
+    }
+}
+
+void WaitForBatchCompletion(BatchACMMP &batch, size_t total) {
+    bool done = false;
+    auto last_report = std::chrono::steady_clock::now();
+    while (!done) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        size_t gpu_completed = batch.getCompletedGPUProblems();
+        size_t disk_completed = batch.getCompletedDiskWrites();
+
+        auto now = std::chrono::steady_clock::now();
+        if (std::chrono::duration_cast<std::chrono::seconds>(now - last_report).count() >= 30) {
+            std::cout << "[APD Progress] GPU: " << gpu_completed << "/" << total
+                      << ", Disk: " << disk_completed << "/" << total
+                      << ", Active: " << batch.getActiveGPUProblems() << std::endl;
+            last_report = now;
+        }
+
+        if (disk_completed >= total &&
+            batch.getActiveGPUProblems() == 0 &&
+            batch.getPendingDiskWrites() == 0) {
+            done = true;
+        }
+    }
 }
 
 int ComputeMultiScaleSettings(const std::string &dense_folder, std::vector<Problem> &problems)
@@ -522,34 +586,6 @@ int ComputeMultiScaleSettings(const std::string &dense_folder, std::vector<Probl
     }
 
     return max_num_downscale;
-}
-
-void JointBilateralUpsampling(const std::string &dense_folder, const Problem &problem, int acmmp_size)
-{
-    std::stringstream result_path;
-    result_path << dense_folder << "/ACMMP" << "/2333_" << std::setw(8) << std::setfill('0') << problem.ref_image_id;
-    std::string result_folder = result_path.str();
-    std::string depth_path = result_folder + "/depths_geom.dmb";
-    cv::Mat_<float> ref_depth;
-    readDepthDmb(depth_path, ref_depth);
-
-    std::string image_folder = dense_folder + std::string("/images");
-    std::stringstream image_path;
-    image_path << image_folder << "/" << std::setw(8) << std::setfill('0') << problem.ref_image_id << ".png";
-    cv::Mat_<uint8_t> image_uint = cv::imread(image_path.str(), cv::IMREAD_GRAYSCALE);
-    cv::Mat image_float;
-    image_uint.convertTo(image_float, CV_32FC1);
-    const float factor_x = static_cast<float>(acmmp_size) / image_float.cols;
-    const float factor_y = static_cast<float>(acmmp_size) / image_float.rows;
-    const float factor = std::min(factor_x, factor_y);
-
-    const int new_cols = std::round(image_float.cols * factor);
-    const int new_rows = std::round(image_float.rows * factor);
-    cv::Mat scaled_image_float;
-    cv::resize(image_float, scaled_image_float, cv::Size(new_cols,new_rows), 0, 0, cv::INTER_LINEAR);
-
-    // std::cout << "Run JBU for image " << problem.ref_image_id <<  ".png" << std::endl;
-    RunJBU(scaled_image_float, ref_depth, dense_folder, problem);
 }
 
 void ProcessProblemsInParallel(const std::string &dense_folder, 
@@ -634,14 +670,27 @@ int main(int argc, char** argv)
     }
 
     std::string dense_folder = argv[1];
-    bool use_batching = true;  // Default to batching enabled
+    bool use_batching = true;
 
-    // Parse command line arguments
+    int max_rounds = 0; // 0 = auto
     for (int i = 2; i < argc; ++i) {
         if (strcmp(argv[i], "--no-batch") == 0) {
             use_batching = false;
         } else if (strcmp(argv[i], "--batch") == 0) {
             use_batching = true;
+        } else if (strncmp(argv[i], "--max-rounds=", 13) == 0) {
+            max_rounds = atoi(argv[i] + 13);
+        } else if (strcmp(argv[i], "--fusion-only") == 0) {
+            // Skip APD rounds, jump directly to fusion
+            std::string df = argv[1];
+            std::vector<Problem> probs;
+            GenerateSampleList(df, probs);
+            InitializeLUTsForAllResolutions(df, probs, ComputeRoundNum(df, probs));
+            std::cout << "=== Running Fusion Only ===" << std::endl;
+            RunFusionCuda(df, probs, /*geom_consistency=*/true);
+            FreeLUTManager();
+            std::cout << "Fusion done!" << std::endl;
+            return 0;
         } else if (strcmp(argv[i], "--help") == 0) {
             printUsage(argv[0]);
             return 0;
@@ -652,99 +701,138 @@ int main(int argc, char** argv)
         }
     }
 
-    std::cout << "=== ACMMP Multi-View Stereo Processing ===" << std::endl;
+    std::cout << "=== APD-Spherical Multi-View Stereo ===" << std::endl;
     std::cout << "Dense folder: " << dense_folder << std::endl;
     std::cout << "Batch processing: " << (use_batching ? "ENABLED" : "DISABLED") << std::endl;
-    std::cout << "==========================================" << std::endl;
+    std::cout << "=======================================" << std::endl;
 
     std::vector<Problem> problems;
     GenerateSampleList(dense_folder, problems);
 
-    std::string output_folder = dense_folder + std::string("/ACMMP");
+    std::string output_folder = dense_folder + "/APD";
     mkdir(output_folder.c_str(), 0777);
 
     size_t num_images = problems.size();
-    std::cout << "There are " << num_images << " problems needed to be processed!" << std::endl;
+    std::cout << "There are " << num_images << " problems to process." << std::endl;
 
-    // // Compute multi-scale settings
-    int max_num_downscale = ComputeMultiScaleSettings(dense_folder, problems);
-    
-    // Initialize LUTs for all expected resolutions
-    InitializeLUTsForAllResolutions(dense_folder, problems, max_num_downscale);
+    // Compute round number based on image size
+    int round_num = ComputeRoundNum(dense_folder, problems);
+    int total_rounds = round_num; // keep for scale computation
+    if (max_rounds > 0 && max_rounds < round_num) round_num = max_rounds;
+    std::cout << "Round count: " << round_num << " (of " << total_rounds << " total)" << std::endl;
 
-    int flag = 0;
-    int geom_iterations = 2;
-    bool geom_consistency = false;
-    bool planar_prior = false;
-    bool hierarchy = false;
-    bool multi_geometry = false;
-    
-    while (max_num_downscale >= 0) {
-        std::cout << "Scale: " << max_num_downscale << std::endl;
+    // Initialize LUTs for all expected resolutions (spherical cameras)
+    InitializeLUTsForAllResolutions(dense_folder, problems, round_num);
 
-        for (size_t i = 0; i < num_images; ++i) {
-            if (problems[i].num_downscale >= 0) {
-                problems[i].cur_image_size = problems[i].max_image_size / 
-                                            pow(2, problems[i].num_downscale);
-                problems[i].num_downscale--;
-            }
+    // ========================================
+    // APD Round-Based Pipeline (optimized: reuse BatchACMMP within each round)
+    // ========================================
+    std::string apd_output_dir = dense_folder + "/APD";
+    makeDir(apd_output_dir);
+
+    // Detect masks once for shared cache
+    std::string mask_dir = dense_folder + "/masks";
+    struct stat mask_stat;
+    bool masks_exist = (stat(mask_dir.c_str(), &mask_stat) == 0 && S_ISDIR(mask_stat.st_mode));
+
+    // Shared image cache across all rounds (stays warm)
+    auto shared_cache = std::make_shared<ImageCache>(50, dense_folder, masks_exist);
+    std::cout << "[APD] Shared image cache: max 50 entries, masks=" << (masks_exist ? "yes" : "no") << std::endl;
+
+    int iteration = 0;
+    for (int i = 0; i < round_num; ++i) {
+        int scale = (int)std::pow(2, total_rounds - 1 - i);
+        std::cout << "\n=== Round " << i << "/" << round_num
+                  << " (scale=" << scale << ") ===" << std::endl;
+
+        auto round_start = std::chrono::high_resolution_clock::now();
+
+        // Set scale for all problems
+        for (auto &p : problems) {
+            p.scale_size = scale;
+            p.iteration = iteration;
         }
 
-        if (flag == 0) {
-            flag = 1;
-            std::cout << "Scale: " << max_num_downscale << std::endl;
-            // Phase 1: Planar prior processing
-            geom_consistency = false;
-            planar_prior = true;
-            ProcessProblemsWithMode(dense_folder, problems, geom_consistency, 
-                                   planar_prior, hierarchy, false, use_batching);
-            
-            // Phase 2: Geometric consistency processing
-            geom_consistency = true;
-            planar_prior = false;
-            std::cout << "Scale: " << max_num_downscale << std::endl;
-            for (int geom_iter = 0; geom_iter < geom_iterations; ++geom_iter) {
-                multi_geometry = (geom_iter > 0);
-                ProcessProblemsWithMode(dense_folder, problems, geom_consistency, 
-                                       planar_prior, hierarchy, multi_geometry, use_batching);
-            }
-        }
-        else {
-            // Joint Bilateral Upsampling phase
-            std::cout << "Scale: " << max_num_downscale << std::endl;
-            #pragma omp parallel for schedule(dynamic)
-            for (size_t i = 0; i < num_images; ++i) {
-               JointBilateralUpsampling(dense_folder, problems[i], problems[i].cur_image_size);
-            }
+        if (!use_batching) {
+            // Sequential fallback: 4 separate passes
+            PatchMatchParams params;
+            params.max_iterations = 3;
+            if (i == 0) { params.state = FIRST_INIT; params.use_APD = false; }
+            else { params.state = REFINE_INIT; params.use_APD = true;
+                   params.ransac_threshold = 0.01f - i * 0.00125f;
+                   params.rotate_time = std::min((int)std::pow(2, i), 4); }
+            params.geom_consistency = false;
+            params.weak_peak_radius = 6;
+            ProcessProblemsAPDSequential(dense_folder, problems, params);
+            iteration++;
 
-            // Phase 3: Hierarchy processing
-            hierarchy = true;
-            geom_consistency = false;
-            planar_prior = true;
-            std::cout << "Scale: " << max_num_downscale << std::endl;
-            ProcessProblemsWithMode(dense_folder, problems, geom_consistency, 
-                                   planar_prior, hierarchy, false, use_batching);
-            
-            // Phase 4: Final geometric consistency
-            hierarchy = false;
-            geom_consistency = true;
-            planar_prior = false;
-            for (int geom_iter = 0; geom_iter < geom_iterations; ++geom_iter) {
-                std::cout << "Scale: " << max_num_downscale << std::endl;
-                multi_geometry = (geom_iter > 0);
-                ProcessProblemsWithMode(dense_folder, problems, geom_consistency, 
-                                       planar_prior, hierarchy, multi_geometry, use_batching);
+            for (int j = 0; j < 3; ++j) {
+                for (auto &p : problems) p.iteration = iteration;
+                params.state = REFINE_ITER;
+                if (i == 0) params.use_APD = false;
+                else { params.use_APD = true;
+                       params.ransac_threshold = 0.01f - i * 0.00125f;
+                       params.rotate_time = std::min((int)std::pow(2, i), 4); }
+                params.geom_consistency = true;
+                params.weak_peak_radius = std::max(4 - 2 * j, 2);
+                ProcessProblemsAPDSequential(dense_folder, problems, params);
+                iteration++;
             }
+        } else {
+            // Optimized batch path: 1 BatchACMMP per round, reuse across 4 passes
+            BatchACMMP batch(dense_folder, problems,
+                             false /*geom*/, false /*planar*/, false /*hier*/, false /*multi_geom*/,
+                             400 /*disk_queue_size*/, shared_cache);
+
+            // Pass 1: FIRST_INIT or REFINE_INIT
+            PatchMatchParams params;
+            params.max_iterations = 3;
+            if (i == 0) { params.state = FIRST_INIT; params.use_APD = false; }
+            else { params.state = REFINE_INIT; params.use_APD = true;
+                   params.ransac_threshold = 0.01f - i * 0.00125f;
+                   params.rotate_time = std::min((int)std::pow(2, i), 4); }
+            params.geom_consistency = false;
+            params.weak_peak_radius = 6;
+
+            batch.SetAPDMode(params);
+            batch.processAllProblems();
+            WaitForBatchCompletion(batch, problems.size());
+            iteration++;
+
+            // Passes 2-4: 3x REFINE_ITER (reuse threads, GPU resources, cache)
+            for (int j = 0; j < 3; ++j) {
+                batch.updateProblemIterations(iteration);
+
+                params.state = REFINE_ITER;
+                if (i == 0) params.use_APD = false;
+                else { params.use_APD = true;
+                       params.ransac_threshold = 0.01f - i * 0.00125f;
+                       params.rotate_time = std::min((int)std::pow(2, i), 4); }
+                params.geom_consistency = true;
+                params.weak_peak_radius = std::max(4 - 2 * j, 2);
+
+                batch.processAllProblemsWithParams(params);
+                WaitForBatchCompletion(batch, problems.size());
+                iteration++;
+            }
+            // ~BatchACMMP: threads + GPU resources freed at end of round
         }
 
-        max_num_downscale--;
+        auto round_end = std::chrono::high_resolution_clock::now();
+        auto round_secs = std::chrono::duration_cast<std::chrono::seconds>(round_end - round_start).count();
+        std::cout << "Round " << i << " complete. (" << round_secs << "s)" << std::endl;
     }
 
-    geom_consistency = true;
-    RunFusionCuda(dense_folder, problems, geom_consistency);
+    std::cout << "[APD] Image cache final: " << shared_cache->hits() << " hits, "
+              << shared_cache->misses() << " misses" << std::endl;
+
+    // Final fusion
+    std::cout << "\n=== Running Fusion ===" << std::endl;
+    RunFusionCuda(dense_folder, problems, /*geom_consistency=*/true);
 
     // Clean up LUT manager
     FreeLUTManager();
 
+    std::cout << "All done!" << std::endl;
     return 0;
 }
