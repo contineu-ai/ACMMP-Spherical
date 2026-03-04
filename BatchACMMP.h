@@ -70,6 +70,7 @@ public:
 
     cudaStream_t stream = nullptr;
     int stream_id = -1;
+    int device_id = 0;  // GPU device this resource is allocated on
 
     // === GPU DEVICE MEMORY (Owned by this object) ===
     // CUDA arrays for 2D texture memory
@@ -198,8 +199,10 @@ private:
     bool planar_prior;
     bool hierarchy;
     bool multi_geometry;
-    size_t mask_disk_queue_size; 
-    // GPU processing resources
+    size_t mask_disk_queue_size;
+    // Multi-GPU support
+    int num_gpus = 1;
+    // GPU processing resources (spans all GPUs)
     size_t max_concurrent_problems;
     size_t num_disk_writers;
     std::vector<cudaStream_t> streams;

@@ -777,10 +777,13 @@ public:
         
         size_t safe_max_textures, safe_max_problems, safe_max_src_images, safe_max_pixels;
         
-        if (!safe_multiply(est_max_textures, static_cast<size_t>(2), safe_max_textures) ||
-            !safe_multiply(est_max_problems, static_cast<size_t>(2), safe_max_problems) ||
-            !safe_multiply(est_max_src_images, static_cast<size_t>(2), safe_max_src_images) ||
-            !safe_multiply(est_max_pixels, static_cast<size_t>(2), safe_max_pixels)) {
+        // Use 1.25x headroom (was 2x which caused OOM with large datasets)
+        safe_max_textures = est_max_textures + est_max_textures / 4;
+        safe_max_problems = est_max_problems + est_max_problems / 4;
+        safe_max_src_images = est_max_src_images + est_max_src_images / 4;
+        safe_max_pixels = est_max_pixels + est_max_pixels / 4;
+        if (safe_max_textures < est_max_textures || safe_max_problems < est_max_problems ||
+            safe_max_src_images < est_max_src_images || safe_max_pixels < est_max_pixels) {
             throw std::overflow_error("Buffer size calculation overflow");
         }
         
@@ -798,8 +801,13 @@ public:
             max_src_images * sizeof(int) +
             max_pixels * (sizeof(PointList) + sizeof(int));
         
-        if (total_required > free_mem * 0.8) {
-            throw std::runtime_error("Insufficient GPU memory for requested buffer sizes");
+        // Ensure persistent buffers leave at least 2GB for textures + overhead
+        size_t min_texture_reserve = static_cast<size_t>(2) * 1024 * 1024 * 1024;
+        if (total_required + min_texture_reserve > free_mem) {
+            std::ostringstream oss;
+            oss << "Insufficient GPU memory: persistent buffers need " << (total_required / (1024*1024))
+                << " MB + 2048 MB texture reserve, but only " << (free_mem / (1024*1024)) << " MB free";
+            throw std::runtime_error(oss.str());
         }
         
         std::cout << "[PersistentGPU] Allocating buffers for max: " 
@@ -1811,9 +1819,9 @@ __global__ void CorrectedChunkBatchKernel(
         int src_c = static_cast<int>(proj_point.x + 0.5f);
         int src_r = static_cast<int>(proj_point.y + 0.5f);
 
-        // Wrap x-coordinate for spherical source cameras
+        // Branchless wrap x-coordinate for spherical source cameras
         if (src_cam.model == SPHERE) {
-            src_c = ((src_c % src_cam.width) + src_cam.width) % src_cam.width;
+            src_c = src_c - src_cam.width * static_cast<int>(floorf(static_cast<float>(src_c) * __fdividef(1.0f, static_cast<float>(src_cam.width))));
         }
 
         if (src_c < 0 || src_c >= src_cam.width || src_r < 0 || src_r >= src_cam.height)
@@ -1835,8 +1843,7 @@ __global__ void CorrectedChunkBatchKernel(
         float diff_x = c - reproj_point_in_ref.x;
         if (ref_cam.model == SPHERE) {
             const float w = static_cast<float>(ref_cam.width);
-            if (diff_x > w * 0.5f) diff_x -= w;
-            else if (diff_x < -w * 0.5f) diff_x += w;
+            diff_x -= w * floorf((diff_x + w * 0.5f) * __fdividef(1.0f, w));
         }
         float reproj_error = hypotf(diff_x, r - reproj_point_in_ref.y);
         float relative_depth_diff = fabsf(proj_depth_in_src - src_depth) / src_depth;
@@ -1983,12 +1990,37 @@ void RunFusionCuda(const std::string &dense_folder,
     if (max_images_per_chunk == 0) {
         max_images_per_chunk = 50;
     }
-    
+
+    // Query GPU memory and compute memory-aware chunk size
+    {
+        size_t free_mem, total_mem;
+        cudaMemGetInfo(&free_mem, &total_mem);
+        FusionLogger::info("Fusion", "GPU memory: " + std::to_string(free_mem / (1024*1024)) +
+                          " MB free / " + std::to_string(total_mem / (1024*1024)) + " MB total");
+
+        // Estimate per-image texture cost: depth(float) + normal(float4) + image(float4)
+        size_t est_image_pixels = static_cast<size_t>(problems[0].cur_image_size) *
+                                  (problems[0].cur_image_size / 2);
+        size_t per_image_texture_bytes = est_image_pixels * (sizeof(float) + 2 * sizeof(float4));
+
+        // Reserve 40% for persistent buffers + overhead, 60% for textures
+        size_t texture_budget = free_mem * 6 / 10;
+        size_t max_images_by_memory = texture_budget / per_image_texture_bytes;
+
+        if (max_images_by_memory < max_images_per_chunk) {
+            FusionLogger::info("Fusion", "Reducing max_images_per_chunk from " +
+                std::to_string(max_images_per_chunk) + " to " + std::to_string(max_images_by_memory) +
+                " based on GPU memory (" + std::to_string(per_image_texture_bytes / (1024*1024)) +
+                " MB/image, " + std::to_string(texture_budget / (1024*1024)) + " MB budget)");
+            max_images_per_chunk = std::max(max_images_by_memory, static_cast<size_t>(5));
+        }
+    }
+
     size_t est_max_textures = max_images_per_chunk;
     size_t est_max_problems = 0;
     size_t est_max_src_images = 0;
     size_t est_max_pixels = 0;
-    
+
     auto chunks = createSmartChunks(problems, max_images_per_chunk);
     
     for (const auto& chunk : chunks) {
@@ -2001,7 +2033,7 @@ void RunFusionCuda(const std::string &dense_folder,
             
             const Problem& problem = problems[prob_idx];
             chunk_src_images += problem.src_image_ids.size();
-            chunk_pixels += 3200 * 1600;
+            chunk_pixels += static_cast<size_t>(problem.cur_image_size) * (problem.cur_image_size / 2);
         }
         
         est_max_src_images = std::max(est_max_src_images, chunk_src_images);

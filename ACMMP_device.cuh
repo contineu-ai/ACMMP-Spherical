@@ -505,6 +505,16 @@ struct TangentPatch {
     int n;
 };
 
+// 1e. Precomputed bilateral patch struct for pinhole NCC (source-independent data)
+struct BilateralPatch {
+    static constexpr int MAX_SAMPLES = 25;
+    float ref_pix[MAX_SAMPLES];
+    float3 world_pt[MAX_SAMPLES];
+    float bw[MAX_SAMPLES];
+    float center_pix;
+    int n;
+};
+
 // ============================================================================
 // MACRO DEFINITIONS FOR COMPATIBILITY
 // ============================================================================

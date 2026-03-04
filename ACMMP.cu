@@ -299,6 +299,88 @@ __device__ __forceinline__ float ComputeBilateralWeight(
     return expf(-spatial_dist_sq * inv_sigma_spatial_sq - color_dist * inv_sigma_color_sq);
 }
 
+// Precompute reference patch for bilateral NCC — source-independent, computed once.
+__device__ void PrecomputeBilateralPatch(
+    const cudaTextureObject_t ref_image, const Camera& ref_camera,
+    const int2 p, const float4& plane_hypothesis, const PatchMatchParams& params,
+    BilateralPatch& patch)
+{
+    const int radius = params.patch_size / 2;
+    const float inv_sigma_spatial_sq = 1.0f / (2.0f * params.sigma_spatial * params.sigma_spatial);
+    const float inv_sigma_color_sq = 1.0f / (2.0f * params.sigma_color * params.sigma_color);
+    patch.center_pix = tex2D<float>(ref_image, p.x + 0.5f, p.y + 0.5f);
+
+    patch.n = 0;
+    for (int i = -radius; i <= radius; i += params.radius_increment) {
+        const float i_sq = static_cast<float>(i * i);
+        for (int j = -radius; j <= radius; j += params.radius_increment) {
+            const int2 ref_pt = make_int2(p.x + i, p.y + j);
+            const float ref_pix = tex2D<float>(ref_image, ref_pt.x + 0.5f, ref_pt.y + 0.5f);
+            const float depth_n = ComputeDepthfromPlaneHypothesis(ref_camera, plane_hypothesis, ref_pt);
+            const float3 Pw_n = Get3DPointonWorld_cu(ref_pt.x, ref_pt.y, depth_n, ref_camera);
+
+            const float spatial_dist_sq = i_sq + static_cast<float>(j * j);
+            const float color_dist = fabsf(ref_pix - patch.center_pix);
+            const float w = expf(-spatial_dist_sq * inv_sigma_spatial_sq - color_dist * inv_sigma_color_sq);
+
+            int k = patch.n++;
+            if (k >= BilateralPatch::MAX_SAMPLES) { patch.n = BilateralPatch::MAX_SAMPLES; break; }
+            patch.ref_pix[k] = ref_pix;
+            patch.world_pt[k] = Pw_n;
+            patch.bw[k] = w;
+        }
+        if (patch.n >= BilateralPatch::MAX_SAMPLES) break;
+    }
+}
+
+// Per-source NCC using precomputed bilateral reference patch.
+__device__ float ComputeNCC_Bilateral(
+    const BilateralPatch& patch,
+    const cudaTextureObject_t src_image, const Camera& src_camera,
+    const PatchMatchParams& params)
+{
+    const float cost_max = 2.0f;
+    const float kMinVar = 1e-5f;
+
+    float sum_bw = 0.0f, sum_r = 0.0f, sum_rr = 0.0f;
+    float sum_s = 0.0f, sum_ss = 0.0f, sum_rs = 0.0f;
+
+    const float src_w = static_cast<float>(src_camera.width);
+    const float src_inv_w = __fdividef(1.0f, src_w);
+
+    for (int k = 0; k < patch.n; ++k) {
+        float2 src_pt;
+        float src_d;
+        ProjectonCamera_cu(patch.world_pt[k], src_camera, src_pt, src_d);
+
+        // Branchless spherical wrapping
+        if (src_camera.model == SPHERE) {
+            src_pt.x -= src_w * floorf(src_pt.x * src_inv_w);
+        }
+
+        // Bounds check
+        if (src_pt.y < 0.0f || src_pt.y >= src_camera.height) continue;
+        if (src_camera.model != SPHERE && (src_pt.x < 0.0f || src_pt.x >= src_camera.width)) continue;
+
+        const float src_pix = tex2D<float>(src_image, src_pt.x + 0.5f, src_pt.y + 0.5f);
+        const float rv = patch.ref_pix[k];
+        const float w = patch.bw[k];
+
+        sum_bw += w;
+        sum_r += w * rv;  sum_rr += w * rv * rv;
+        sum_s += w * src_pix;  sum_ss += w * src_pix * src_pix;
+        sum_rs += w * rv * src_pix;
+    }
+
+    if (sum_bw < 1e-6f) return cost_max;
+    const float ib = 1.0f / sum_bw;
+    const float mr = sum_r * ib, ms = sum_s * ib;
+    const float vr = sum_rr * ib - mr * mr, vs = sum_ss * ib - ms * ms;
+    if (vr < kMinVar || vs < kMinVar) return cost_max;
+    return fmaxf(0.0f, fminf(cost_max, 1.0f - (sum_rs * ib - mr * ms) / sqrtf(vr * vs)));
+}
+
+// Legacy wrapper for single-source calls (e.g., if needed elsewhere)
 __device__ float ComputeBilateralNCC(
     const cudaTextureObject_t ref_image,
     const Camera ref_camera,
@@ -310,111 +392,27 @@ __device__ float ComputeBilateralNCC(
 {
     const float cost_max = 2.0f;
     const int radius = params.patch_size / 2;
-    const float kMinVar = 1e-5f;
 
-    // Early validation with tighter bounds checking
     float depth_ref = ComputeDepthfromPlaneHypothesis(ref_camera, plane_hypothesis, p);
     if (depth_ref <= 0.0f || depth_ref > 1000.0f) return cost_max;
-    
+
     float3 Pw_center = Get3DPointonWorld_cu(p.x, p.y, depth_ref, ref_camera);
-    float2 pt_center; 
+    float2 pt_center;
     float dummy_depth;
     ProjectonCamera_cu(Pw_center, src_camera, pt_center, dummy_depth);
-    
-    // Expanded early exit - check if patch will be mostly out of bounds
-    // For spherical cameras, x wraps around so skip the x-bounds check
+
     if (src_camera.model == SPHERE) {
-        if (pt_center.y < radius || pt_center.y >= src_camera.height - radius) {
+        if (pt_center.y < radius || pt_center.y >= src_camera.height - radius)
             return cost_max;
-        }
     } else {
         if (pt_center.x < radius || pt_center.x >= src_camera.width - radius ||
-            pt_center.y < radius || pt_center.y >= src_camera.height - radius) {
+            pt_center.y < radius || pt_center.y >= src_camera.height - radius)
             return cost_max;
-        }
     }
 
-    // Precompute constants (unchanged from original optimization)
-    const float inv_sigma_spatial_sq = 1.0f / (2.0f * params.sigma_spatial * params.sigma_spatial);
-    const float inv_sigma_color_sq = 1.0f / (2.0f * params.sigma_color * params.sigma_color);
-    const float ref_center_pix = tex2D<float>(ref_image, p.x + 0.5f, p.y + 0.5f);
-
-    // Single precision accumulation (faster than double precision)
-    float sum_ref = 0.0f, sum_ref_ref = 0.0f;
-    float sum_src = 0.0f, sum_src_src = 0.0f;
-    float sum_ref_src = 0.0f, sum_bw = 0.0f;
-
-    // Optimized inner loop with better memory access
-    for (int i = -radius; i <= radius; i += params.radius_increment) {
-        const float i_sq = i * i; // Precompute for spatial distance
-        
-        for (int j = -radius; j <= radius; j += params.radius_increment) {
-            const int2 ref_pt = make_int2(p.x + i, p.y + j);
-
-            // Single texture read for reference
-            const float ref_pix = tex2D<float>(ref_image, ref_pt.x + 0.5f, ref_pt.y + 0.5f);
-            
-            // Optimized 3D point computation
-            const float depth_n = ComputeDepthfromPlaneHypothesis(ref_camera, plane_hypothesis, ref_pt);
-            const float3 Pw_n = Get3DPointonWorld_cu(ref_pt.x, ref_pt.y, depth_n, ref_camera);
-
-            // Single projection computation
-            float2 src_pt; 
-            float src_d;
-            ProjectonCamera_cu(Pw_n, src_camera, src_pt, src_d);
-            
-            // Wrap x-coordinate for spherical cameras before bounds check
-            if (src_camera.model == SPHERE) {
-                const float w = static_cast<float>(src_camera.width);
-                if (src_pt.x < 0.0f) src_pt.x += w;
-                else if (src_pt.x >= w) src_pt.x -= w;
-            }
-
-            // Bounds check (y always checked; x checked for non-spherical)
-            if (src_pt.y < 0.0f || src_pt.y >= src_camera.height) {
-                continue;
-            }
-            if (src_camera.model != SPHERE && (src_pt.x < 0.0f || src_pt.x >= src_camera.width)) {
-                continue;
-            }
-
-            // Single texture read for source
-            const float src_pix = tex2D<float>(src_image, src_pt.x + 0.5f, src_pt.y + 0.5f);
-
-            // Optimized bilateral weight - avoid sqrt in spatial distance
-            const float spatial_dist_sq = i_sq + j * j;
-            const float color_dist = fabsf(ref_pix - ref_center_pix);
-            const float w = expf(-spatial_dist_sq * inv_sigma_spatial_sq - color_dist * inv_sigma_color_sq);
-
-            // Accumulate - using single precision for speed
-            sum_bw      += w;
-            sum_ref     += w * ref_pix;
-            sum_ref_ref += w * ref_pix * ref_pix;
-            sum_src     += w * src_pix;
-            sum_src_src += w * src_pix * src_pix;
-            sum_ref_src += w * ref_pix * src_pix;
-        }
-    }
-
-    // Early exit for insufficient data
-    if (sum_bw < 1e-6f) return cost_max;
-
-    // Optimized normalization and variance computation
-    const float inv_bw = 1.0f / sum_bw;
-    const float mean_ref = sum_ref * inv_bw;
-    const float mean_src = sum_src * inv_bw;
-    const float var_ref = sum_ref_ref * inv_bw - mean_ref * mean_ref;
-    const float var_src = sum_src_src * inv_bw - mean_src * mean_src;
-    
-    if (var_ref < kMinVar || var_src < kMinVar) {
-        return cost_max;
-    }
-
-    const float covar = sum_ref_src * inv_bw - mean_ref * mean_src;
-    const float denom = sqrtf(var_ref * var_src);
-    const float ncc_cost = 1.0f - covar / denom;
-    
-    return fmaxf(0.0f, fminf(cost_max, ncc_cost));
+    BilateralPatch patch;
+    PrecomputeBilateralPatch(ref_image, ref_camera, p, plane_hypothesis, params, patch);
+    return ComputeNCC_Bilateral(patch, src_image, src_camera, params);
 }
 
 // ============================================================================
@@ -451,7 +449,7 @@ __device__ void PrecomputeTangentPatch(
             sd.x *= inv_len; sd.y *= inv_len; sd.z *= inv_len;
 
             float2 rp = DirectionToPixelSpherical(ref_cam, sd);
-            if (rp.x < 0.f) rp.x += w_img; else if (rp.x >= w_img) rp.x -= w_img;
+            rp.x -= w_img * floorf(rp.x * __fdividef(1.0f, w_img));
             if (rp.y < 0.f || rp.y >= ref_cam.height) continue;
             float ref_val = tex2D<float>(ref_image, rp.x + 0.5f, rp.y + 0.5f);
 
@@ -486,6 +484,7 @@ __device__ float ComputeNCC_Tangent(
     const float cost_max = 2.f, kMinVar = 1e-5f;
     float sum_bw=0, sum_r=0, sum_rr=0, sum_s=0, sum_ss=0, sum_rs=0;
     const float src_w = static_cast<float>(src_cam.width);
+    const float src_inv_w = __fdividef(1.0f, src_w);
     const float pole_rows = (src_cam.model == SPHERE)
         ? src_w * 0.5f * (5.f / 180.f) : 0.f;
 
@@ -493,7 +492,7 @@ __device__ float ComputeNCC_Tangent(
         float2 sp; float sd;
         ProjectonCamera_cu(patch.world_pt[k], src_cam, sp, sd);
         if (src_cam.model == SPHERE) {
-            if (sp.x < 0.f) sp.x += src_w; else if (sp.x >= src_w) sp.x -= src_w;
+            sp.x -= src_w * floorf(sp.x * src_inv_w);
             if (sp.y < pole_rows || sp.y >= src_cam.height - pole_rows) continue;
         }
         if (sp.y < 0.f || sp.y >= src_cam.height) continue;
@@ -537,8 +536,10 @@ __device__ float ComputeMultiViewInitialCostandSelectedViews(const cudaTextureOb
             }
         }
     } else {
+        BilateralPatch patch;
+        PrecomputeBilateralPatch(images[0], cameras[0], p, plane_hypothesis, params, patch);
         for (int i = 1; i < params.num_images; ++i) {
-            float c = ComputeBilateralNCC(images[0], cameras[0], images[i], cameras[i], p, plane_hypothesis, params);
+            float c = ComputeNCC_Bilateral(patch, images[i], cameras[i], params);
             cost_vector[i - 1] = c;
             cost_vector_copy[i - 1] = c;
             cost_count++;
@@ -577,8 +578,10 @@ __device__ void ComputeMultiViewCostVector(const cudaTextureObject_t *images, co
         for (int i = 1; i < params.num_images; ++i)
             cost_vector[i-1] = ComputeNCC_Tangent(patch, images[i], cameras[i], params);
     } else {
+        BilateralPatch patch;
+        PrecomputeBilateralPatch(images[0], cameras[0], p, plane_hypothesis, params, patch);
         for (int i = 1; i < params.num_images; ++i)
-            cost_vector[i - 1] = ComputeBilateralNCC(images[0], cameras[0], images[i], cameras[i], p, plane_hypothesis, params);
+            cost_vector[i-1] = ComputeNCC_Bilateral(patch, images[i], cameras[i], params);
     }
 }
 
@@ -607,8 +610,8 @@ __device__ float ComputeGeomConsistencyCost(const cudaTextureObject_t depth_imag
     float diff_col = p.x - backward_point.x;
     if (ref_camera.model == SPHERE) {
         const float w = static_cast<float>(ref_camera.width);
-        if (diff_col > w * 0.5f) diff_col -= w;
-        else if (diff_col < -w * 0.5f) diff_col += w;
+        // Branchless shortest-path wrapping: wrap into [-w/2, w/2)
+        diff_col -= w * floorf((diff_col + w * 0.5f) * __fdividef(1.0f, w));
     }
     const float diff_row = p.y - backward_point.y;
     return min(max_cost, sqrt(diff_col * diff_col + diff_row * diff_row));
@@ -1201,6 +1204,8 @@ __device__ void CheckerboardPropagation(
 
     // Evaluate 8 checkerboard neighbors (near/far x up/down/left/right).
     // Spherical cameras: horizontal neighbors always valid due to wrapping.
+    // With --maxrregcount=96 + __launch_bounds__(512,2), the compiler will
+    // naturally spill this large array to L1-cached local memory.
     float cost_array[8][32];
     // Initialize cost array
     for (int i = 0; i < 8; ++i) {
@@ -1213,18 +1218,31 @@ __device__ void CheckerboardPropagation(
     int num_valid_pixels = 0;
     const int positions[8] = {up_near, up_far, down_near, down_far, left_near, left_far, right_near, right_far};
 
+    // Neighbor cost caching: skip expensive NCC for converged neighbors (iter > 0).
+    // A neighbor is "converged" if its cost hasn't changed between iterations.
+    // In that case, fill cost_array with the neighbor's stored cost as proxy.
+    #define EVAL_NEIGHBOR(dir_idx, neighbor_pos) do { \
+        if (iter > 0 && (neighbor_pos) >= 0 && (neighbor_pos) < width * height && \
+            fabsf(costs[neighbor_pos] - pre_costs[neighbor_pos]) < 0.001f) { \
+            const float proxy = costs[neighbor_pos]; \
+            for (int _v = 0; _v < 32; ++_v) cost_array[dir_idx][_v] = proxy; \
+        } else { \
+            ComputeMultiViewCostVector(images, cameras, p, plane_hypotheses[neighbor_pos], cost_array[dir_idx], params); \
+        } \
+    } while(0)
+
     if (p.y > 2) {
         flag[1] = true;
         num_valid_pixels++;
         up_far = FindBestNeighborInDirection(costs, center, width, height, p, 1, up_far);
-        ComputeMultiViewCostVector(images, cameras, p, plane_hypotheses[up_far], cost_array[1], params);
+        EVAL_NEIGHBOR(1, up_far);
     }
 
     if (p.y < height - 3) {
         flag[3] = true;
         num_valid_pixels++;
         down_far = FindBestNeighborInDirection(costs, center, width, height, p, 3, down_far);
-        ComputeMultiViewCostVector(images, cameras, p, plane_hypotheses[down_far], cost_array[3], params);
+        EVAL_NEIGHBOR(3, down_far);
     }
 
     if (p.x > 2 || is_sphere) {
@@ -1233,7 +1251,7 @@ __device__ void CheckerboardPropagation(
         if (p.x > 2) {
             left_far = FindBestNeighborInDirection(costs, center, width, height, p, 5, left_far);
         }
-        ComputeMultiViewCostVector(images, cameras, p, plane_hypotheses[left_far], cost_array[5], params);
+        EVAL_NEIGHBOR(5, left_far);
     }
 
     if (p.x < width - 3 || is_sphere) {
@@ -1242,21 +1260,21 @@ __device__ void CheckerboardPropagation(
         if (p.x < width - 3) {
             right_far = FindBestNeighborInDirection(costs, center, width, height, p, 7, right_far);
         }
-        ComputeMultiViewCostVector(images, cameras, p, plane_hypotheses[right_far], cost_array[7], params);
+        EVAL_NEIGHBOR(7, right_far);
     }
 
     if (p.y > 0) {
         flag[0] = true;
         num_valid_pixels++;
         up_near = FindBestNeighborInDirection(costs, center, width, height, p, 0, up_near);
-        ComputeMultiViewCostVector(images, cameras, p, plane_hypotheses[up_near], cost_array[0], params);
+        EVAL_NEIGHBOR(0, up_near);
     }
 
     if (p.y < height - 1) {
         flag[2] = true;
         num_valid_pixels++;
         down_near = FindBestNeighborInDirection(costs, center, width, height, p, 2, down_near);
-        ComputeMultiViewCostVector(images, cameras, p, plane_hypotheses[down_near], cost_array[2], params);
+        EVAL_NEIGHBOR(2, down_near);
     }
 
     if (p.x > 0 || is_sphere) {
@@ -1265,7 +1283,7 @@ __device__ void CheckerboardPropagation(
         if (p.x > 0) {
             left_near = FindBestNeighborInDirection(costs, center, width, height, p, 4, left_near);
         }
-        ComputeMultiViewCostVector(images, cameras, p, plane_hypotheses[left_near], cost_array[4], params);
+        EVAL_NEIGHBOR(4, left_near);
     }
 
     if (p.x < width - 1 || is_sphere) {
@@ -1274,8 +1292,10 @@ __device__ void CheckerboardPropagation(
         if (p.x < width - 1) {
             right_near = FindBestNeighborInDirection(costs, center, width, height, p, 6, right_near);
         }
-        ComputeMultiViewCostVector(images, cameras, p, plane_hypotheses[right_near], cost_array[6], params);
+        EVAL_NEIGHBOR(6, right_near);
     }
+
+    #undef EVAL_NEIGHBOR
 
     // Update positions array with safe values
     const int final_positions[8] = {up_near, up_far, down_near, down_far, left_near, left_far, right_near, right_far};
@@ -1429,7 +1449,8 @@ __device__ void CheckerboardPropagation(
 }
 
 template<bool UseMask>
-__global__ void BlackPixelUpdate(cudaTextureObjects *texture_objects, cudaTextureObjects *texture_depths, Camera *cameras, float4 *plane_hypotheses, float *costs,  float *pre_costs,  RNGState *rand_states, unsigned int *selected_views, float4 *prior_planes, unsigned int *plane_masks, const uint8_t *ref_mask, const PatchMatchParams params, const int iter)
+__global__ void __launch_bounds__(512, 2)
+BlackPixelUpdate(cudaTextureObjects *texture_objects, cudaTextureObjects *texture_depths, Camera *cameras, float4 *plane_hypotheses, float *costs,  float *pre_costs,  RNGState *rand_states, unsigned int *selected_views, float4 *prior_planes, unsigned int *plane_masks, const uint8_t *ref_mask, const PatchMatchParams params, const int iter)
 {
     // Coalesced: all threads in a warp access the same row, stride-2 columns
     const int tx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1442,7 +1463,8 @@ __global__ void BlackPixelUpdate(cudaTextureObjects *texture_objects, cudaTextur
 }
 
 template<bool UseMask>
-__global__ void RedPixelUpdate(cudaTextureObjects *texture_objects, cudaTextureObjects *texture_depths, Camera *cameras, float4 *plane_hypotheses, float *costs,  float *pre_costs, RNGState *rand_states, unsigned int *selected_views, float4 *prior_planes, unsigned int *plane_masks, const uint8_t *ref_mask, const PatchMatchParams params, const int iter)
+__global__ void __launch_bounds__(512, 2)
+RedPixelUpdate(cudaTextureObjects *texture_objects, cudaTextureObjects *texture_depths, Camera *cameras, float4 *plane_hypotheses, float *costs,  float *pre_costs, RNGState *rand_states, unsigned int *selected_views, float4 *prior_planes, unsigned int *plane_masks, const uint8_t *ref_mask, const PatchMatchParams params, const int iter)
 {
     // Coalesced: all threads in a warp access the same row, stride-2 columns
     const int tx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1917,6 +1939,104 @@ __global__ void ComputePriorPlanesKernel(
     }
 
     prior_planes[center] = plane;
+}
+
+// GPU-side grid triangulation: replaces CPU Delaunay with regular grid connectivity.
+// Each valid pair of adjacent 5x5 blocks forms 2 triangles (a quad split diagonally).
+// Eliminates the GPU→CPU→GPU round-trip for Subdiv2D.
+__global__ void GridTriangulationKernel(
+    const int2* support_points, const int num_support_points,
+    const float* costs, int width, int height, int block_size,
+    int2* triangle_vertices, int* num_triangles, int max_triangles)
+{
+    // Each thread handles one grid cell (bx, by) and creates up to 2 triangles
+    // connecting (bx,by), (bx+1,by), (bx,by+1), (bx+1,by+1)
+    const int grid_w = (width + block_size - 1) / block_size;
+    const int grid_h = (height + block_size - 1) / block_size;
+
+    const int bx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int by = blockIdx.y * blockDim.y + threadIdx.y;
+    if (bx >= grid_w - 1 || by >= grid_h - 1) return;
+
+    // Map grid cell (bx,by) to support point index
+    // Support points are stored linearly: index = by * grid_w + bx
+    const int idx00 = by * grid_w + bx;
+    const int idx10 = by * grid_w + (bx + 1);
+    const int idx01 = (by + 1) * grid_w + bx;
+    const int idx11 = (by + 1) * grid_w + (bx + 1);
+
+    // Check all 4 corners are valid support points (within range)
+    if (idx00 >= num_support_points || idx10 >= num_support_points ||
+        idx01 >= num_support_points || idx11 >= num_support_points) return;
+
+    const int2 p00 = support_points[idx00];
+    const int2 p10 = support_points[idx10];
+    const int2 p01 = support_points[idx01];
+    const int2 p11 = support_points[idx11];
+
+    // Validate all points are within image bounds
+    if (p00.x < 0 || p00.x >= width || p00.y < 0 || p00.y >= height) return;
+    if (p10.x < 0 || p10.x >= width || p10.y < 0 || p10.y >= height) return;
+    if (p01.x < 0 || p01.x >= width || p01.y < 0 || p01.y >= height) return;
+    if (p11.x < 0 || p11.x >= width || p11.y < 0 || p11.y >= height) return;
+
+    // Validate costs at all corners (only connect blocks with good matches)
+    const float cost_threshold = 0.1f;
+    if (costs[p00.y * width + p00.x] >= cost_threshold) return;
+    if (costs[p10.y * width + p10.x] >= cost_threshold) return;
+    if (costs[p01.y * width + p01.x] >= cost_threshold) return;
+    if (costs[p11.y * width + p11.x] >= cost_threshold) return;
+
+    // Emit 2 triangles for this quad
+    int tri_base = atomicAdd(num_triangles, 2);
+    if (tri_base + 1 >= max_triangles) return;
+
+    // Triangle 1: p00, p10, p01
+    triangle_vertices[(tri_base + 0) * 3 + 0] = p00;
+    triangle_vertices[(tri_base + 0) * 3 + 1] = p10;
+    triangle_vertices[(tri_base + 0) * 3 + 2] = p01;
+
+    // Triangle 2: p10, p11, p01
+    triangle_vertices[(tri_base + 1) * 3 + 0] = p10;
+    triangle_vertices[(tri_base + 1) * 3 + 1] = p11;
+    triangle_vertices[(tri_base + 1) * 3 + 2] = p01;
+}
+
+// Regular grid support point extraction: one point per block, ordered by grid position.
+// Unlike ExtractSupportPointsKernel which uses atomicAdd (unordered), this produces
+// support points in a deterministic grid layout needed by GridTriangulationKernel.
+__global__ void ExtractGridSupportPointsKernel(
+    const float4* plane_hypotheses, const float* costs,
+    int width, int height, int block_size,
+    int2* support_points_out, int grid_w, int grid_h)
+{
+    const int bx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int by = blockIdx.y * blockDim.y + threadIdx.y;
+    if (bx >= grid_w || by >= grid_h) return;
+
+    const int x0 = bx * block_size;
+    const int y0 = by * block_size;
+    const int x1 = min(x0 + block_size, width);
+    const int y1 = min(y0 + block_size, height);
+
+    float min_cost = 2.0f;
+    int best_x = (x0 + x1) / 2;  // Default to center of block
+    int best_y = (y0 + y1) / 2;
+
+    for (int y = y0; y < y1; y++) {
+        for (int x = x0; x < x1; x++) {
+            float cost = costs[y * width + x];
+            if (cost < min_cost) {
+                min_cost = cost;
+                best_x = x;
+                best_y = y;
+            }
+        }
+    }
+
+    const int idx = by * grid_w + bx;
+    // Store best point (or block center if no good match found)
+    support_points_out[idx] = make_int2(best_x, best_y);
 }
 
 // ── End Batch Planar Prior Kernels ────────────────────────────────────────

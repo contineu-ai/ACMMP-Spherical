@@ -119,10 +119,15 @@ public:
     SphericalLUT* FindClosestLUT(int width, int height, float cx, float cy);
     void FreeAllLUTs();
     size_t GetTotalMemoryUsage() const;
+    std::vector<ResolutionKey> GetResolutions() const;
 };
 
 void InitializeLUTManager();
 void FreeLUTManager();
 extern SphericalLUTManager* g_lut_manager;
+
+// Multi-GPU LUT replication: creates independent LUT managers on devices 1..num_gpus-1
+void ReplicateLUTsToAllDevices(int num_gpus);
+void FreeAllDeviceLUTs();
 
 #endif // SPHERICAL_LUT_MULTIRES_H

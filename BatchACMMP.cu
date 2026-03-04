@@ -3,6 +3,7 @@
 // ========================================
 
 #include "BatchACMMP.h"
+#include "SphericalLUT_MultiRes.h"
 #include "CompressedDMB.h"
 #include <sys/stat.h>
 #include <iostream>
@@ -27,6 +28,16 @@ __global__ void ComputePriorPlanesKernel(
     const int2* triangle_vertices, unsigned int* plane_masks,
     float4* prior_planes, float depth_min, float depth_max,
     int width, int height);
+
+__global__ void ExtractGridSupportPointsKernel(
+    const float4* plane_hypotheses, const float* costs,
+    int width, int height, int block_size,
+    int2* support_points_out, int grid_w, int grid_h);
+
+__global__ void GridTriangulationKernel(
+    const int2* support_points, const int num_support_points,
+    const float* costs, int width, int height, int block_size,
+    int2* triangle_vertices, int* num_triangles, int max_triangles);
 
 // ── ImageCache implementation ──────────────────────────────────────────────
 ImageCache::ImageCache(size_t max_entries, const std::string& dense_folder, bool has_masks)
@@ -119,11 +130,12 @@ void ProblemGPUResources::allocate(int max_width, int max_height, int max_images
     // This function is called once per resource object when the pool is initialized.
     allocated_images = max_images;
 
-    // Allocate arrays for images and depths using the maximum possible dimensions.
+    // Allocate arrays for images (FP16 for 2x texture cache) and depths (FP32 for precision).
     for (int i = 0; i < max_images; ++i) {
-        cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc(32, 0, 0, 0, cudaChannelFormatKindFloat);
-        CUDA_CHECK(cudaMallocArray(&cuArray[i], &channelDesc, max_width, max_height));
-        CUDA_CHECK(cudaMallocArray(&cuDepthArray[i], &channelDesc, max_width, max_height));
+        cudaChannelFormatDesc imageChannelDesc = cudaCreateChannelDesc(16, 0, 0, 0, cudaChannelFormatKindFloat);
+        CUDA_CHECK(cudaMallocArray(&cuArray[i], &imageChannelDesc, max_width, max_height));
+        cudaChannelFormatDesc depthChannelDesc = cudaCreateChannelDesc(32, 0, 0, 0, cudaChannelFormatKindFloat);
+        CUDA_CHECK(cudaMallocArray(&cuDepthArray[i], &depthChannelDesc, max_width, max_height));
     }
 
     // Allocate all other required device memory buffers.
@@ -209,23 +221,30 @@ void BatchACMMP::initializeResourcePool() {
     streams.resize(max_concurrent_problems);
     resource_pool.resize(max_concurrent_problems);
 
-    int prio_low=0, prio_high=0;
-    CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&prio_low, &prio_high));
-    
+    // Distribute resources across all GPUs in round-robin fashion
     for (size_t i = 0; i < max_concurrent_problems; ++i) {
+        int gpu_id = static_cast<int>(i) % num_gpus;
+        CUDA_CHECK(cudaSetDevice(gpu_id));
+
+        int prio_low=0, prio_high=0;
+        CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&prio_low, &prio_high));
         CUDA_CHECK(cudaStreamCreateWithPriority(&streams[i], cudaStreamNonBlocking, prio_high));
 
         std::unique_ptr<ProblemGPUResources> res(new ProblemGPUResources());
         res->stream_id = (int)i;
         res->stream = streams[i];
+        res->device_id = gpu_id;
 
-        // Allocate the GPU memory for this resource object.
+        // Allocate the GPU memory on this device.
         res->allocate(max_width, max_height, max_images);
 
         available_resources.push(res.get());
         resource_pool[i] = std::move(res);
     }
-    
+
+    // Restore to device 0
+    CUDA_CHECK(cudaSetDevice(0));
+
     // Launch GPU worker threads.
     gpu_worker_threads.reserve(max_concurrent_problems);
     for (size_t i = 0; i < max_concurrent_problems; ++i) {
@@ -331,7 +350,12 @@ BatchACMMP::BatchACMMP(const std::string& dense_folder_,
       geom_consistency(geom_consistency_), planar_prior(planar_prior_),
       hierarchy(hierarchy_), multi_geometry(multi_geometry_),mask_disk_queue_size(mask_disk_queue_size_) 
 {
-    // Device properties
+    // Multi-GPU detection
+    CUDA_CHECK(cudaGetDeviceCount(&num_gpus));
+    num_gpus = std::max(1, num_gpus);
+    std::cout << "[BatchACMMP] Detected " << num_gpus << " GPU(s)" << std::endl;
+
+    // Use device 0 for initial sizing
     cudaDeviceProp prop{};
     CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
     checkCudaLimits();
@@ -339,25 +363,32 @@ BatchACMMP::BatchACMMP(const std::string& dense_folder_,
     memory_per_problem = problems.empty() ? (size_t)500 * 1024 * 1024
                                           : estimateMemoryPerProblem(problems[0]);
 
-    // Calculate optimal GPU concurrency
+    // Calculate per-GPU concurrency, then multiply by num_gpus
     size_t usable_gpu = size_t(double(available_gpu_memory) * 0.75);
     size_t by_gpu_mem = std::max<size_t>(1, usable_gpu / memory_per_problem);
-    
+
     // Hardware-based limits: ~6 SMs per concurrent problem for good occupancy
     size_t hardware_threads = std::thread::hardware_concurrency();
     size_t by_sm = std::max<size_t>(2, prop.multiProcessorCount / 6);
 
-    max_concurrent_problems = std::min({by_gpu_mem, by_sm, size_t(24)});
-    max_concurrent_problems = std::max<size_t>(1, max_concurrent_problems);
-    
+    size_t per_gpu_concurrent = std::min({by_gpu_mem, by_sm, size_t(24)});
+    per_gpu_concurrent = std::max<size_t>(1, per_gpu_concurrent);
+    max_concurrent_problems = per_gpu_concurrent * num_gpus;
+
     // Separate disk writer threads - optimize for disk I/O
     num_disk_writers = std::min<size_t>(4, std::max<size_t>(2, hardware_threads / 4));
-    
+
     std::cout << "[BatchACMMP] Configuration:" << std::endl;
-    std::cout << "  GPU Streams: " << max_concurrent_problems << std::endl;
+    std::cout << "  GPUs: " << num_gpus << " (" << per_gpu_concurrent << " streams each)" << std::endl;
+    std::cout << "  GPU Streams (total): " << max_concurrent_problems << std::endl;
     std::cout << "  Disk Writers: " << num_disk_writers << std::endl;
-    std::cout << "  GPU Memory: " << (available_gpu_memory/(1024*1024)) << "MB free, "
+    std::cout << "  GPU Memory (device 0): " << (available_gpu_memory/(1024*1024)) << "MB free, "
               << (memory_per_problem/(1024*1024)) << "MB/problem" << std::endl;
+
+    // Replicate LUTs to all GPU devices (device 0 already has them from main)
+    if (num_gpus > 1) {
+        ReplicateLUTsToAllDevices(num_gpus);
+    }
 
     // Initialize image cache: detect mask folder
     std::string mask_dir = dense_folder + "/masks";
@@ -401,6 +432,7 @@ BatchACMMP::~BatchACMMP() {
     // Step 4: Clean up GPU resources FIRST (they may reference streams)
     for (auto& res : resource_pool) {
         if (res && res->stream) {
+            cudaSetDevice(res->device_id);
             cudaStreamSynchronize(res->stream);  // sync per stream
             res->cleanup();
         }
@@ -451,7 +483,7 @@ size_t BatchACMMP::estimateMemoryPerProblem(const Problem& problem) {
     const size_t W = cam.width, H = cam.height;
     const size_t N = 1 + problem.src_image_ids.size();
 
-    size_t textures = N * W * H * (sizeof(float) + sizeof(float)); // images + depths
+    size_t textures = N * W * H * (sizeof(uint16_t) + sizeof(float)); // images (FP16) + depths (FP32)
     size_t working = W * H * (2*sizeof(float4) + 3*sizeof(float)); // hypotheses + costs
     size_t misc = W * H * (sizeof(RNGState) + sizeof(unsigned int));
     size_t masks = W * H * sizeof(uint8_t);                           // ref_mask_cuda
@@ -612,8 +644,8 @@ void BatchACMMP::processProblemOnStream(int problem_idx, ProblemGPUResources* re
     const Problem& problem = all_problems[problem_idx];
     cudaStream_t stream = resources->stream;
     
-    // Set the device explicitly for this thread.
-    cudaSetDevice(0);
+    // Set the device for this resource's GPU (multi-GPU support).
+    cudaSetDevice(resources->device_id);
     
     active_gpu_problems_.fetch_add(1);
     
@@ -648,91 +680,68 @@ void BatchACMMP::processProblemOnStream(int problem_idx, ProblemGPUResources* re
                 // ═══ PASS 1: initial depth estimates ═══
                 acmmp.RunPatchMatch(resources, /*skip_host_download=*/true);
 
-                // GPU: extract support points
-                const int max_sp = ((width + 4) / 5) * ((height + 4) / 5);
-                CUDA_CHECK(cudaMemsetAsync(resources->num_support_points_cuda, 0, sizeof(int), stream));
-                dim3 sp_grid((width + 4) / 5, (height + 4) / 5);
-                dim3 sp_block(1, 1);
-                ExtractSupportPointsKernel<<<sp_grid, sp_block, 0, stream>>>(
-                    resources->plane_hypotheses_cuda, resources->costs_cuda,
-                    width, height,
-                    resources->support_points_cuda, resources->num_support_points_cuda, max_sp);
+                // GPU-only planar prior pipeline (no CPU sync point)
+                const int block_size = 5;
+                const int grid_w = (width + block_size - 1) / block_size;
+                const int grid_h = (height + block_size - 1) / block_size;
+                const int num_grid_pts = grid_w * grid_h;
+                const int max_tris = num_grid_pts * 2;
 
-                // D2H: count first
+                // Step 1: Extract grid-ordered support points (GPU)
+                {
+                    dim3 eg_block(16, 16);
+                    dim3 eg_grid((grid_w + eg_block.x - 1) / eg_block.x,
+                                 (grid_h + eg_block.y - 1) / eg_block.y);
+                    ExtractGridSupportPointsKernel<<<eg_grid, eg_block, 0, stream>>>(
+                        resources->plane_hypotheses_cuda, resources->costs_cuda,
+                        width, height, block_size,
+                        resources->support_points_cuda, grid_w, grid_h);
+                }
+
+                // Step 2: Grid triangulation (GPU) — no D→H→D round-trip
+                CUDA_CHECK(cudaMemsetAsync(resources->num_support_points_cuda, 0, sizeof(int), stream));
+                {
+                    dim3 gt_block(16, 16);
+                    dim3 gt_grid((grid_w - 1 + gt_block.x - 1) / gt_block.x,
+                                 (grid_h - 1 + gt_block.y - 1) / gt_block.y);
+                    GridTriangulationKernel<<<gt_grid, gt_block, 0, stream>>>(
+                        resources->support_points_cuda, num_grid_pts,
+                        resources->costs_cuda, width, height, block_size,
+                        resources->triangle_vertices_cuda, resources->num_support_points_cuda, max_tris);
+                }
+
+                // Step 3: Get triangle count (need it for rasterization launch)
                 CUDA_CHECK(cudaMemcpyAsync(resources->num_support_points_pinned,
                                            resources->num_support_points_cuda,
                                            sizeof(int), cudaMemcpyDeviceToHost, stream));
                 CUDA_CHECK(cudaStreamSynchronize(stream));
-                int num_pts = std::min(*resources->num_support_points_pinned, max_sp);
+                int num_valid_tris = std::min(*resources->num_support_points_pinned, max_tris);
 
-                if (num_pts > 2) {
-                    // D2H: support points
-                    CUDA_CHECK(cudaMemcpyAsync(resources->support_points_pinned,
-                                               resources->support_points_cuda,
-                                               sizeof(int2) * num_pts, cudaMemcpyDeviceToHost, stream));
-                    CUDA_CHECK(cudaStreamSynchronize(stream));
+                if (num_valid_tris > 0) {
+                    // Step 4: Rasterize triangles → plane_masks (GPU)
+                    CUDA_CHECK(cudaMemsetAsync(resources->plane_masks_cuda, 0,
+                                               sizeof(unsigned int) * width * height, stream));
+                    RasterizeTrianglesKernel<<<(num_valid_tris + 255) / 256, 256, 0, stream>>>(
+                        resources->triangle_vertices_cuda, num_valid_tris,
+                        resources->plane_masks_cuda, width, height);
 
-                    // CPU: Delaunay triangulation
-                    std::vector<cv::Point> support2DPoints(num_pts);
-                    for (int i = 0; i < num_pts; i++)
-                        support2DPoints[i] = cv::Point(resources->support_points_pinned[i].x,
-                                                       resources->support_points_pinned[i].y);
-                    cv::Rect imageRC(0, 0, width, height);
-                    auto triangles = acmmp.DelaunayTriangulation(imageRC, support2DPoints);
+                    // Step 5: Compute prior planes from triangulated depths (GPU)
+                    float dmin = acmmp.GetMinDepth();
+                    float dmax = acmmp.GetMaxDepth();
+                    dim3 pp_block(16, 16);
+                    dim3 pp_grid((width + pp_block.x - 1) / pp_block.x,
+                                 (height + pp_block.y - 1) / pp_block.y);
+                    ComputePriorPlanesKernel<<<pp_grid, pp_block, 0, stream>>>(
+                        resources->plane_hypotheses_cuda, resources->cameras_cuda,
+                        resources->triangle_vertices_cuda, resources->plane_masks_cuda,
+                        resources->prior_planes_cuda,
+                        dmin, dmax, width, height);
 
-                    // Filter OOB triangles and pack vertices
-                    std::vector<int2> tri_verts;
-                    tri_verts.reserve(triangles.size() * 3);
-                    for (const auto& tr : triangles) {
-                        if (imageRC.contains(tr.pt1) && imageRC.contains(tr.pt2) && imageRC.contains(tr.pt3)) {
-                            tri_verts.push_back(make_int2(tr.pt1.x, tr.pt1.y));
-                            tri_verts.push_back(make_int2(tr.pt2.x, tr.pt2.y));
-                            tri_verts.push_back(make_int2(tr.pt3.x, tr.pt3.y));
-                        }
-                    }
-                    int num_valid_tris = (int)tri_verts.size() / 3;
-
-                    if (num_valid_tris > 0) {
-                        // H2D: triangle vertices
-                        CUDA_CHECK(cudaMemcpyAsync(resources->triangle_vertices_cuda, tri_verts.data(),
-                                                   sizeof(int2) * tri_verts.size(), cudaMemcpyHostToDevice, stream));
-
-                        // GPU: rasterize triangles → plane_masks
-                        CUDA_CHECK(cudaMemsetAsync(resources->plane_masks_cuda, 0,
-                                                   sizeof(unsigned int) * width * height, stream));
-                        RasterizeTrianglesKernel<<<(num_valid_tris + 255) / 256, 256, 0, stream>>>(
-                            resources->triangle_vertices_cuda, num_valid_tris,
-                            resources->plane_masks_cuda, width, height);
-
-                        // GPU: compute prior planes from triangulated depths
-                        float dmin = acmmp.GetMinDepth();
-                        float dmax = acmmp.GetMaxDepth();
-                        dim3 pp_block(16, 16);
-                        dim3 pp_grid((width + pp_block.x - 1) / pp_block.x,
-                                     (height + pp_block.y - 1) / pp_block.y);
-                        ComputePriorPlanesKernel<<<pp_grid, pp_block, 0, stream>>>(
-                            resources->plane_hypotheses_cuda, resources->cameras_cuda,
-                            resources->triangle_vertices_cuda, resources->plane_masks_cuda,
-                            resources->prior_planes_cuda,
-                            dmin, dmax, width, height);
-
-                        // Upload plane_masks and prior_planes to GPU is already done (they're on GPU)
-                        // Upload plane_masks_cuda and prior_planes_cuda handles to the device struct
-                        // (RunPatchMatch reads from res->plane_masks_cuda and res->prior_planes_cuda directly)
-
-                        // ═══ PASS 2: prior-assisted PatchMatch ═══
-                        acmmp.SetPlanarPriorParams();
-                        acmmp.RunPatchMatch(resources, /*skip_host_download=*/false);
-                    } else {
-                        // No valid triangles: download Pass 1 results
-                        CUDA_CHECK(cudaMemcpyAsync(resources->planes_host_pinned, resources->plane_hypotheses_cuda,
-                                                   sizeof(float4) * width * height, cudaMemcpyDeviceToHost, stream));
-                        CUDA_CHECK(cudaMemcpyAsync(resources->costs_host_pinned, resources->costs_cuda,
-                                                   sizeof(float) * width * height, cudaMemcpyDeviceToHost, stream));
-                        CUDA_CHECK(cudaStreamSynchronize(stream));
-                    }
+                    // ═══ PASS 2: prior-assisted PatchMatch ═══
+                    acmmp.SetPlanarPriorParams();
+                    acmmp.RunPatchMatch(resources, /*skip_host_download=*/false);
                 } else {
-                    // Too few support points: download Pass 1 results
+                    // No valid triangles: download Pass 1 results
                     CUDA_CHECK(cudaMemcpyAsync(resources->planes_host_pinned, resources->plane_hypotheses_cuda,
                                                sizeof(float4) * width * height, cudaMemcpyDeviceToHost, stream));
                     CUDA_CHECK(cudaMemcpyAsync(resources->costs_host_pinned, resources->costs_cuda,

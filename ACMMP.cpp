@@ -1,6 +1,7 @@
 #include "ACMMP.h"
 #include "BatchACMMP.h"
 #include <cmath>
+#include <cuda_fp16.h>
 
 #include <cstdarg>
 
@@ -951,8 +952,11 @@ void ACMMP::CudaSpaceInitialization(const std::string &dense_folder, const Probl
         int rows = images[i].rows;
         int cols = images[i].cols;
 
-        // Always copy image data to array
-        CUDA_CHECK(cudaMemcpy2DToArrayAsync(res->cuArray[i], 0, 0, images[i].ptr<float>(), images[i].step[0], cols * sizeof(float), rows, cudaMemcpyHostToDevice, s));
+        // Convert image to FP16 for 2x texture cache utilization.
+        // tex2D<float>() auto-converts FP16 to FP32 on read — zero kernel changes needed.
+        cv::Mat half_img;
+        images[i].convertTo(half_img, CV_16FC1);
+        CUDA_CHECK(cudaMemcpy2DToArrayAsync(res->cuArray[i], 0, 0, half_img.ptr<uint16_t>(), half_img.step[0], cols * sizeof(uint16_t), rows, cudaMemcpyHostToDevice, s));
 
         // Skip texture creation if already created in allocate() (batch path)
         if (!res->textures_created) {

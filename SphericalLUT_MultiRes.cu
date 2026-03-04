@@ -387,6 +387,15 @@ size_t SphericalLUTManager::GetTotalMemoryUsage() const {
     return total;
 }
 
+std::vector<ResolutionKey> SphericalLUTManager::GetResolutions() const {
+    std::vector<ResolutionKey> keys;
+    keys.reserve(lut_map.size());
+    for (const auto& pair : lut_map) {
+        keys.push_back(pair.first);
+    }
+    return keys;
+}
+
 // Global functions
 void InitializeLUTManager() {
     if (g_lut_manager == nullptr) {
@@ -401,4 +410,62 @@ void FreeLUTManager() {
         g_lut_manager = nullptr;
         std::cout << "Optimized LUT Manager freed" << std::endl;
     }
+}
+
+// ============================================================================
+// MULTI-GPU LUT REPLICATION
+// ============================================================================
+
+// Per-device LUT managers for devices 1..N-1 (device 0 uses g_lut_manager)
+static std::vector<SphericalLUTManager*> g_device_lut_managers;
+
+void ReplicateLUTsToAllDevices(int num_gpus) {
+    if (num_gpus <= 1 || g_lut_manager == nullptr) return;
+
+    // Skip if already replicated (called from multiple BatchACMMP constructions)
+    if (!g_device_lut_managers.empty()) return;
+
+    // Get resolutions from the primary manager (device 0)
+    std::vector<ResolutionKey> resolutions = g_lut_manager->GetResolutions();
+    if (resolutions.empty()) return;
+
+    int orig_device;
+    cudaGetDevice(&orig_device);
+
+    g_device_lut_managers.resize(num_gpus - 1, nullptr);
+
+    for (int d = 1; d < num_gpus; ++d) {
+        cudaSetDevice(d);
+
+        // Create a fresh manager on this device (allocates pool + inverse trig LUTs)
+        SphericalLUTManager* mgr = new SphericalLUTManager();
+
+        // Create all LUTs for the same resolutions (init kernels run on device d)
+        for (const auto& res : resolutions) {
+            mgr->GetOrCreateLUT(res.width, res.height, res.cx, res.cy);
+        }
+
+        g_device_lut_managers[d - 1] = mgr;
+        std::cout << "[LUT] Replicated " << resolutions.size() << " LUTs to device " << d
+                  << " (" << mgr->GetTotalMemoryUsage() / (1024.0 * 1024.0) << " MB)" << std::endl;
+    }
+
+    cudaSetDevice(orig_device);
+}
+
+void FreeAllDeviceLUTs() {
+    int orig_device;
+    cudaGetDevice(&orig_device);
+
+    for (size_t i = 0; i < g_device_lut_managers.size(); ++i) {
+        if (g_device_lut_managers[i]) {
+            cudaSetDevice(static_cast<int>(i) + 1);
+            delete g_device_lut_managers[i];
+            g_device_lut_managers[i] = nullptr;
+        }
+    }
+    g_device_lut_managers.clear();
+
+    cudaSetDevice(orig_device);
+    std::cout << "[LUT] Freed all device LUT replicas" << std::endl;
 }

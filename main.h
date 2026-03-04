@@ -133,6 +133,8 @@ void JointBilateralUpsampling(const std::string& dense_folder,
 
 extern void InitializeLUTManager();
 extern void FreeLUTManager();
+extern void ReplicateLUTsToAllDevices(int num_gpus);
+extern void FreeAllDeviceLUTs();
 
 
 

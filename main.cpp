@@ -740,11 +740,13 @@ int main(int argc, char** argv)
         max_num_downscale--;
     }
 
+    // Free LUTs before fusion - they're not needed and consume significant GPU memory
+    FreeAllDeviceLUTs();
+    FreeLUTManager();
+    cudaDeviceSynchronize();
+
     geom_consistency = true;
     RunFusionCuda(dense_folder, problems, geom_consistency);
-
-    // Clean up LUT manager
-    FreeLUTManager();
 
     return 0;
 }
