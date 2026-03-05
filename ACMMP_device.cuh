@@ -515,6 +515,16 @@ struct BilateralPatch {
     int n;
 };
 
+// Shared-memory reference tile info for bilateral NCC.
+// When data != nullptr, PrecomputeBilateralPatch reads from the shared-memory
+// tile instead of tex2D, exploiting overlap between neighboring threads' patches.
+struct RefTileInfo {
+    const float *data;   // nullptr → fall back to tex2D
+    int origin_x;
+    int origin_y;
+    int width;           // tile row stride (number of columns)
+};
+
 // ============================================================================
 // MACRO DEFINITIONS FOR COMPATIBILITY
 // ============================================================================
